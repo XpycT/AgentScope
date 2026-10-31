@@ -10,6 +10,10 @@
 
 pub mod claude;
 pub mod codex;
+/// OMP metadata/identity/link parsing. Not a [`ProviderReader`] and not registered
+/// with the application; exposed for the discovery regression suite only.
+#[doc(hidden)]
+pub mod omp;
 pub mod opencode;
 pub(crate) mod probe;
 

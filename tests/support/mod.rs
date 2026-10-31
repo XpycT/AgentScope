@@ -5,6 +5,7 @@ pub mod claude;
 pub mod codex;
 pub mod desktop;
 pub mod facts;
+pub mod omp;
 pub mod opencode;
 pub mod world;
 

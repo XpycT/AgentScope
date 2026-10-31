@@ -56,16 +56,22 @@ fn complete_lines(buf: &[u8], base: u64, mid_line: bool) -> Vec<(u64, Vec<u8>)> 
 }
 
 pub(crate) fn probe_file(path: &Path, len: u64) -> io::Result<Probe> {
+    probe_file_lines(path, len, 1)
+}
+
+/// [`probe_file`] whose prefix is extended (under `HEADER_MAX`) until it holds
+/// `lines` complete lines, for formats whose header is not the first line.
+pub(crate) fn probe_file_lines(path: &Path, len: u64, lines: usize) -> io::Result<Probe> {
     let mut file = File::open(path)?;
     let mut head = vec![0u8; len.min(HEAD_WINDOW as u64) as usize];
     let got = read_full(&mut file, &mut head)?;
     head.truncate(got);
     let mut bytes = got;
     // A header longer than the window is read to its newline, up to the cap.
-    let mut searched = 0usize;
-    while !head[searched..].contains(&b'\n') && head.len() < HEADER_MAX && (head.len() as u64) < len
+    while head.iter().filter(|b| **b == b'\n').count() < lines
+        && head.len() < HEADER_MAX
+        && (head.len() as u64) < len
     {
-        searched = head.len();
         let at = head.len();
         head.resize(at + 8192.min(HEADER_MAX - at), 0);
         let more = read_full(&mut file, &mut head[at..])?;
