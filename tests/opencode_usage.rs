@@ -3,14 +3,15 @@ mod support;
 use std::collections::HashMap;
 use std::path::Path;
 
-use agentscope::config::{PriceEntry, PriceSchedule};
 use agentscope::domain::{
-    AggregationClass, Lifecycle, Provider, RefreshBudget, SessionSummary, TokenCategories,
+    AggregationClass, Lifecycle, RefreshBudget, SessionSummary, TokenCategories,
 };
+use agentscope::providers::ProviderReader;
 use agentscope::providers::opencode::OpenCodeScanner;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use support::NOW;
+use support::facts::price_schedule;
 use support::opencode::*;
 
 const BIG: RefreshBudget = RefreshBudget {
@@ -22,9 +23,9 @@ const BIG: RefreshBudget = RefreshBudget {
 fn scan(scanner: &mut OpenCodeScanner) -> HashMap<String, SessionSummary> {
     let mut out = HashMap::new();
     loop {
-        let delta = scanner.scan_roster(NOW, BIG).expect("scan");
+        let delta = support::world::rescan(scanner, NOW, BIG);
         for s in delta.sessions {
-            out.insert(s.key.provider_session_id.clone(), s);
+            out.insert(s.meta.key.native_id.clone(), s);
         }
         if delta.scan.done {
             return out;
@@ -36,9 +37,9 @@ fn scanner_for(db: &Path) -> OpenCodeScanner {
     OpenCodeScanner::new(&config_for_db(db)).expect("scanner")
 }
 
-fn priced_scanner(db: &Path, entry: PriceEntry) -> OpenCodeScanner {
+fn priced_scanner(db: &Path, cards: &str) -> OpenCodeScanner {
     let mut config = config_for_db(db);
-    config.pricing = PriceSchedule::new(vec![entry]).expect("prices");
+    config.pricing = price_schedule(cards);
     OpenCodeScanner::new(&config).expect("scanner")
 }
 
@@ -105,7 +106,8 @@ fn session_totals_beat_message_sums_and_zero_cost_stays_reported() {
         usage.categories,
         TokenCategories {
             input: Some(10),
-            output: Some(5),
+            // Separately reported reasoning is folded into canonical output (5 + 2).
+            output: Some(7),
             reasoning: Some(2),
             cache_read: Some(3),
             cache_write: Some(4),
@@ -117,15 +119,28 @@ fn session_totals_beat_message_sums_and_zero_cost_stays_reported() {
         Some(24),
         "session columns, not the message sum"
     );
-    assert_eq!(usage.model.as_deref(), Some("free-model"));
-    assert_eq!(usage.cost.usd, Some(0.0), "a reported 0 is a value");
-    assert_eq!(usage.cost.class, AggregationClass::Reported);
+    // No message scan backs the session totals, so no model attribution is claimed.
+    assert!(usage.models.is_empty());
+    assert!(!usage.coverage.complete);
+    assert_eq!(usage.reported_cost_usd, Some(0.0));
+    // The reported zero stays reported; "acme/free-model" has no card, so the
+    // API-equivalent is unknown rather than a complete $0.
+    assert_eq!(usage.cost.usd, None);
+    assert_eq!(usage.cost.class, AggregationClass::Unknown);
+    assert!(
+        usage
+            .cost
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("reported no charge")
+    );
 
     let usage = out["paid"].usage.as_ref().expect("usage");
     assert_eq!(usage.total, Some(150));
     assert_eq!(usage.cost.usd, Some(1.25));
     assert_eq!(usage.cost.class, AggregationClass::Reported);
-    assert!(usage.model.is_none());
+    assert!(usage.models.is_empty());
 }
 
 #[test]
@@ -203,7 +218,11 @@ fn missing_session_totals_derive_from_unique_messages_and_mark_derived() {
     let usage = out["full"].usage.as_ref().expect("usage");
     assert_eq!(usage.class, AggregationClass::Derived);
     assert_eq!(usage.categories.input, Some(30));
-    assert_eq!(usage.categories.output, Some(11));
+    assert_eq!(
+        usage.categories.output,
+        Some(12),
+        "11 output + 1 separate reasoning"
+    );
     assert_eq!(usage.categories.reasoning, Some(1));
     assert_eq!(usage.categories.cache_read, Some(6));
     assert_eq!(usage.categories.cache_write, Some(3));
@@ -231,38 +250,30 @@ fn derived_usage_without_reported_cost_uses_configured_prices_or_unknown() {
     let mut s = Session::new("s", 1, 2);
     s.model = Some(&model);
     insert_session(&conn, &s);
-    msg(
-        &conn,
-        "s",
-        "a1",
-        "assistant",
-        3,
-        assistant(
+    msg(&conn, "s", "a1", "assistant", 3, {
+        let mut data = assistant(
             Some("stop"),
             tokens(1_000_000, 1_000_000, 1_000_000, 0, 0),
             None,
-        ),
-    );
-    let entry = |reasoning: Option<f64>| PriceEntry {
-        provider: Provider::OpenCode,
-        model: "priced".into(),
-        as_of: Some("2026-01-01".into()),
-        input_per_mtok: 1.0,
-        cached_input_per_mtok: None,
-        cache_write_per_mtok: Some(0.0),
-        cache_write_5m_per_mtok: None,
-        cache_write_1h_per_mtok: None,
-        cache_read_per_mtok: Some(0.0),
-        output_per_mtok: 2.0,
-        reasoning_per_mtok: reasoning,
+        );
+        data["modelID"] = json!("priced");
+        data["providerID"] = json!("acme");
+        data
+    });
+    let card = |reasoning: Option<f64>| {
+        let reasoning = reasoning.map_or(String::new(), |r| format!(r#","reasoning":{r}"#));
+        format!(
+            r#"[{{"billing_provider":"acme","model":"priced","as_of":"2026-01-01",
+                "rates":{{"input":1.0,"output":2.0,"cache_read":0.0,"cache_write":0.0{reasoning}}}}}]"#
+        )
     };
-    let out = scan(&mut priced_scanner(&db, entry(Some(3.0))));
+    let out = scan(&mut priced_scanner(&db, &card(Some(3.0))));
     let cost = &out["s"].usage.as_ref().expect("usage").cost;
     assert_eq!(cost.class, AggregationClass::Estimated);
     assert_eq!(cost.usd, Some(6.0));
     assert_eq!(cost.as_of.as_deref(), Some("2026-01-01"));
 
-    let out = scan(&mut priced_scanner(&db, entry(None)));
+    let out = scan(&mut priced_scanner(&db, &card(None)));
     let cost = &out["s"].usage.as_ref().expect("usage").cost;
     assert_eq!(
         cost.class,
@@ -476,22 +487,32 @@ fn budget(records: usize, bytes: usize, millis: u64) -> RefreshBudget {
     }
 }
 
-/// Runs steps until the pass is done; returns the number of steps and the roster.
+thread_local! {
+    static KEYS: std::cell::RefCell<Vec<agentscope::domain::SessionKey>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn scan_with(
     scanner: &mut OpenCodeScanner,
     budget: RefreshBudget,
 ) -> (usize, HashMap<String, SessionSummary>) {
     let mut out = HashMap::new();
-    for step in 1..=10_000 {
-        let delta = scanner.scan_roster(NOW, budget).expect("scan");
-        for s in delta.sessions {
-            out.insert(s.key.provider_session_id.clone(), s);
+    let mut steps = 0;
+    let found = support::world::discover_pass(scanner, NOW, BIG);
+    KEYS.with(|k| {
+        let mut k = k.borrow_mut();
+        for meta in &found.sessions {
+            if !k.contains(&meta.key) {
+                k.push(meta.key.clone());
+            }
         }
-        if delta.scan.done {
-            return (step, out);
-        }
+    });
+    // Discovery reports only new or changed rows; every known session is hydrated.
+    for key in KEYS.with(|k| k.borrow().clone()) {
+        let (summary, n) = support::world::hydrate_steps(scanner, &key, NOW, budget, 10_000);
+        steps += n;
+        out.insert(key.native_id.clone(), summary);
     }
-    panic!("scan never finished");
+    (steps, out)
 }
 
 #[test]
@@ -520,11 +541,20 @@ fn evidence_collection_is_resumable_under_the_refresh_budget() {
     let mut scanner = scanner_for(&db);
 
     // The roster row is read but no evidence is published until it completes.
+    let key = support::world::discover_pass(&mut scanner, NOW, BIG)
+        .sessions
+        .remove(0)
+        .key;
+    KEYS.with(|k| k.borrow_mut().push(key.clone()));
     let first = scanner
-        .scan_roster(NOW, budget(4, 100_000_000, 60_000))
-        .expect("scan");
-    assert!(!first.scan.done, "evidence outstanding keeps the pass open");
-    assert!(first.sessions.is_empty());
+        .hydrate(
+            support::world::new_job(),
+            &key,
+            NOW,
+            budget(4, 100_000_000, 60_000),
+        )
+        .unwrap();
+    assert!(!first.done, "evidence outstanding keeps hydration open");
 
     let (steps, out) = scan_with(&mut scanner, budget(4, 100_000_000, 60_000));
     assert!(steps >= 3, "13 rows at 4 per step, got {steps} steps");
@@ -560,7 +590,7 @@ fn exhausted_budget_reads_nothing_and_keeps_state() {
         budget(10, 0, 1000),
         budget(10, 1000, 0),
     ] {
-        let d = scanner.scan_roster(NOW, zero).expect("scan");
+        let d = scanner.discover(NOW, zero).unwrap();
         assert!(d.sessions.is_empty() && !d.scan.done);
     }
     let (_, out) = scan_with(&mut scanner, budget(10, 100_000, 60_000));
@@ -594,8 +624,16 @@ fn optional_session_columns_are_kept_independently() {
     assert_eq!(usage.categories.output, None);
     assert_eq!(usage.class, AggregationClass::Partial);
     assert_eq!(usage.total, None);
-    assert_eq!(usage.cost.usd, Some(0.0), "reported zero cost survives");
-    assert_eq!(usage.cost.class, AggregationClass::Reported);
+    assert_eq!(
+        usage.reported_cost_usd,
+        Some(0.0),
+        "reported zero cost survives"
+    );
+    assert_eq!(
+        usage.cost.usd, None,
+        "partial counters give no API-equivalent"
+    );
+    assert_eq!(usage.cost.class, AggregationClass::Unknown);
 }
 
 #[test]
@@ -723,8 +761,15 @@ fn lifecycle_completing_on_the_last_allowed_row_defers_derivation() {
     for tight in [budget(1, 100_000_000, 60_000), budget(100, 1, 60_000)] {
         let mut scanner = scanner_for(&db);
         // Lifecycle finishes on the only allowed row; derivation must wait.
-        let first = scanner.scan_roster(NOW, tight).expect("scan");
-        assert!(first.sessions.is_empty() && !first.scan.done);
+        let key = support::world::discover_pass(&mut scanner, NOW, BIG)
+            .sessions
+            .remove(0)
+            .key;
+        KEYS.with(|k| k.borrow_mut().push(key.clone()));
+        let first = scanner
+            .hydrate(support::world::new_job(), &key, NOW, tight)
+            .unwrap();
+        assert!(!first.done, "evidence outstanding keeps hydration open");
         let (steps, out) = scan_with(&mut scanner, tight);
         assert!(
             steps >= 2,
@@ -788,5 +833,307 @@ fn a_valid_id_equal_to_a_synthetic_prefix_bound_is_counted_once() {
         usage.categories.input,
         Some(110),
         "\"n\" counted exactly once"
+    );
+}
+
+#[test]
+fn a_message_naming_another_model_leaves_the_session_aggregate_unattributed() {
+    let (_d, db, conn) = fixture();
+    let model = model_json("one", "acme", "");
+    let mut s = Session::new("s", 1, 2);
+    s.model = Some(&model);
+    insert_session(&conn, &s);
+    for (id, at, model_id) in [("a1", 3, "one"), ("a2", 4, "two")] {
+        let mut data = assistant(Some("stop"), tokens(1_000_000, 1_000_000, 0, 0, 0), None);
+        data["modelID"] = json!(model_id);
+        data["providerID"] = json!("acme");
+        msg(&conn, "s", id, "assistant", at, data);
+    }
+    let cards = r#"[{"billing_provider":"acme","model":"one","rates":{"input":1.0,"output":2.0,"cache_read":0.0,"cache_write":0.0}},
+                    {"billing_provider":"acme","model":"two","rates":{"input":9.0,"output":9.0,"cache_read":0.0,"cache_write":0.0}}]"#;
+    let out = scan(&mut priced_scanner(&db, cards));
+    let usage = out["s"].usage.as_ref().expect("usage");
+    assert_eq!(usage.class, AggregationClass::Derived);
+    assert_eq!(usage.categories.input, Some(2_000_000), "totals are kept");
+    assert!(
+        usage.models.is_empty(),
+        "not attributed to the current model"
+    );
+    assert_eq!(usage.cost.usd, None);
+    assert!(!usage.coverage.complete);
+
+    // Messages that agree with the session model keep the attribution.
+    let (_d, db, conn) = fixture();
+    let mut s = Session::new("s", 1, 2);
+    s.model = Some(&model);
+    insert_session(&conn, &s);
+    let mut data = assistant(Some("stop"), tokens(1_000_000, 1_000_000, 0, 0, 0), None);
+    data["modelID"] = json!("one");
+    data["providerID"] = json!("acme");
+    msg(&conn, "s", "a1", "assistant", 3, data);
+    let out = scan(&mut priced_scanner(&db, cards));
+    let usage = out["s"].usage.as_ref().expect("usage");
+    assert_eq!(usage.models.len(), 1);
+    assert_eq!(usage.cost.usd, Some(3.0));
+}
+
+#[test]
+fn session_totals_without_message_evidence_and_nested_v2_models_are_handled_by_shape() {
+    let cards = r#"[{"billing_provider":"acme","model":"one","rates":{"input":1.0,"output":2.0,"cache_read":0.0,"cache_write":0.0,"reasoning":0.0}},
+                    {"billing_provider":"acme","model":"two","rates":{"input":9.0,"output":9.0,"cache_read":0.0,"cache_write":0.0,"reasoning":0.0}}]"#;
+    let model = model_json("one", "acme", "");
+
+    // Session totals plus a reported cost skip message derivation entirely; the
+    // messages may span models, so no complete per-model estimate exists.
+    let (_d, db, conn) = fixture();
+    let mut s = Session::new("s", 1, 2);
+    s.model = Some(&model);
+    s.tokens = Some([1_000_000, 1_000_000, 0, 0, 0]);
+    s.cost = Some(0.0);
+    insert_session(&conn, &s);
+    for (id, at, m) in [("a1", 3, "one"), ("a2", 4, "two")] {
+        let mut data = assistant(Some("stop"), tokens(1, 1, 0, 0, 0), None);
+        data["modelID"] = json!(m);
+        data["providerID"] = json!("acme");
+        msg(&conn, "s", id, "assistant", at, data);
+    }
+    let out = scan(&mut priced_scanner(&db, cards));
+    let usage = out["s"].usage.as_ref().expect("usage");
+    assert_eq!(
+        usage.reported_cost_usd,
+        Some(0.0),
+        "recorded money is preserved"
+    );
+    assert!(usage.models.is_empty());
+    assert_eq!(usage.cost.usd, None);
+    assert!(!usage.coverage.complete);
+
+    // The v2 shape nests the model; a nested switch is detected, a nested match attributes.
+    for (second, expect_models) in [("two", 0), ("one", 1)] {
+        let (_d, db, conn) = fixture();
+        let mut s = Session::new("s", 1, 2);
+        s.model = Some(&model);
+        insert_session(&conn, &s);
+        for (id, at, m) in [("a1", 3, "one"), ("a2", 4, second)] {
+            let mut data = assistant(Some("stop"), tokens(1_000_000, 1_000_000, 0, 0, 0), None);
+            data["model"] = json!({"id": m, "providerID": "acme", "variant": ""});
+            msg(&conn, "s", id, "assistant", at, data);
+        }
+        let out = scan(&mut priced_scanner(&db, cards));
+        let usage = out["s"].usage.as_ref().expect("usage");
+        assert_eq!(usage.models.len(), expect_models, "{second}");
+        assert_eq!(usage.cost.usd.is_some(), expect_models == 1, "{second}");
+    }
+
+    // A flat `id` or a nested `modelID` is not a documented shape for its dispatch.
+    let (_d, db, conn) = fixture();
+    let mut s = Session::new("s", 1, 2);
+    s.model = Some(&model);
+    insert_session(&conn, &s);
+    let mut data = assistant(Some("stop"), tokens(1_000_000, 1_000_000, 0, 0, 0), None);
+    data["id"] = json!("one");
+    msg(&conn, "s", "a1", "assistant", 3, data);
+    let out = scan(&mut priced_scanner(&db, cards));
+    assert!(out["s"].usage.as_ref().unwrap().models.is_empty());
+}
+
+#[test]
+fn only_the_recorded_creation_time_is_a_native_metric() {
+    let (_d, db, conn) = fixture();
+    let mut s = Session::new("started", 10, 20);
+    s.tokens = Some([10, 5, 2, 3, 4]);
+    s.cost = Some(0.5);
+    insert_session(&conn, &s);
+    let out = scan(&mut scanner_for(&db));
+    let m = &out["started"].metrics;
+    assert_eq!(m.timing.started_at, Some(10));
+    assert_eq!(
+        m.timing.ended_at, None,
+        "a turn completion is not a session end"
+    );
+    assert_eq!(m.timing.active_ms, None);
+    assert!(!m.timing.active_complete);
+    assert_eq!(
+        m.speed,
+        agentscope::domain::SpeedSummary::default(),
+        "aggregate session totals carry no per-request duration"
+    );
+    assert_eq!((m.context.used, m.context.capacity), (None, None));
+    assert_eq!(m.compactions.observed, 0);
+    assert!(!m.compactions.history_complete);
+    assert_eq!(m.compactions.known_cost_usd, None);
+}
+
+#[test]
+fn parent_child_nested_and_fork_direct_usage_stays_separate() {
+    let (_d, db, conn) = fixture();
+    let go = model_json("gpt-5", "opencode-go", "high");
+    let zen = model_json("gpt-5", "opencode-zen", "high");
+    let other = model_json("gpt-5", "acme", "high");
+
+    let mut parent = Session::new("ses_parent", 100, 400);
+    parent.model = Some(&go);
+    parent.tokens = Some([1_000, 400, 0, 0, 0]);
+    parent.cost = Some(0.25);
+    insert_session(&conn, &parent);
+
+    let mut child = Session::new("ses_child", 150, 500);
+    child.parent_id = Some("ses_parent");
+    child.model = Some(&zen);
+    child.tokens = Some([200, 80, 0, 0, 0]);
+    child.cost = Some(0.05);
+    insert_session(&conn, &child);
+
+    let mut nested = Session::new("ses_nested", 200, 600);
+    nested.parent_id = Some("ses_child");
+    nested.model = Some(&other);
+    nested.tokens = Some([40, 10, 0, 0, 0]);
+    nested.cost = Some(0.01);
+    insert_session(&conn, &nested);
+
+    // A fork names its source but not a parent: it is a root with reset counters.
+    let mut fork = Session::new("ses_fork", 300, 700);
+    fork.fork_id = Some("ses_parent");
+    fork.model = Some(&go);
+    fork.tokens = Some([30, 5, 0, 0, 0]);
+    fork.cost = Some(0.002);
+    insert_session(&conn, &fork);
+    // Copied history: message-level sums would be far larger than the reset counters.
+    for (s, id, at) in [
+        ("ses_fork", "f1", 310),
+        ("ses_fork", "f2", 320),
+        ("ses_parent", "p1", 110),
+    ] {
+        msg(
+            &conn,
+            s,
+            id,
+            "assistant",
+            at,
+            assistant(Some("stop"), tokens(5_000, 5_000, 0, 0, 0), Some(9.0)),
+        );
+    }
+
+    let out = scan(&mut scanner_for(&db));
+    let parent = &out["ses_parent"];
+    let child = &out["ses_child"];
+    let nested = &out["ses_nested"];
+    let fork = &out["ses_fork"];
+
+    assert_eq!(parent.usage.as_ref().unwrap().total, Some(1_400));
+    assert_eq!(child.usage.as_ref().unwrap().total, Some(280));
+    assert_eq!(nested.usage.as_ref().unwrap().total, Some(50));
+    assert_eq!(
+        fork.usage.as_ref().unwrap().total,
+        Some(35),
+        "the fork's own reset counters, not copied history"
+    );
+    assert_eq!(parent.usage.as_ref().unwrap().cost.usd, Some(0.25));
+    assert_eq!(child.usage.as_ref().unwrap().cost.usd, Some(0.05));
+    assert_eq!(nested.usage.as_ref().unwrap().cost.usd, Some(0.01));
+    assert_eq!(fork.usage.as_ref().unwrap().cost.usd, Some(0.002));
+
+    // Direct usage is not rolled up or added across the family.
+    let family: f64 = [parent, child, nested, fork]
+        .iter()
+        .filter_map(|s| s.usage.as_ref().and_then(|u| u.cost.usd))
+        .sum();
+    assert!((family - 0.312).abs() < 1e-12);
+
+    // Lineage is explicit: parent/child/nested are separate links, a fork is a root.
+    assert!(parent.meta.lineage.parent.is_none());
+    assert_eq!(
+        child.meta.lineage.parent,
+        Some(agentscope::domain::SessionLink::Resolved(
+            parent.meta.key.clone()
+        ))
+    );
+    assert_eq!(
+        nested.meta.lineage.parent,
+        Some(agentscope::domain::SessionLink::Resolved(
+            child.meta.key.clone()
+        ))
+    );
+    assert!(fork.meta.lineage.parent.is_none());
+    assert_eq!(
+        fork.meta.lineage.fork,
+        Some(agentscope::domain::SessionLink::Resolved(
+            parent.meta.key.clone()
+        ))
+    );
+}
+
+#[test]
+fn equal_model_ids_through_different_providers_keep_their_own_route_and_price() {
+    let (_d, db, conn) = fixture();
+    let cards = r#"[
+        {"billing_provider":"opencode-go","model":"shared","as_of":"2026-01-01",
+         "rates":{"input":1.0,"output":2.0,"cache_read":0.0,"cache_write":0.0,"reasoning":0.0}},
+        {"billing_provider":"opencode-zen","model":"shared","as_of":"2026-01-01",
+         "rates":{"input":10.0,"output":20.0,"cache_read":0.0,"cache_write":0.0,"reasoning":0.0}},
+        {"billing_provider":"acme","model":"shared","as_of":"2026-01-01",
+         "rates":{"input":100.0,"output":200.0,"cache_read":0.0,"cache_write":0.0,"reasoning":0.0}}
+    ]"#;
+    for (id, provider, at) in [
+        ("ses_go", "opencode-go", 10),
+        ("ses_zen", "opencode-zen", 20),
+        ("ses_acme", "acme", 30),
+    ] {
+        let model = model_json("shared", provider, "");
+        let mut s = Session::new(id, at, at + 1);
+        s.model = Some(&model);
+        insert_session(&conn, &s);
+        let mut data = assistant(Some("stop"), tokens(1_000_000, 1_000_000, 0, 0, 0), None);
+        data["model"] = json!({"id": "shared", "providerID": provider, "variant": ""});
+        msg(&conn, id, &format!("{id}-a"), "assistant", at + 2, data);
+    }
+
+    let out = scan(&mut priced_scanner(&db, cards));
+    let cost = |id: &str| out[id].usage.as_ref().unwrap().cost.clone();
+    assert_eq!(cost("ses_go").usd, Some(3.0));
+    assert_eq!(cost("ses_zen").usd, Some(30.0));
+    assert_eq!(cost("ses_acme").usd, Some(300.0));
+    for id in ["ses_go", "ses_zen", "ses_acme"] {
+        let usage = out[id].usage.as_ref().unwrap();
+        assert_eq!(usage.models.len(), 1, "{id}");
+        assert_eq!(usage.cost.class, AggregationClass::Estimated, "{id}");
+    }
+    assert_eq!(
+        out["ses_go"].usage.as_ref().unwrap().models[0]
+            .model
+            .provider
+            .as_deref(),
+        Some("opencode-go")
+    );
+    assert_eq!(
+        out["ses_zen"].usage.as_ref().unwrap().models[0]
+            .model
+            .provider
+            .as_deref(),
+        Some("opencode-zen")
+    );
+
+    // No recorded route: Unknown, never filled in with a vendor default.
+    let (_d2, db2, conn2) = fixture();
+    let model = model_json("shared", "", "");
+    let mut unrecorded = Session::new("ses_none", 1, 2);
+    unrecorded.model = Some(&model);
+    insert_session(&conn2, &unrecorded);
+    let mut data = assistant(Some("stop"), tokens(1_000_000, 1_000_000, 0, 0, 0), None);
+    data["model"] = json!({"id": "shared", "variant": ""});
+    msg(&conn2, "ses_none", "a1", "assistant", 3, data);
+    let out = scan(&mut priced_scanner(&db2, cards));
+    let usage = out["ses_none"].usage.as_ref().unwrap();
+    assert_eq!(usage.cost.usd, None);
+    assert_eq!(usage.cost.class, AggregationClass::Unknown);
+    assert!(
+        usage
+            .cost
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("billing route"),
+        "{:?}",
+        usage.cost
     );
 }

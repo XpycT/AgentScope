@@ -13,7 +13,8 @@ CREATE TABLE session_v2(
     id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, fork_session_id TEXT,
     title TEXT, directory TEXT, model TEXT, version TEXT, share_url TEXT,
     time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER,
-    idle_outcome TEXT, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+    idle_outcome TEXT, agent TEXT, metadata TEXT, tokens_input INTEGER,
+    tokens_output INTEGER, tokens_reasoning INTEGER,
     tokens_cache_read INTEGER, tokens_cache_write INTEGER, cost REAL);
 CREATE TABLE session_message(
     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER,
@@ -73,6 +74,7 @@ pub struct Session<'a> {
     pub parent_id: Option<&'a str>,
     pub fork_id: Option<&'a str>,
     pub model: Option<&'a str>,
+    pub agent: Option<&'a str>,
     pub created: i64,
     pub updated: i64,
     pub archived: Option<i64>,
@@ -92,6 +94,7 @@ impl<'a> Session<'a> {
             parent_id: None,
             fork_id: None,
             model: None,
+            agent: None,
             created,
             updated,
             archived: None,
@@ -105,13 +108,13 @@ impl<'a> Session<'a> {
 pub fn insert_session(conn: &Connection, s: &Session<'_>) {
     conn.execute(
         "INSERT INTO session_v2(id, project_id, parent_id, fork_session_id, title, directory,
-            model, version, share_url, time_created, time_updated, time_archived,
+            model, agent, version, share_url, time_created, time_updated, time_archived,
             tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
             cost, idle_outcome)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '2.0.29', 'https://share.invalid/SECRET-SHARE', ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '2.0.29', 'https://share.invalid/SECRET-SHARE', ?9, ?10, ?11,
+            ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
-            s.id, s.project_id, s.parent_id, s.fork_id, s.title, s.directory, s.model,
+            s.id, s.project_id, s.parent_id, s.fork_id, s.title, s.directory, s.model, s.agent,
             s.created, s.updated, s.archived,
             s.tokens.map(|t| t[0]), s.tokens.map(|t| t[1]), s.tokens.map(|t| t[2]),
             s.tokens.map(|t| t[3]), s.tokens.map(|t| t[4]), s.cost, s.idle_outcome

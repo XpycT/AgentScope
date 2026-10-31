@@ -1,7 +1,7 @@
 mod support;
 use agentscope::config::{CliOverrides, Config, Env};
 use agentscope::domain::{PageDirection, PageRequest, RefreshBudget, SessionKey};
-use agentscope::providers::{ProviderReader, claude::ClaudeScanner};
+use agentscope::providers::claude::ClaudeScanner;
 use serde_json::{Value, json};
 use std::io::Write;
 use support::{NOW, write_lines};
@@ -39,7 +39,11 @@ fn setup(
     )
     .unwrap();
     let mut scanner = ClaudeScanner::new(&config).unwrap();
-    let key = scanner.refresh(NOW, BUDGET).unwrap().sessions.remove(0).key;
+    let key = support::world::rescan(&mut scanner, NOW, BUDGET)
+        .sessions
+        .remove(0)
+        .meta
+        .key;
     (dir, path, scanner, key)
 }
 fn assistant(uuid: &str, content: Value) -> Value {
@@ -59,9 +63,16 @@ fn forward_and_backward_pages_are_equivalent_and_never_split_tool_pairs() {
     let mut forward = Vec::new();
     let mut anchor = None;
     loop {
-        let p = s
-            .transcript_page(&key, anchor, PageDirection::Forward, PAGE)
-            .unwrap();
+        let p = support::world::try_transcript(
+            &mut s,
+            &key,
+            anchor,
+            PageDirection::Forward,
+            PAGE,
+            support::world::BIG,
+            support::world::STEPS,
+        )
+        .unwrap();
         forward.extend(p.events);
         if !p.has_more {
             break;
@@ -71,9 +82,16 @@ fn forward_and_backward_pages_are_equivalent_and_never_split_tool_pairs() {
     let mut backward = Vec::new();
     let mut anchor = None;
     loop {
-        let p = s
-            .transcript_page(&key, anchor, PageDirection::Backward, PAGE)
-            .unwrap();
+        let p = support::world::try_transcript(
+            &mut s,
+            &key,
+            anchor,
+            PageDirection::Backward,
+            PAGE,
+            support::world::BIG,
+            support::world::STEPS,
+        )
+        .unwrap();
         backward.splice(0..0, p.events);
         if !p.has_more {
             break;
@@ -98,19 +116,44 @@ fn forward_and_backward_pages_are_equivalent_and_never_split_tool_pairs() {
         source_order: forward[0].source_order,
         stable_id: forward[0].id.clone(),
     };
-    assert_eq!(s.count_events_after(&key, &first).unwrap(), 2);
+    assert_eq!(
+        support::world::try_count(
+            &mut s,
+            &key,
+            &first,
+            support::world::BIG,
+            support::world::STEPS
+        )
+        .unwrap(),
+        2
+    );
 }
 #[test]
 fn source_locator_round_trip_and_foreign_locator_rejection() {
     let (_dir, _, mut s, key) = setup(&[assistant("a", json!("hello"))]);
-    let p = s
-        .transcript_page(&key, None, PageDirection::Forward, PAGE)
-        .unwrap();
+    let p = support::world::try_transcript(
+        &mut s,
+        &key,
+        None,
+        PageDirection::Forward,
+        PAGE,
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     let loc = p.events[0].provenance.locator.clone();
-    assert!(s.source_record(&loc).unwrap().raw.contains("hello"));
+    assert!(
+        support::world::try_source(&mut s, &loc, support::world::BIG, support::world::STEPS)
+            .unwrap()
+            .raw
+            .contains("hello")
+    );
     let mut foreign = loc;
-    foreign.session.provider_session_id = "other".into();
-    assert!(s.source_record(&foreign).is_err());
+    foreign.session.native_id = "other".into();
+    assert!(
+        support::world::try_source(&mut s, &foreign, support::world::BIG, support::world::STEPS)
+            .is_err()
+    );
 }
 #[test]
 fn partial_append_then_completion_adds_one_event() {
@@ -119,16 +162,19 @@ fn partial_append_then_completion_adds_one_event() {
     let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     write!(f, "{}", &line[..line.len() / 2]).unwrap();
     f.flush().unwrap();
-    s.refresh(NOW, BUDGET).unwrap();
+    support::world::rescan(&mut s, NOW, BUDGET);
     assert_eq!(
-        s.transcript_page(
+        support::world::try_transcript(
+            &mut s,
             &key,
             None,
             PageDirection::Forward,
             PageRequest {
                 max_events: 10,
                 ..PAGE
-            }
+            },
+            support::world::BIG,
+            support::world::STEPS
         )
         .unwrap()
         .events
@@ -137,16 +183,19 @@ fn partial_append_then_completion_adds_one_event() {
     );
     writeln!(f, "{}", &line[line.len() / 2..]).unwrap();
     f.flush().unwrap();
-    s.refresh(NOW, BUDGET).unwrap();
+    support::world::rescan(&mut s, NOW, BUDGET);
     assert_eq!(
-        s.transcript_page(
+        support::world::try_transcript(
+            &mut s,
             &key,
             None,
             PageDirection::Forward,
             PageRequest {
                 max_events: 10,
                 ..PAGE
-            }
+            },
+            support::world::BIG,
+            support::world::STEPS
         )
         .unwrap()
         .events
@@ -161,19 +210,21 @@ fn rotation_resets_cursor_content_and_usage_ledger() {
         assistant("b", json!("old second")),
     ]);
     std::fs::write(&path, format!("{}\n", assistant("a", json!("new")))).unwrap();
-    let delta = s.refresh(NOW, BUDGET).unwrap();
+    let delta = support::world::rescan(&mut s, NOW, BUDGET);
     assert_eq!(delta.sessions[0].usage.as_ref().unwrap().total, Some(3));
-    let p = s
-        .transcript_page(
-            &key,
-            None,
-            PageDirection::Forward,
-            PageRequest {
-                max_events: 10,
-                ..PAGE
-            },
-        )
-        .unwrap();
+    let p = support::world::try_transcript(
+        &mut s,
+        &key,
+        None,
+        PageDirection::Forward,
+        PageRequest {
+            max_events: 10,
+            ..PAGE
+        },
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert_eq!(p.events.len(), 1);
     assert_eq!(p.events[0].text.as_ref().unwrap().preview, "new");
 }
@@ -184,12 +235,27 @@ fn suppressed_and_unknown_records_appear_in_diagnostics() {
         json!({"type":"mystery"}),
         assistant("a", json!("visible")),
     ]);
-    let p = s
-        .transcript_page(&key, None, PageDirection::Forward, PAGE)
-        .unwrap();
+    let p = support::world::try_transcript(
+        &mut s,
+        &key,
+        None,
+        PageDirection::Forward,
+        PAGE,
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert_eq!(p.diagnostics.len(), 2);
     for d in p.diagnostics {
-        assert!(s.source_record(&d.locator).is_ok());
+        assert!(
+            support::world::try_source(
+                &mut s,
+                &d.locator,
+                support::world::BIG,
+                support::world::STEPS
+            )
+            .is_ok()
+        );
     }
 }
 
@@ -199,24 +265,16 @@ fn index_builds_in_bounded_resumable_steps() {
         .map(|n| assistant(&format!("{n}"), json!("x")))
         .collect();
     let (_dir, _, mut scanner, key) = setup(&records);
-    loop {
-        if scanner.refresh(NOW, BUDGET).unwrap().scan.done {
-            break;
-        }
-    }
-    let mut retries = 0;
-    let page = loop {
-        match scanner.transcript_page(&key, None, PageDirection::Forward, PAGE) {
-            Ok(page) => break page,
-            Err(agentscope::providers::ProviderError::Unavailable(message))
-                if message.contains("index is building") =>
-            {
-                retries += 1
-            }
-            Err(error) => panic!("{error}"),
-        }
-    };
-    assert!(retries > 0, "index construction must be resumable");
+    let (page, pending) = support::world::transcript_steps(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PAGE,
+        BUDGET,
+        support::world::STEPS,
+    );
+    assert!(pending >= 4, "{pending}: 2,200 records at 512 per step");
     assert_eq!(page.events.len(), 1);
     assert!(page.has_more);
 }
@@ -225,24 +283,56 @@ fn index_builds_in_bounded_resumable_steps() {
 fn stale_locator_is_rejected_after_rotation_and_refresh() {
     let (_dir, path, mut scanner, key) =
         setup(&[assistant("old", json!("old content long enough"))]);
-    let old = scanner
-        .transcript_page(&key, None, PageDirection::Forward, PAGE)
-        .unwrap()
-        .events[0]
+    let old = support::world::try_transcript(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PAGE,
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .unwrap()
+    .events[0]
         .provenance
         .locator
         .clone();
     std::fs::write(path, format!("{}\n", assistant("new", json!("new")))).unwrap();
-    scanner.refresh(NOW, BUDGET).unwrap();
-    assert!(scanner.source_record(&old).is_err());
-    let new = scanner
-        .transcript_page(&key, None, PageDirection::Forward, PAGE)
-        .unwrap()
-        .events[0]
+    support::world::rescan(&mut scanner, NOW, BUDGET);
+    assert!(
+        support::world::try_source(
+            &mut scanner,
+            &old,
+            support::world::BIG,
+            support::world::STEPS
+        )
+        .is_err()
+    );
+    let new = support::world::try_transcript(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PAGE,
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .unwrap()
+    .events[0]
         .provenance
         .locator
         .clone();
-    assert!(scanner.source_record(&new).unwrap().raw.contains("new"));
+    assert!(
+        support::world::try_source(
+            &mut scanner,
+            &new,
+            support::world::BIG,
+            support::world::STEPS
+        )
+        .unwrap()
+        .raw
+        .contains("new")
+    );
 }
 
 #[test]
@@ -254,9 +344,16 @@ fn nested_hidden_and_joined_result_have_openable_diagnostics() {
         ),
         json!({"type":"user","uuid":"b","message":{"content":[{"type":"tool_result","tool_use_id":"c","content":[{"type":"text","text":"done"},{"type":"unknown_nested","secret":"synthetic"}]}]}}),
     ]);
-    let page = scanner
-        .transcript_page(&key, None, PageDirection::Forward, PAGE)
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PAGE,
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert!(
         page.diagnostics
             .iter()
@@ -265,11 +362,15 @@ fn nested_hidden_and_joined_result_have_openable_diagnostics() {
     assert!(page.diagnostics.iter().any(|d| d.label.contains("hidden")));
     for diag in page.diagnostics {
         assert!(
-            scanner
-                .source_record(&diag.locator)
-                .unwrap()
-                .raw
-                .contains("tool_result")
+            support::world::try_source(
+                &mut scanner,
+                &diag.locator,
+                support::world::BIG,
+                support::world::STEPS
+            )
+            .unwrap()
+            .raw
+            .contains("tool_result")
         );
     }
 }
@@ -281,17 +382,19 @@ fn revisions_and_shared_message_usage_are_consistent_across_pages() {
     b["message"]["id"] = json!("a");
     let replacement = assistant("a", json!("replacement"));
     let (_dir, _, mut scanner, key) = setup(&[a, b, replacement]);
-    let page = scanner
-        .transcript_page(
-            &key,
-            None,
-            PageDirection::Forward,
-            PageRequest {
-                max_events: 10,
-                ..PAGE
-            },
-        )
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PageRequest {
+            max_events: 10,
+            ..PAGE
+        },
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert_eq!(page.events.len(), 2);
     assert_eq!(page.events.iter().filter(|e| e.usage.is_some()).count(), 1);
     assert_eq!(page.events[1].text.as_ref().unwrap().preview, "replacement");
@@ -308,27 +411,48 @@ fn index_preserves_partial_record_completed_beyond_scanned_boundary() {
         .unwrap();
     write!(file, "{}", &line[..split]).unwrap();
     file.flush().unwrap();
-    scanner.refresh(NOW, BUDGET).unwrap();
+    support::world::rescan(&mut scanner, NOW, BUDGET);
     writeln!(file, "{}", &line[split..]).unwrap();
     file.flush().unwrap();
-    let page = scanner
-        .transcript_page(&key, None, PageDirection::Forward, PAGE)
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PAGE,
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert_eq!(page.events.len(), 1);
-    scanner.refresh(NOW, BUDGET).unwrap();
-    let page = scanner
-        .transcript_page(&key, None, PageDirection::Backward, PAGE)
-        .unwrap();
+    support::world::rescan(&mut scanner, NOW, BUDGET);
+    let page = support::world::try_transcript(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Backward,
+        PAGE,
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert_eq!(page.events[0].text.as_ref().unwrap().preview, "second");
 }
 
 #[test]
 fn large_sampled_source_rejects_replacement_with_identical_samples() {
     let (_dir, path, mut scanner, key) = setup(&[assistant("a", json!("visible"))]);
-    let locator = scanner
-        .transcript_page(&key, None, PageDirection::Forward, PAGE)
-        .unwrap()
-        .events[0]
+    let locator = support::world::try_transcript(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PAGE,
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .unwrap()
+    .events[0]
         .provenance
         .locator
         .clone();
@@ -338,13 +462,29 @@ fn large_sampled_source_rejects_replacement_with_identical_samples() {
         .unwrap();
     writeln!(file, "{}", "x".repeat(5 * 1024 * 1024)).unwrap();
     drop(file);
-    scanner.refresh(NOW, BUDGET).unwrap();
-    assert!(scanner.source_record(&locator).is_ok());
+    support::world::rescan(&mut scanner, NOW, BUDGET);
+    assert!(
+        support::world::try_source(
+            &mut scanner,
+            &locator,
+            support::world::BIG,
+            support::world::STEPS
+        )
+        .is_ok()
+    );
     let replacement = path.with_extension("replacement");
     std::fs::write(&replacement, std::fs::read(&path).unwrap()).unwrap();
     std::fs::remove_file(&path).unwrap();
     std::fs::rename(&replacement, &path).unwrap();
-    assert!(scanner.source_record(&locator).is_err());
+    assert!(
+        support::world::try_source(
+            &mut scanner,
+            &locator,
+            support::world::BIG,
+            support::world::STEPS
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -352,30 +492,23 @@ fn enormous_oversized_record_is_indexed_across_bounded_steps() {
     let (_dir, path, mut scanner, key) = setup(&[assistant("a", json!("visible"))]);
     let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     writeln!(file, "{}", "x".repeat(10 * 1024 * 1024)).unwrap();
-    // The roster drains the oversized line under the refresh budget, so it takes
-    // several refreshes; the transcript index then builds in its own bounded steps.
-    let mut refreshes = 0;
-    while !scanner.refresh(NOW, BUDGET).unwrap().scan.done {
-        refreshes += 1;
-        assert!(refreshes < 1000, "scan never finished");
-    }
-    assert!(refreshes >= 2, "oversized drain must span refreshes");
-    let mut retries = 0;
-    loop {
-        match scanner.transcript_page(&key, None, PageDirection::Forward, PAGE) {
-            Ok(page) => {
-                assert_eq!(page.events.len(), 1);
-                break;
-            }
-            Err(agentscope::providers::ProviderError::Unavailable(message))
-                if message.contains("index is building") =>
-            {
-                retries += 1
-            }
-            Err(error) => panic!("{error}"),
-        }
-    }
-    assert!(retries >= 2);
+    // Hydration drains the oversized line under the work budget, so it takes several
+    // slices; the transcript index then builds in its own bounded steps.
+    let found = support::world::discover_pass(&mut scanner, NOW, BUDGET);
+    assert_eq!(found.sessions.len(), 1);
+    let (_, slices) = support::world::hydrate_steps(&mut scanner, &key, NOW, BUDGET, 1000);
+    assert!(slices >= 2, "oversized drain must span slices");
+    let (page, pending) = support::world::transcript_steps(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PAGE,
+        BUDGET,
+        support::world::STEPS,
+    );
+    assert_eq!(page.events.len(), 1);
+    assert!(pending >= 2);
 }
 
 #[test]
@@ -386,9 +519,16 @@ fn diagnostic_overflow_preserves_events_and_marks_truncation() {
             records.push(assistant("a", json!("visible")));
         }
         let (_dir, _, mut scanner, key) = setup(&records);
-        let page = scanner
-            .transcript_page(&key, None, PageDirection::Forward, PAGE)
-            .unwrap();
+        let page = support::world::try_transcript(
+            &mut scanner,
+            &key,
+            None,
+            PageDirection::Forward,
+            PAGE,
+            support::world::BIG,
+            support::world::STEPS,
+        )
+        .unwrap();
         assert_eq!(page.events.len(), usize::from(visible));
         if visible {
             assert_eq!(page.events[0].text.as_ref().unwrap().preview, "visible");
@@ -397,7 +537,15 @@ fn diagnostic_overflow_preserves_events_and_marks_truncation() {
         assert_eq!(page.diagnostics.len(), 200);
         let marker = page.diagnostics.last().unwrap();
         assert!(marker.label.contains("diagnostics truncated"));
-        assert!(scanner.source_record(&marker.locator).is_ok());
+        assert!(
+            support::world::try_source(
+                &mut scanner,
+                &marker.locator,
+                support::world::BIG,
+                support::world::STEPS
+            )
+            .is_ok()
+        );
     }
 }
 
@@ -407,28 +555,33 @@ fn finalization_is_resumable_after_small_append() {
         .map(|n| assistant(&format!("{n}"), json!("x")))
         .collect();
     let (_dir, path, mut scanner, key) = setup(&records);
-    while !scanner.refresh(NOW, BUDGET).unwrap().scan.done {}
-    while scanner
-        .transcript_page(&key, None, PageDirection::Forward, PAGE)
-        .is_err()
-    {}
+    support::world::transcript_ready(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PAGE,
+        BUDGET,
+        support::world::STEPS,
+    );
     let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     writeln!(file, "{}", assistant("new", json!("last"))).unwrap();
     file.flush().unwrap();
-    scanner.refresh(NOW, BUDGET).unwrap();
-    assert!(matches!(
-        scanner.transcript_page(&key, None, PageDirection::Forward, PAGE),
-        Err(agentscope::providers::ProviderError::Unavailable(_))
-    ));
-    let mut retries = 1;
-    while scanner
-        .transcript_page(&key, None, PageDirection::Forward, PAGE)
-        .is_err()
-    {
-        retries += 1;
-        assert!(retries < 100);
-    }
-    assert!(retries >= 2);
+    support::world::rescan(&mut scanner, NOW, BUDGET);
+    let (page, pending) = support::world::transcript_steps(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PAGE,
+        BUDGET,
+        support::world::STEPS,
+    );
+    assert!(
+        pending >= 1,
+        "the extended index finalizes in resumable steps"
+    );
+    assert_eq!(page.events.len(), 1);
 }
 
 #[test]
@@ -439,7 +592,15 @@ fn large_uuid_many_blocks_hits_metadata_limit() {
     );
     let (_dir, _, mut scanner, key) = setup(&[record]);
     assert!(matches!(
-        scanner.transcript_page(&key, None, PageDirection::Forward, PAGE),
+        support::world::try_transcript(
+            &mut scanner,
+            &key,
+            None,
+            PageDirection::Forward,
+            PAGE,
+            support::world::BIG,
+            support::world::STEPS
+        ),
         Err(agentscope::providers::ProviderError::Unsupported(_))
     ));
 }
@@ -497,7 +658,9 @@ fn stop_reason_drives_completion_unfinished_work_and_reopening() {
             ),
         ],
     );
-    let done = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    let done = support::world::rescan(&mut s, NOW, BUDGET)
+        .sessions
+        .remove(0);
     assert_eq!(done.lifecycle, Lifecycle::Completed);
     assert!(!done.unfinished_work);
     let completed_at = done.last_completion.expect("end_turn is a completion");
@@ -514,7 +677,9 @@ fn stop_reason_drives_completion_unfinished_work_and_reopening() {
             json!("one more thing"),
         )],
     );
-    let reopened = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    let reopened = support::world::rescan(&mut s, NOW, BUDGET)
+        .sessions
+        .remove(0);
     assert!(reopened.unfinished_work);
     assert_eq!(reopened.lifecycle, Lifecycle::Ongoing);
     assert_eq!(reopened.last_completion, Some(completed_at));
@@ -531,7 +696,9 @@ fn stop_reason_drives_completion_unfinished_work_and_reopening() {
             json!("fine"),
         )],
     );
-    let closed = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    let closed = support::world::rescan(&mut s, NOW, BUDGET)
+        .sessions
+        .remove(0);
     assert!(!closed.unfinished_work);
     append(
         &path,
@@ -543,7 +710,9 @@ fn stop_reason_drives_completion_unfinished_work_and_reopening() {
             json!("<system-reminder>ignore</system-reminder>"),
         )],
     );
-    let still = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    let still = support::world::rescan(&mut s, NOW, BUDGET)
+        .sessions
+        .remove(0);
     assert!(!still.unfinished_work, "injected text is not user work");
     append(
         &path,
@@ -555,7 +724,9 @@ fn stop_reason_drives_completion_unfinished_work_and_reopening() {
             json!([{"type":"tool_use","id":"t2","name":"Bash","input":{}}]),
         )],
     );
-    let pending = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    let pending = support::world::rescan(&mut s, NOW, BUDGET)
+        .sessions
+        .remove(0);
     assert!(pending.unfinished_work);
     assert_eq!(pending.lifecycle, Lifecycle::Ongoing);
 }
@@ -567,7 +738,8 @@ fn result_appended_for_a_displayed_pending_call_invalidates_the_session() {
         json!([{"type":"tool_use","id":"c","name":"Read","input":{}}]),
     )]);
     let page = |s: &mut ClaudeScanner| {
-        s.transcript_page(
+        support::world::try_transcript(
+            s,
             &key,
             None,
             PageDirection::Forward,
@@ -575,6 +747,8 @@ fn result_appended_for_a_displayed_pending_call_invalidates_the_session() {
                 max_events: 10,
                 ..PAGE
             },
+            support::world::BIG,
+            support::world::STEPS,
         )
         .unwrap()
     };
@@ -584,7 +758,11 @@ fn result_appended_for_a_displayed_pending_call_invalidates_the_session() {
     );
     // An unrelated append leaves the displayed row alone.
     append(&path, &[assistant("b", json!("note"))]);
-    assert!(s.refresh(NOW, BUDGET).unwrap().invalidated.is_empty());
+    assert!(
+        support::world::rescan(&mut s, NOW, BUDGET)
+            .invalidated
+            .is_empty()
+    );
 
     append(
         &path,
@@ -592,7 +770,7 @@ fn result_appended_for_a_displayed_pending_call_invalidates_the_session() {
             json!({"type":"user","uuid":"r","message":{"content":[{"type":"tool_result","tool_use_id":"c","content":"done"}]}}),
         ],
     );
-    let delta = s.refresh(NOW, BUDGET).unwrap();
+    let delta = support::world::rescan(&mut s, NOW, BUDGET);
     assert_eq!(delta.invalidated, vec![key.clone()]);
     let after = page(&mut s);
     assert_eq!(
@@ -620,7 +798,7 @@ fn growing_in_place_rewrite_resets_state_and_invalidates() {
     f.flush().unwrap();
     drop(f);
 
-    let delta = s.refresh(NOW, BUDGET).unwrap();
+    let delta = support::world::rescan(&mut s, NOW, BUDGET);
     assert!(
         delta.invalidated.contains(&key),
         "rewrite must invalidate: {:?}",
@@ -628,17 +806,19 @@ fn growing_in_place_rewrite_resets_state_and_invalidates() {
     );
     let summary = &delta.sessions[0];
     assert_eq!(summary.displayed_event_count, 4);
-    let page = s
-        .transcript_page(
-            &key,
-            None,
-            PageDirection::Forward,
-            PageRequest {
-                max_events: 10,
-                ..PAGE
-            },
-        )
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut s,
+        &key,
+        None,
+        PageDirection::Forward,
+        PageRequest {
+            max_events: 10,
+            ..PAGE
+        },
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     let texts: Vec<_> = page
         .events
         .iter()
@@ -671,19 +851,21 @@ fn middle_only_rewrite_followed_by_append_is_detected_exactly() {
     drop(f);
     append(&path, &[assistant("d", json!("appended"))]);
 
-    let delta = s.refresh(NOW, BUDGET).unwrap();
+    let delta = support::world::rescan(&mut s, NOW, BUDGET);
     assert!(delta.invalidated.contains(&key), "{:?}", delta.invalidated);
-    let page = s
-        .transcript_page(
-            &key,
-            None,
-            PageDirection::Forward,
-            PageRequest {
-                max_events: 10,
-                ..PAGE
-            },
-        )
-        .expect("pages are readable after the rebuild");
+    let page = support::world::try_transcript(
+        &mut s,
+        &key,
+        None,
+        PageDirection::Forward,
+        PageRequest {
+            max_events: 10,
+            ..PAGE
+        },
+        support::world::BIG,
+        support::world::STEPS,
+    )
+    .expect("pages are readable after the rebuild");
     let texts: Vec<_> = page
         .events
         .iter()
@@ -712,24 +894,26 @@ fn prefix_verification_is_resumable_under_a_small_budget() {
         max_bytes: 16 * 1024,
         max_millis: 60_000,
     };
-    let mut steps = 0;
-    let mut last = None;
-    loop {
-        let d = s.refresh(NOW, small).unwrap();
-        steps += 1;
-        if let Some(x) = d.sessions.into_iter().next() {
-            last = Some(x);
-        }
-        if d.scan.done {
-            break;
-        }
-        assert!(steps < 1000);
-    }
+    assert_eq!(
+        support::world::discover_pass(&mut s, NOW, small)
+            .sessions
+            .len(),
+        1
+    );
+    let (summary, steps) = support::world::hydrate_steps(&mut s, &key, NOW, small, 1000);
     assert!(steps >= 5, "80 KB verified at 16 KB per step: {steps}");
-    assert_eq!(last.unwrap().displayed_event_count, 41);
+    assert_eq!(summary.displayed_event_count, 41);
     assert!(
-        s.transcript_page(&key, None, PageDirection::Forward, PAGE)
-            .is_ok()
+        support::world::try_transcript(
+            &mut s,
+            &key,
+            None,
+            PageDirection::Forward,
+            PAGE,
+            support::world::BIG,
+            support::world::STEPS
+        )
+        .is_ok()
     );
 }
 
@@ -757,7 +941,9 @@ fn tool_use_without_stop_reason_after_end_turn_reopens_the_turn() {
             json!("really done"),
         )],
     );
-    let done = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    let done = support::world::rescan(&mut s, NOW, BUDGET)
+        .sessions
+        .remove(0);
     assert_eq!(status_label(&done), StatusLabel::Complete);
     let completed_at = done.last_completion.unwrap();
     // Streamed assistant record: tool_use block, null stop_reason, no user record.
@@ -771,7 +957,9 @@ fn tool_use_without_stop_reason_after_end_turn_reopens_the_turn() {
             json!([{"type":"tool_use","id":"t9","name":"Bash","input":{}}]),
         )],
     );
-    let open = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    let open = support::world::rescan(&mut s, NOW, BUDGET)
+        .sessions
+        .remove(0);
     assert!(open.unfinished_work);
     assert_eq!(open.lifecycle, Lifecycle::Ongoing);
     assert_eq!(open.last_completion, Some(completed_at));

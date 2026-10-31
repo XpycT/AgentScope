@@ -3,7 +3,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::domain::{ProcessAssociation, Provider, StatusLabel};
+use crate::domain::{Harness, ProcessAssociation, StatusLabel};
 
 pub const ELLIPSIS: char = '…';
 
@@ -21,6 +21,12 @@ pub fn search_prompt(text: &str) -> String {
         text.to_string()
     };
     format!("Search: {shown}_   Enter keep  Esc cancel  Ctrl+u clear")
+}
+
+/// Display-safe text on one physical line: sanitized, redacted, and with line
+/// breaks flattened so untrusted text can never start a new screen row.
+pub fn one_line(text: &str) -> String {
+    crate::ingest::text::display_safe(text).replace(['\n', '\r'], " ")
 }
 
 /// Fit `text` into exactly `width` columns: truncate with a visible marker or
@@ -47,11 +53,14 @@ pub fn fit(text: &str, width: usize) -> String {
     out
 }
 
-pub fn provider_name(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Codex => "Codex",
-        Provider::Claude => "Claude",
-        Provider::OpenCode => "OpenCode",
+pub fn harness_name(harness: Harness) -> &'static str {
+    match harness {
+        Harness::Codex => "Codex",
+        Harness::Claude => "Claude",
+        Harness::OpenCode => "OpenCode",
+        Harness::Omp => "OMP",
+        Harness::Hermes => "Hermes",
+        Harness::Pi => "Pi",
     }
 }
 

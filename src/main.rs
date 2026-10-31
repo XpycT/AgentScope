@@ -1,7 +1,7 @@
 use agentscope::app::App;
 use agentscope::config::{CliOverrides, Config};
-use agentscope::domain::Thresholds;
-use agentscope::ingest::jsonl::{JsonlCursor, Record};
+use agentscope::domain::{LocatorKind, RefreshBudget, Thresholds};
+use agentscope::ingest::source::{SourceError, SourceItem, SourceReader};
 use agentscope::ingest::text::display_safe;
 use agentscope::providers::ProviderReader;
 use agentscope::providers::claude::ClaudeScanner;
@@ -17,35 +17,54 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
-const USAGE: &str = "Usage: agentscope [OPTIONS]\n       agentscope inspect <codex.jsonl>";
+/// One diagnostic inspection slice: a diagnostic must stay bounded on a huge archive
+/// and simply take more steps.
+const INSPECT_BUDGET: RefreshBudget = RefreshBudget {
+    max_records: 256,
+    max_bytes: 8 * 1024 * 1024,
+    max_millis: 100,
+};
+
+const USAGE: &str =
+    "Usage: agentscope [OPTIONS]\n       agentscope inspect <rollout.jsonl|rollout.jsonl.zst>";
 
 const HELP: &str =
     "AgentScope: read-only monitor for local Codex, Claude Code, and OpenCode sessions.
 
 Usage:
   agentscope [OPTIONS]
-  agentscope inspect <codex.jsonl>   Print a Codex transcript (diagnostic, no TUI)
+  agentscope inspect <rollout.jsonl|rollout.jsonl.zst>
+                            Print a Codex transcript or its archived copy (no TUI)
 
 Options:
   --config <path>           Config file (default: platform config directory)
   --codex-sessions <dir>    Codex sessions root
   --claude-projects <dir>   Claude projects root
+  --claude-desktop <dir>    Claude Desktop application-data directory
   --opencode-db <path>      OpenCode database
+  --omp-sessions <dir>      OMP sessions root (accepted; no reader yet)
+  --pi-sessions <dir>       Pi sessions root (accepted; no reader yet)
+  --hermes-db <path>        Hermes state.db (accepted; no reader yet)
   --no-processes            Disable process observation
   --no-color                Disable color (NO_COLOR is also honored)
+  --no-mouse                Disable mouse capture (keyboard still works; the terminal keeps native selection)
   --version                 Print version
   --help                    Print this help
 
-Keys: j/k move, g/G first/last, Enter open, / search, n/N next/previous match, f filter,
-      s sort (S reverse), r refresh, p process candidates, D diagnostics, v source,
-      x redaction, ? help, q or Ctrl+c quit.";
+Keys: j/k move, g/G first/last, Enter open (or load more), Space expand, Tab swap list/preview,
+      Left/Right scroll columns, J/K scroll preview, / search, n/N next/previous match,
+      f filter, s sort (S reverse), r refresh, p process candidates, D diagnostics, v source,
+      x redaction, ? help, q or Ctrl+c quit.
+Mouse: click selects, the marker expands, Load more rows load, the wheel scrolls; hold Shift to
+       select text with the terminal. Mouse input never changes agent sessions.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
     Version,
     Inspect(PathBuf),
-    Run(CliOverrides),
+    /// Boxed: the resolved overrides outgrew the other variants.
+    Run(Box<CliOverrides>),
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
@@ -78,13 +97,18 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
             "--config" => cli.config = Some(value(&mut args)?),
             "--codex-sessions" => cli.codex_sessions = Some(value(&mut args)?),
             "--claude-projects" => cli.claude_projects = Some(value(&mut args)?),
+            "--claude-desktop" => cli.claude_desktop = Some(value(&mut args)?),
             "--opencode-db" => cli.opencode_db = Some(value(&mut args)?),
+            "--omp-sessions" => cli.omp_sessions = Some(value(&mut args)?),
+            "--pi-sessions" => cli.pi_sessions = Some(value(&mut args)?),
+            "--hermes-db" => cli.hermes_db = Some(value(&mut args)?),
             "--no-processes" if inline.is_none() => cli.no_processes = true,
             "--no-color" if inline.is_none() => cli.no_color = true,
+            "--no-mouse" if inline.is_none() => cli.no_mouse = true,
             _ => return Err(format!("unrecognized argument: {}", display_safe(&text))),
         }
     }
-    Ok(Command::Run(cli))
+    Ok(Command::Run(Box::new(cli)))
 }
 
 fn main() -> ExitCode {
@@ -117,7 +141,8 @@ fn run_tui(cli: &CliOverrides) -> ExitCode {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         eprintln!(
             "agentscope: stdin and stdout must be a terminal for the interactive view.\n\
-             To read a transcript without the TUI, use: agentscope inspect <codex.jsonl>"
+             To read a transcript without the TUI, use: \
+             agentscope inspect <rollout.jsonl|rollout.jsonl.zst>"
         );
         return ExitCode::from(2);
     }
@@ -130,7 +155,6 @@ fn run_tui(cli: &CliOverrides) -> ExitCode {
     };
     let no_color = config.no_color || std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
 
-    let (readers, notes) = build_readers(&config);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
@@ -144,15 +168,15 @@ fn run_tui(cli: &CliOverrides) -> ExitCode {
     let mut ctx = RosterContext {
         no_color,
         roots: checked_roots(&config),
-        notes,
+        notes: Vec::new(),
         last_refresh: None,
         error: None,
     };
-    let worker = WorkerHandle::spawn(readers, config.clone());
-    let respawn = || {
+    // Readers (including the SQLite open) are always built on the worker thread, for
+    // the first worker and for every replacement.
+    let spawn = || {
         let (notes_tx, notes) = std::sync::mpsc::channel();
         let factory_config = config.clone();
-        // Readers (including the SQLite open) are built on the worker thread.
         let worker = WorkerHandle::spawn_lazy(
             Box::new(move || {
                 let (readers, notes) = build_readers(&factory_config);
@@ -163,7 +187,7 @@ fn run_tui(cli: &CliOverrides) -> ExitCode {
         );
         ui::Respawned { worker, notes }
     };
-    match ui::run(&mut app, &mut ctx, worker, &respawn) {
+    match ui::run(&mut app, &mut ctx, spawn(), &spawn, config.mouse_enabled) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("agentscope: terminal error: {:?}", error.kind());
@@ -174,7 +198,7 @@ fn run_tui(cli: &CliOverrides) -> ExitCode {
 
 fn build_readers(config: &Config) -> (Vec<Box<dyn ProviderReader>>, Vec<String>) {
     let mut readers: Vec<Box<dyn ProviderReader>> = Vec::new();
-    let mut notes = Vec::new();
+    let mut notes = config.startup_notes();
     let mut add = |name: &str, result: Result<Box<dyn ProviderReader>, _>| match result {
         Ok(reader) => readers.push(reader),
         Err(error) => notes.push(format!("{name} unavailable: {error}")),
@@ -191,7 +215,7 @@ fn build_readers(config: &Config) -> (Vec<Box<dyn ProviderReader>>, Vec<String>)
     let (opencode, opened) = RetryingOpenCode::open(config);
     match opened {
         None => readers.push(Box::new(opencode)),
-        Some(error) if config.providers.opencode.db.is_some() => {
+        Some(error) if config.harnesses.opencode.db.is_some() => {
             notes.push(format!("OpenCode unavailable: {error}; retrying"));
             readers.push(Box::new(opencode));
         }
@@ -206,48 +230,65 @@ fn checked_roots(config: &Config) -> Vec<String> {
         None => format!("{name}: no location configured"),
     };
     vec![
-        show("Codex", &config.providers.codex.root),
-        show("Claude", &config.providers.claude.root),
-        show("OpenCode", &config.providers.opencode.db),
+        show("Codex", &config.harnesses.codex.root),
+        show("Claude", &config.harnesses.claude.root),
+        show("OpenCode", &config.harnesses.opencode.db),
     ]
 }
 
-fn inspect(path: PathBuf) -> io::Result<()> {
-    let mut reader = JsonlCursor::open(path, MAX_RECORD_BYTES)?;
+fn inspect(path: PathBuf) -> Result<(), SourceError> {
+    let mut reader = SourceReader::open(&path, MAX_RECORD_BYTES)?;
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
-    while let Some(record) = reader.next_record()? {
-        match record {
-            Record::Json { offset, value } => {
-                let payload = &value["payload"];
-                if value["type"] == "session_meta" {
-                    if let Some(id) = payload["id"].as_str() {
-                        writeln!(stdout, "Session: {}", display_safe(id))?;
-                    }
-                } else if value["type"] == "response_item" && payload["type"] == "message" {
-                    let role = match payload["role"].as_str() {
-                        Some("user") => "User",
-                        Some("assistant") => "Assistant",
-                        _ => continue,
-                    };
-                    if let Some(parts) = payload["content"].as_array() {
-                        for part in parts {
-                            if (part["type"] == "input_text" || part["type"] == "output_text")
-                                && let Some(text) = part["text"].as_str()
-                            {
-                                writeln!(stdout, "[{role} @ {offset}] {}", display_safe(text))?;
+    loop {
+        let batch = reader.step(INSPECT_BUDGET)?;
+        for record in &batch.records {
+            // A compressed ordinal names the record; a plain file's own byte offset is
+            // meaningful, so each source keeps its own anchor.
+            let (anchor, at) = match &record.locator {
+                LocatorKind::FileOffset { offset, .. } => {
+                    (offset.to_string(), format!("byte {offset}"))
+                }
+                LocatorKind::CompressedRecord { ordinal, .. } => {
+                    (format!("#{ordinal}"), format!("record #{ordinal}"))
+                }
+                LocatorKind::DbRow { .. } => continue,
+            };
+            match &record.item {
+                SourceItem::Json(value) => {
+                    let payload = &value["payload"];
+                    if value["type"] == "session_meta" {
+                        if let Some(id) = payload["id"].as_str() {
+                            writeln!(stdout, "Session: {}", display_safe(id))?;
+                        }
+                    } else if value["type"] == "response_item" && payload["type"] == "message" {
+                        let role = match payload["role"].as_str() {
+                            Some("user") => "User",
+                            Some("assistant") => "Assistant",
+                            _ => continue,
+                        };
+                        if let Some(parts) = payload["content"].as_array() {
+                            for part in parts {
+                                if (part["type"] == "input_text" || part["type"] == "output_text")
+                                    && let Some(text) = part["text"].as_str()
+                                {
+                                    writeln!(stdout, "[{role} @ {anchor}] {}", display_safe(text))?;
+                                }
                             }
                         }
                     }
                 }
-            }
-            Record::Invalid { offset } => writeln!(stderr, "Invalid JSON record at byte {offset}")?,
-            Record::TooLarge { offset } => writeln!(stderr, "Oversized record at byte {offset}")?,
-            Record::Skipping { .. } => {}
-            Record::Incomplete { offset } => {
-                writeln!(stderr, "Incomplete record at byte {offset}")?
+                SourceItem::Invalid => writeln!(stderr, "Invalid JSON record at {at}")?,
+                SourceItem::TooLarge => writeln!(stderr, "Oversized record at {at}")?,
+                SourceItem::Skipping => {}
+                SourceItem::Incomplete => writeln!(stderr, "Incomplete record at {at}")?,
+                SourceItem::Damaged(damage) => {
+                    writeln!(stderr, "Damaged source at {at}: {damage}")?
+                }
             }
         }
+        if batch.done {
+            return Ok(());
+        }
     }
-    Ok(())
 }

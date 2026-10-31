@@ -3,6 +3,8 @@
 
 pub mod claude;
 pub mod codex;
+pub mod desktop;
+pub mod facts;
 pub mod opencode;
 pub mod world;
 
@@ -22,6 +24,15 @@ pub fn config_for(root: &Path) -> Config {
         ..CliOverrides::default()
     };
     Config::load_with_env(&cli, &Env::new()).expect("valid test config")
+}
+
+/// Config whose Codex sessions and archived stores are exactly `sessions` and
+/// `archived`, as one native store.
+pub fn config_for_store(sessions: &Path, archived: &Path) -> Config {
+    let mut config = config_for(sessions);
+    config.harnesses.codex.archived = Some(archived.to_path_buf());
+    config.harnesses.codex.archived_explicit = true;
+    config
 }
 
 pub fn write_lines(path: &Path, lines: &[String]) {
@@ -108,5 +119,61 @@ impl Unreadable {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&self.path, fs::Permissions::from_mode(0o644)).ok();
         }
+    }
+}
+
+/// Every source the allowlisted traversal of a provider root yields, in traversal order.
+pub struct Walked {
+    pub sources: Vec<agentscope::discovery::SourceFile>,
+    pub warnings: Vec<agentscope::domain::Warning>,
+}
+
+fn walk_sources(harness: agentscope::domain::Harness, root: Option<&Path>) -> Walked {
+    let mut walk = agentscope::discovery::Walk::new(harness, root);
+    let mut sources = Vec::new();
+    while !walk.is_done() {
+        sources.extend(walk.step(64, std::time::Instant::now() + Duration::from_secs(60)));
+    }
+    Walked {
+        sources,
+        warnings: walk.take_warnings(),
+    }
+}
+
+pub fn codex_sources(config: &Config) -> Walked {
+    walk_sources(
+        agentscope::domain::Harness::Codex,
+        config.harnesses.codex.root.as_deref(),
+    )
+}
+
+pub fn claude_sources(config: &Config) -> Walked {
+    walk_sources(
+        agentscope::domain::Harness::Claude,
+        config.harnesses.claude.root.as_deref(),
+    )
+}
+
+/// A frozen roster generation whose loaded roots are `sessions`, in order, all hydrated.
+pub fn snapshot(
+    generation: u64,
+    sessions: Vec<agentscope::domain::SessionSummary>,
+    scan: agentscope::domain::ScanProgress,
+) -> agentscope::roster::RosterSnapshot {
+    let roots: Vec<agentscope::domain::SessionKey> =
+        sessions.iter().map(|s| s.meta.key.clone()).collect();
+    agentscope::roster::RosterSnapshot {
+        generation,
+        roots: roots.into(),
+        metadata: sessions
+            .iter()
+            .map(|s| std::sync::Arc::new(s.meta.clone()))
+            .collect(),
+        summaries: sessions.into_iter().map(std::sync::Arc::new).collect(),
+        scan: vec![scan],
+        has_more: false,
+        limited: None,
+        refresh_available: false,
+        provisional: false,
     }
 }

@@ -2,14 +2,15 @@ mod support;
 
 use std::collections::HashMap;
 
-use agentscope::config::{CliOverrides, Config, Env, PriceEntry, PriceSchedule};
-use agentscope::discovery::discover_codex;
+use agentscope::config::{CliOverrides, Config, Env};
 use agentscope::domain::{
-    AggregationClass, Lifecycle, Provider, RefreshBudget, SessionKey, SessionLink, SessionSummary,
+    AggregationClass, Harness, Lifecycle, RefreshBudget, SessionKey, SessionLink, SessionSummary,
     SourceKey, Warning, WarningKind,
 };
+use agentscope::providers::ProviderReader;
 use agentscope::providers::codex::CodexScanner;
 use support::codex::*;
+use support::facts::price_schedule;
 use support::{NOW, Unreadable, config_for, dated, link_dir, set_modified, write_lines};
 
 const BIG: RefreshBudget = RefreshBudget {
@@ -25,6 +26,8 @@ struct Scan {
     calls: usize,
 }
 
+/// Discovery to the end of one pass, then hydration of every source it reported, all
+/// under `budget`. `calls` counts every discovery and hydration slice.
 fn scan_until_done(scanner: &mut CodexScanner, budget: RefreshBudget) -> Scan {
     let mut scan = Scan {
         sessions: HashMap::new(),
@@ -32,19 +35,35 @@ fn scan_until_done(scanner: &mut CodexScanner, budget: RefreshBudget) -> Scan {
         warnings: vec![],
         calls: 0,
     };
+    let mut keys: Vec<SessionKey> = Vec::new();
     loop {
-        let delta = scanner.scan_roster(NOW, budget).expect("scan");
+        let delta = scanner.discover(NOW, budget).expect("discover");
         scan.calls += 1;
-        for s in delta.sessions {
-            scan.sessions.insert(s.key.clone(), s);
+        for meta in delta.sessions {
+            if !keys.contains(&meta.key) {
+                keys.push(meta.key);
+            }
         }
         scan.removed.extend(delta.removed);
         scan.warnings.extend(delta.warnings);
         if delta.scan.done {
-            return scan;
+            break;
         }
-        assert!(scan.calls < 10_000, "scan never finished");
+        assert!(scan.calls < 10_000, "discovery never finished");
     }
+    for key in keys {
+        let job = support::world::new_job();
+        loop {
+            let delta = scanner.hydrate(job, &key, NOW, budget).expect("hydrate");
+            scan.calls += 1;
+            if delta.done {
+                scan.sessions.insert(key, delta.summary);
+                break;
+            }
+            assert!(scan.calls < 1_000_000, "hydration never finished");
+        }
+    }
+    scan
 }
 
 fn only(scan: &Scan) -> &SessionSummary {
@@ -98,7 +117,7 @@ fn discovers_rollout_files_and_skips_symlinks_and_missing_roots() {
     }
     eprintln!("symlinks created: {linked}");
 
-    let found = discover_codex(&config_for(&root)).unwrap();
+    let found = support::codex_sources(&config_for(&root));
     let mut names: Vec<_> = found
         .sources
         .iter()
@@ -109,11 +128,11 @@ fn discovers_rollout_files_and_skips_symlinks_and_missing_roots() {
     assert!(found.sources.iter().all(|s| s.len > 0));
     assert!(found.warnings.is_empty());
 
-    let missing = discover_codex(&config_for(&dir.path().join("nope"))).unwrap();
+    let missing = support::codex_sources(&config_for(&dir.path().join("nope")));
     assert!(missing.sources.is_empty());
     assert_eq!(missing.warnings.len(), 1);
     assert_eq!(missing.warnings[0].key.kind, WarningKind::Unavailable);
-    assert_eq!(missing.warnings[0].key.provider, Provider::Codex);
+    assert_eq!(missing.warnings[0].key.harness, Harness::Codex);
 }
 
 #[test]
@@ -130,7 +149,7 @@ fn root_overrides_follow_cli_then_env_then_home() {
     env.insert("CODEX_HOME".into(), home.clone().into());
 
     let from_env = Config::load_with_env(&CliOverrides::default(), &env).unwrap();
-    let found = discover_codex(&from_env).unwrap();
+    let found = support::codex_sources(&from_env);
     assert_eq!(found.sources.len(), 1);
     assert!(found.sources[0].path.ends_with("rollout-h.jsonl"));
 
@@ -139,13 +158,13 @@ fn root_overrides_follow_cli_then_env_then_home() {
         ..CliOverrides::default()
     };
     let from_cli = Config::load_with_env(&cli, &env).unwrap();
-    let found = discover_codex(&from_cli).unwrap();
+    let found = support::codex_sources(&from_cli);
     assert_eq!(found.sources.len(), 1);
     assert!(found.sources[0].path.ends_with("rollout-x.jsonl"));
 }
 
 #[test]
-fn cap_keeps_newest_files_by_mtime_and_warns_with_omitted_count() {
+fn discovery_is_newest_name_first_and_not_capped_by_the_detail_cache() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("s");
     for (name, secs) in [
@@ -158,21 +177,28 @@ fn cap_keeps_newest_files_by_mtime_and_warns_with_omitted_count() {
         set_modified(&path, secs);
     }
     let mut config = config_for(&root);
-    config.max_sessions = 2;
-    let found = discover_codex(&config).unwrap();
+    config.max_cached_sessions = 2;
+    let found = support::codex_sources(&config);
     let names: Vec<_> = found
         .sources
         .iter()
         .map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, ["rollout-2.jsonl", "rollout-3.jsonl"]);
-    assert_eq!(found.warnings.len(), 1);
-    assert!(found.warnings[0].message.contains('1'));
-    assert_eq!(found.warnings[0].count, 1);
+    // Descending file names (newest first for dated rollouts); nothing is dropped.
+    assert_eq!(
+        names,
+        ["rollout-3.jsonl", "rollout-2.jsonl", "rollout-1.jsonl"]
+    );
+    assert!(found.warnings.is_empty());
 
-    let scan = scan_until_done(&mut CodexScanner::new(&config).unwrap(), BIG);
-    assert_eq!(scan.sessions.len(), 2);
-    assert!(scan.warnings.iter().any(|w| w.count == 1));
+    let mut scanner = CodexScanner::new(&config).unwrap();
+    let scan = scan_until_done(&mut scanner, BIG);
+    assert_eq!(scan.sessions.len(), 3, "every discovered source hydrates");
+    assert!(
+        scanner.cached_sessions() <= 2,
+        "the detail cache stays bounded: {}",
+        scanner.cached_sessions()
+    );
 }
 
 #[test]
@@ -201,26 +227,27 @@ fn maps_meta_cwd_source_lineage_and_model() {
     );
     let scan = scan_until_done(&mut scanner(&root), BIG);
     let s = only(&scan);
-    assert_eq!(s.key.provider, Provider::Codex);
-    assert_eq!(s.key.provider_session_id, "child-1");
-    assert_eq!(s.key.source, SourceKey::File(path));
+    assert_eq!(s.meta.key.harness, Harness::Codex);
+    assert_eq!(s.meta.key.native_id, "child-1");
+    assert_eq!(s.meta.key.source, SourceKey::File(path));
     assert_eq!(
-        s.cwd.as_deref(),
+        s.meta.cwd.as_deref(),
         Some(std::path::Path::new("/work/RipperGame"))
     );
-    assert_eq!(s.project.as_deref(), Some("RipperGame"));
-    assert_eq!(s.provider_version.as_deref(), Some("0.159.2"));
-    assert_eq!(s.models, ["gpt-b", "gpt-a"]);
-    assert_eq!(s.title, "Scout");
-    assert!(!s.title_derived);
+    assert_eq!(s.meta.project.as_deref(), Some("RipperGame"));
+    assert_eq!(s.meta.harness_version.as_deref(), Some("0.159.2"));
+    // The latest turn context wins; an earlier gpt-b is not retained.
+    assert_eq!(s.meta.model.as_ref().map(|m| m.id.as_str()), Some("gpt-a"));
+    assert_eq!(s.meta.title, "Scout");
+    assert!(!s.meta.title_derived);
     assert_eq!(
-        s.lineage.parent,
+        s.meta.lineage.parent,
         Some(SessionLink::Unresolved("parent-1".into()))
     );
-    assert!(!s.lineage.sidechain);
-    assert!(s.source_available);
-    assert_eq!(s.created_at, Some(1_793_268_000_000));
-    assert_eq!(s.last_persisted_at, Some(1_793_268_004_000));
+    assert!(!s.meta.lineage.sidechain);
+    assert!(s.meta.source_available);
+    assert_eq!(s.meta.created_at, Some(1_793_268_000_000));
+    assert_eq!(s.meta.activity.at, Some(1_793_268_004_000));
 }
 
 #[test]
@@ -252,10 +279,10 @@ fn parent_links_resolve_to_the_most_recent_source_or_stay_ambiguous() {
     let by_id = |id: &str| {
         scan.sessions
             .values()
-            .filter(|s| s.key.provider_session_id == id)
+            .filter(|s| s.meta.key.native_id == id)
             .collect::<Vec<_>>()
     };
-    let link = |id: &str| by_id(id)[0].lineage.parent.clone().unwrap();
+    let link = |id: &str| by_id(id)[0].meta.lineage.parent.clone().unwrap();
     match link("c1") {
         SessionLink::Resolved(k) => {
             assert_eq!(k.source, SourceKey::File(dated(&root, "rollout-p2.jsonl")))
@@ -308,17 +335,17 @@ fn uses_first_user_prompt_as_derived_title_and_never_developer_text() {
     let get = |id: &str| {
         scan.sessions
             .values()
-            .find(|s| s.key.provider_session_id == id)
+            .find(|s| s.meta.key.native_id == id)
             .unwrap_or_else(|| panic!("no session {id}"))
     };
     let t = get("t-1");
-    assert_eq!(t.title, "Fix the inventory API");
-    assert!(t.title_derived);
+    assert_eq!(t.meta.title, "Fix the inventory API");
+    assert!(t.meta.title_derived);
     let d = get("dev-only");
-    assert_eq!(d.title, "dev-only");
-    assert!(!d.title.contains("SECRET"));
-    assert!(!d.title_derived);
-    assert_eq!(get("long").title.chars().count(), 80);
+    assert_eq!(d.meta.title, "dev-only");
+    assert!(!d.meta.title.contains("SECRET"));
+    assert!(!d.meta.title_derived);
+    assert_eq!(get("long").meta.title.chars().count(), 80);
     // Missing session_meta: id and title fall back to the file stem with a warning.
     let n = get("rollout-nometa");
     assert!(warning(n, "#missing-meta").is_some());
@@ -366,17 +393,20 @@ fn usage_uses_latest_thread_snapshot_with_token_count_fallback() {
     let get = |id: &str| {
         scan.sessions
             .values()
-            .find(|s| s.key.provider_session_id == id)
+            .find(|s| s.meta.key.native_id == id)
             .unwrap()
     };
     let rec = get("rec").usage.as_ref().unwrap();
     assert_eq!(rec.total, Some(350));
-    assert_eq!(rec.categories.input, Some(300));
-    assert_eq!(rec.categories.cached_input, Some(100));
+    // Canonical legs: uncached input and cache reads (300 input includes 100 cached).
+    assert_eq!(rec.categories.input, Some(200));
+    assert_eq!(rec.categories.cache_read, Some(100));
+    assert_eq!(rec.categories.cached_input, None);
     assert_eq!(rec.categories.output, Some(50));
     assert_eq!(rec.categories.reasoning, Some(10));
     assert_eq!(rec.categories.cache_write, Some(0));
-    assert_eq!(rec.model.as_deref(), Some("gpt-a"));
+    assert_eq!(rec.models.len(), 1);
+    assert_eq!(rec.models[0].model.id, "gpt-a");
     assert_eq!(rec.class, AggregationClass::Reported);
     // No price configured: cost stays Unknown, never zero.
     assert_eq!(rec.cost.class, AggregationClass::Unknown);
@@ -384,7 +414,7 @@ fn usage_uses_latest_thread_snapshot_with_token_count_fallback() {
 
     let cnt = get("cnt").usage.as_ref().unwrap();
     assert_eq!(cnt.total, Some(39));
-    assert_eq!(cnt.categories.input, Some(30));
+    assert_eq!(cnt.categories.input, Some(24), "30 input minus 6 cached");
 
     assert!(get("none").usage.is_none());
 }
@@ -415,7 +445,7 @@ fn latest_cumulative_snapshot_wins_even_when_the_value_decreases() {
             s.usage.as_ref().unwrap().total,
             Some(500),
             "{}",
-            s.key.provider_session_id
+            s.meta.key.native_id
         );
     }
 }
@@ -444,25 +474,16 @@ fn cost_is_estimated_from_prices_and_unknown_for_nonzero_cache_writes() {
         );
     }
     let mut config = config_for(&root);
-    config.pricing = PriceSchedule::new(vec![PriceEntry {
-        provider: Provider::Codex,
-        model: "gpt-a".into(),
-        as_of: Some("2026-10-01".into()),
-        input_per_mtok: 1.0,
-        cached_input_per_mtok: Some(0.1),
-        cache_write_per_mtok: None,
-        cache_write_5m_per_mtok: None,
-        cache_write_1h_per_mtok: None,
-        cache_read_per_mtok: None,
-        output_per_mtok: 2.0,
-        reasoning_per_mtok: None,
-    }])
-    .unwrap();
+    // Native Codex records no billing route, so the reference policy prices it at "openai".
+    config.pricing = price_schedule(
+        r#"[{"billing_provider":"openai","model":"gpt-a","as_of":"2026-10-01",
+            "rates":{"input":1.0,"output":2.0,"cache_read":0.1}}]"#,
+    );
     let scan = scan_until_done(&mut CodexScanner::new(&config).unwrap(), BIG);
     let cost = |id: &str| {
         scan.sessions
             .values()
-            .find(|s| s.key.provider_session_id == id)
+            .find(|s| s.meta.key.native_id == id)
             .unwrap()
             .usage
             .as_ref()
@@ -501,7 +522,7 @@ fn duplicate_session_ids_remain_separate_rows() {
     totals.sort();
     assert_eq!(totals, [100, 250]);
     for s in scan.sessions.values() {
-        assert_eq!(s.key.provider_session_id, "same-id");
+        assert_eq!(s.meta.key.native_id, "same-id");
         let w = warning(s, "#duplicate-id").expect("duplicate warning");
         assert_eq!(w.count, 2);
     }
@@ -545,7 +566,7 @@ fn malformed_unknown_and_oversized_records_are_counted() {
     assert_eq!(warning(s, "#oversized").map(|w| w.count), Some(1));
     assert_eq!(warning(s, "#unknown").map(|w| w.count), Some(1));
     assert_eq!(s.hidden_records, 3);
-    assert_eq!(s.title, "after the damage");
+    assert_eq!(s.meta.title, "after the damage");
     assert_eq!(s.displayed_event_count, 1);
 }
 
@@ -583,18 +604,39 @@ fn context_window_and_lifecycle_are_reported_evidence_only() {
     let get = |id: &str| {
         scan.sessions
             .values()
-            .find(|s| s.key.provider_session_id == id)
+            .find(|s| s.meta.key.native_id == id)
             .unwrap()
     };
-    assert_eq!(get("w").context_window, Some(258_400));
+    assert_eq!(get("w").metrics.context.capacity, Some(258_400));
+    assert_eq!(
+        get("w").metrics.context.used,
+        None,
+        "no prompt snapshot yet"
+    );
+    assert_eq!(
+        get("w").metrics.timing.active_ms,
+        Some(2_000),
+        "the closed turn contributes its own span"
+    );
+    assert!(
+        !get("w").metrics.timing.active_complete,
+        "the last turn is open"
+    );
+    assert_eq!(get("x").metrics.timing.active_ms, Some(4_000));
+    assert!(get("x").metrics.timing.active_complete);
+    assert_eq!(
+        get("y").metrics.context.used,
+        Some(1),
+        "occupancy is the last prompt's input tokens, not lifetime totals"
+    );
     assert_eq!(get("w").lifecycle, Lifecycle::Ongoing);
     assert!(get("w").unfinished_work);
     assert_eq!(get("w").last_completion, Some(1_793_268_003_000));
     assert_eq!(get("x").lifecycle, Lifecycle::Completed);
     assert!(!get("x").unfinished_work);
     assert_eq!(get("x").last_completion, Some(1_793_271_605_000));
-    assert_eq!(get("x").context_window, None);
-    assert_eq!(get("y").context_window, Some(128_000));
+    assert_eq!(get("x").metrics.context.capacity, None);
+    assert_eq!(get("y").metrics.context.capacity, Some(128_000));
     assert_eq!(get("y").lifecycle, Lifecycle::Unknown);
 }
 
@@ -625,7 +667,7 @@ fn chunked_budget_resumes_and_appends_are_read_incrementally() {
     let key_a = first
         .sessions
         .keys()
-        .find(|k| k.provider_session_id == "a")
+        .find(|k| k.native_id == "a")
         .unwrap()
         .clone();
     assert_eq!(
@@ -658,7 +700,7 @@ fn chunked_budget_resumes_and_appends_are_read_incrementally() {
     std::fs::remove_file(&b).unwrap();
     let gone = scan_until_done(&mut s, BIG);
     assert_eq!(gone.removed.len(), 1);
-    assert_eq!(gone.removed[0].provider_session_id, "b");
+    assert_eq!(gone.removed[0].native_id, "b");
     assert!(!gone.warnings.is_empty());
 }
 
@@ -672,7 +714,7 @@ fn changed_session_id_retires_the_previous_key() {
     let mut s = scanner(&root);
     let first = scan_until_done(&mut s, BIG);
     let old = first.sessions.keys().next().unwrap().clone();
-    assert_eq!(old.provider_session_id, "rollout-late");
+    assert_eq!(old.native_id, "rollout-late");
 
     // The file gains metadata: the stem-keyed row must be retired.
     write_lines(
@@ -681,10 +723,7 @@ fn changed_session_id_retires_the_previous_key() {
     );
     let second = scan_until_done(&mut s, BIG);
     assert_eq!(second.removed, [old]);
-    assert_eq!(
-        second.sessions.keys().next().unwrap().provider_session_id,
-        "real-id"
-    );
+    assert_eq!(second.sessions.keys().next().unwrap().native_id, "real-id");
 
     // A replacement under another ID retires the previous one as well.
     std::fs::remove_file(&path).unwrap();
@@ -697,12 +736,9 @@ fn changed_session_id_retires_the_previous_key() {
     );
     let third = scan_until_done(&mut s, BIG);
     assert_eq!(third.removed.len(), 1);
-    assert_eq!(third.removed[0].provider_session_id, "real-id");
+    assert_eq!(third.removed[0].native_id, "real-id");
     assert_eq!(third.sessions.len(), 1);
-    assert_eq!(
-        third.sessions.keys().next().unwrap().provider_session_id,
-        "other-id"
-    );
+    assert_eq!(third.sessions.keys().next().unwrap().native_id, "other-id");
 }
 
 #[test]
@@ -780,8 +816,8 @@ fn long_cwd_is_preserved_exactly() {
     );
     let scan = scan_until_done(&mut scanner(&root), BIG);
     let s = only(&scan);
-    assert_eq!(s.cwd.as_deref(), Some(std::path::Path::new(&cwd)));
-    assert_eq!(s.project.as_deref(), Some("RipperGame"));
+    assert_eq!(s.meta.cwd.as_deref(), Some(std::path::Path::new(&cwd)));
+    assert_eq!(s.meta.project.as_deref(), Some("RipperGame"));
 }
 
 #[test]
@@ -803,7 +839,7 @@ fn symlinked_descendants_are_skipped_but_a_linked_root_works() {
         link_dir(&outside, &root.join("2026").join("linked")),
         "could not create a link"
     );
-    let found = discover_codex(&config_for(&root)).unwrap();
+    let found = support::codex_sources(&config_for(&root));
     assert_eq!(found.sources.len(), 1);
     assert!(found.sources[0].path.ends_with("rollout-in.jsonl"));
 
@@ -813,12 +849,12 @@ fn symlinked_descendants_are_skipped_but_a_linked_root_works() {
         link_dir(&root, &linked_root),
         "could not create a root link"
     );
-    let found = discover_codex(&config_for(&linked_root)).unwrap();
+    let found = support::codex_sources(&config_for(&linked_root));
     assert_eq!(found.sources.len(), 1);
 }
 
 #[test]
-fn unreadable_source_is_retained_one_refresh_then_expires_and_recovers() {
+fn unreadable_source_is_listed_unavailable_without_hiding_others_and_recovers() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("s");
     let path = dated(&root, "rollout-lock.jsonl");
@@ -834,38 +870,44 @@ fn unreadable_source_is_retained_one_refresh_then_expires_and_recovers() {
         return;
     }
     let mut s = scanner(&root);
-    let first = scan_until_done(&mut s, BIG);
-    let row = first
+    let found = support::world::discover_pass(&mut s, NOW, BIG);
+    assert_eq!(found.sessions.len(), 2, "a healthy neighbour is not hidden");
+    let locked = found
         .sessions
-        .values()
-        .find(|r| r.key.source == SourceKey::File(path.clone()))
-        .expect("retained row");
-    assert!(!row.source_available);
-    assert!(warning(row, "#unavailable").is_some());
-    assert!(first.removed.is_empty());
-
-    // Second refresh: still unreadable, so the row expires with a warning.
-    let second = scan_until_done(&mut s, BIG);
-    assert_eq!(second.removed.len(), 1);
-    assert_eq!(second.removed[0].source, SourceKey::File(path.clone()));
+        .iter()
+        .find(|m| m.key.source == SourceKey::File(path.clone()))
+        .expect("listed");
+    assert!(!locked.source_available);
     assert!(
-        second
+        found
             .warnings
             .iter()
-            .any(|w| w.key.source.ends_with("#expired"))
+            .any(|w| w.key.source.ends_with("#unavailable")),
+        "{:?}",
+        found.warnings
     );
-    assert!(second.sessions.is_empty());
+    assert!(found.removed.is_empty());
+    let row = support::world::hydrate_complete(&mut s, &locked.key, NOW);
+    assert!(!row.meta.source_available);
+    assert!(warning(&row, "#unavailable").is_some());
 
-    // Expired and still unreadable: no flapping row reappears.
-    let third = scan_until_done(&mut s, BIG);
-    assert!(third.sessions.is_empty() && third.removed.is_empty());
+    // Still unreadable on later passes: it is probed again (never silently trusted) and
+    // the row neither flaps nor disappears.
+    let again = support::world::discover_pass(&mut s, NOW, BIG);
+    assert!(again.removed.is_empty());
+    assert!(
+        again
+            .sessions
+            .iter()
+            .all(|m| m.key.source == SourceKey::File(path.clone()) && !m.source_available)
+    );
 
     // Once readable again it comes back.
     lock.release();
-    let back = scan_until_done(&mut s, BIG);
-    let row = back.sessions.values().next().expect("recovered row");
-    assert_eq!(row.key.provider_session_id, "locked");
-    assert!(row.source_available);
+    let back = support::world::rescan(&mut s, NOW, BIG);
+    let row = back.sessions.first().expect("recovered row");
+    assert_eq!(row.meta.key.native_id, "locked");
+    assert!(row.meta.source_available);
 }
 
 #[test]
@@ -903,7 +945,7 @@ fn token_usage_record_forms_are_all_read_and_latest_wins() {
             s.usage.as_ref().unwrap().total,
             Some(10),
             "{}",
-            s.key.provider_session_id
+            s.meta.key.native_id
         );
     }
 }
@@ -936,9 +978,18 @@ fn rotation_charges_the_replacements_full_bytes() {
         max_bytes,
         max_millis: 60_000,
     };
-    let first = s.scan_roster(NOW, budget).unwrap();
+    let found = support::world::discover_pass(&mut s, NOW, BIG);
+    assert_eq!(found.sessions.len(), 1, "the replacement is rediscovered");
+    let first = s
+        .hydrate(
+            support::world::new_job(),
+            &found.sessions[0].key,
+            NOW,
+            budget,
+        )
+        .unwrap();
     assert!(
-        !first.scan.done,
+        !first.done,
         "replacement's full bytes must exhaust the budget"
     );
 }
@@ -982,7 +1033,7 @@ fn cursorless_rewrite_reports_invalidated_but_append_does_not() {
     use std::io::Write;
     writeln!(f, "{}", assistant("2026-10-29T10:00:03Z", "more")).unwrap();
     set_modified(&target, 1_000); // stays the oldest rollout, so no cursor
-    let appended = s.scan_roster(NOW, BIG).unwrap();
+    let appended = support::world::rescan(&mut s, NOW, BIG);
     assert!(appended.invalidated.is_empty());
 
     // Rewrite: same event count, different content, no cursor to notice.
@@ -990,14 +1041,14 @@ fn cursorless_rewrite_reports_invalidated_but_append_does_not() {
     set_modified(&target, 1_000);
     let mut invalidated = vec![];
     loop {
-        let d = s.scan_roster(NOW, BIG).unwrap();
+        let d = support::world::rescan(&mut s, NOW, BIG);
         invalidated.extend(d.invalidated);
         if d.scan.done {
             break;
         }
     }
     assert!(
-        invalidated.iter().any(|k| k.provider_session_id == "id0"),
+        invalidated.iter().any(|k| k.native_id == "id0"),
         "rewrite without a cursor must invalidate: {invalidated:?}"
     );
 }
@@ -1040,6 +1091,10 @@ fn user_prompt_or_pending_call_after_task_complete_reopens_the_turn() {
     assert_eq!(first.lifecycle, Lifecycle::Completed);
     assert!(!first.unfinished_work);
     assert_eq!(status_label(&first), StatusLabel::Complete);
+    assert!(
+        first.metrics.timing.active_complete,
+        "a fully recorded, closed turn is complete coverage"
+    );
     let completed_at = first.last_completion.expect("completion recorded");
 
     // A later genuine user prompt reopens the turn but keeps the old completion time.
@@ -1050,6 +1105,10 @@ fn user_prompt_or_pending_call_after_task_complete_reopens_the_turn() {
     assert_eq!(reopened.lifecycle, Lifecycle::Ongoing);
     assert_eq!(reopened.last_completion, Some(completed_at));
     assert_ne!(status_label(reopened), StatusLabel::Complete);
+    assert!(
+        !reopened.metrics.timing.active_complete,
+        "a turn reopened without task_started cannot claim complete active coverage"
+    );
 
     // Injected context is not a genuine prompt.
     append_lines(&target, &[task_complete("2026-10-29T10:05:30Z")]);
@@ -1094,19 +1153,16 @@ fn output_appended_for_a_displayed_pending_call_invalidates_the_session() {
     let before = only(&first).displayed_event_count;
     // Unrelated append: nothing displayed changes.
     append_lines(&target, &[assistant("2026-10-29T10:00:03Z", "working")]);
-    let quiet = s.scan_roster(NOW, BIG).unwrap();
+    let quiet = support::world::rescan(&mut s, NOW, BIG);
     assert!(quiet.invalidated.is_empty(), "{:?}", quiet.invalidated);
 
     append_lines(
         &target,
         &[function_output("2026-10-29T10:00:04Z", "c1", "ok")],
     );
-    let delta = s.scan_roster(NOW, BIG).unwrap();
+    let delta = support::world::rescan(&mut s, NOW, BIG);
     assert!(
-        delta
-            .invalidated
-            .iter()
-            .any(|k| k.provider_session_id == "pend"),
+        delta.invalidated.iter().any(|k| k.native_id == "pend"),
         "retiring a displayed pending row must invalidate: {:?}",
         delta.invalidated
     );
@@ -1130,24 +1186,103 @@ fn oversized_line_is_consumed_under_the_refresh_budget() {
         max_millis: 60_000,
     };
     let mut s = scanner(&root);
-    let mut steps = 0;
-    let mut final_summary = None;
-    loop {
-        let delta = s.scan_roster(NOW, small).expect("scan");
-        steps += 1;
-        if let Some(sum) = delta.sessions.into_iter().next() {
-            final_summary = Some(sum);
-        }
-        if delta.scan.done {
-            break;
-        }
-        assert!(steps < 10_000);
-    }
+    let found = support::world::discover_pass(&mut s, NOW, small);
+    assert_eq!(found.sessions.len(), 1);
+    let (sum, steps) =
+        support::world::hydrate_steps(&mut s, &found.sessions[0].key, NOW, small, 10_000);
     assert!(steps >= 8, "4 MiB at 256 KiB per step took {steps} steps");
-    let sum = final_summary.expect("session emitted");
     assert!(warning(&sum, "#oversized").is_some());
     assert_eq!(
         sum.displayed_event_count, 1,
         "the record after the huge line is read"
+    );
+}
+
+#[test]
+fn a_model_switch_leaves_the_session_aggregate_unattributed_and_unpriced() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    write_lines(
+        &dated(&root, "rollout-switch.jsonl"),
+        &[
+            session_meta("2026-10-29T10:00:00Z", "switch", "/p"),
+            turn_context("2026-10-29T10:00:01Z", "gpt-a", "/p"),
+            turn_context("2026-10-29T10:00:02Z", "gpt-b", "/p"),
+            usage_record(
+                "2026-10-29T10:00:03Z",
+                usage(1_000_000, 0, 1_000_000, 0, 2_000_000),
+            ),
+        ],
+    );
+    write_lines(
+        &dated(&root, "rollout-single.jsonl"),
+        &[
+            session_meta("2026-10-29T11:00:00Z", "single", "/p"),
+            turn_context("2026-10-29T11:00:01Z", "gpt-a", "/p"),
+            usage_record(
+                "2026-10-29T11:00:03Z",
+                usage(1_000_000, 0, 1_000_000, 0, 2_000_000),
+            ),
+        ],
+    );
+    let mut config = config_for(&root);
+    config.pricing = price_schedule(
+        r#"[{"billing_provider":"openai","model":"gpt-a","rates":{"input":1.0,"output":2.0,"cache_read":0.1}},
+            {"billing_provider":"openai","model":"gpt-b","rates":{"input":10.0,"output":20.0,"cache_read":1.0}}]"#,
+    );
+    let scan = scan_until_done(&mut CodexScanner::new(&config).unwrap(), BIG);
+    let usage_of = |id: &str| {
+        scan.sessions
+            .values()
+            .find(|s| s.meta.key.native_id == id)
+            .unwrap()
+            .usage
+            .clone()
+            .unwrap()
+    };
+    let mixed = usage_of("switch");
+    assert_eq!(mixed.total, Some(2_000_000), "provider total is preserved");
+    assert!(mixed.models.is_empty(), "no per-model attribution");
+    assert_eq!(mixed.cost.usd, None, "not priced at the latest model");
+    assert!(!mixed.coverage.complete);
+    assert!(
+        mixed
+            .coverage
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("several models")
+    );
+    let single = usage_of("single");
+    assert_eq!(single.models.len(), 1);
+    assert!(single.cost.usd.is_some());
+}
+
+#[test]
+fn the_newest_compaction_markers_are_retained_when_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let stamps: Vec<String> = (0..300)
+        .map(|i| format!("2026-10-29T10:{:02}:{:02}Z", i / 60, i % 60))
+        .collect();
+    let mut lines = vec![session_meta("2026-10-29T10:00:00Z", "cap", "/p")];
+    for ts in &stamps {
+        lines.push(compacted(ts));
+    }
+    write_lines(&dated(&root, "rollout-cap.jsonl"), &lines);
+    let scan = scan_until_done(&mut scanner(&root), BIG);
+    let s = only(&scan);
+    assert_eq!(s.metrics.compactions.observed, 256);
+    assert!(!s.metrics.compactions.history_complete);
+    let latest = s
+        .metrics
+        .compactions
+        .latest
+        .as_ref()
+        .expect("latest marker");
+    assert_eq!(
+        latest.timestamp,
+        Some(1_793_268_000_000 + 299_000),
+        "the retained window slides to the newest marker"
     );
 }

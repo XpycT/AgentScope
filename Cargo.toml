@@ -18,6 +18,8 @@ sysinfo = { version = "0.40.0", default-features = false, features = ["system"] 
 thiserror = "2.0.21"
 toml = "1.1.8"
 unicode-width = "0.2.3"
+# Streaming zstd decode of archived rollouts (bounded, never a full expansion buffer).
+zstd = "0.14.3"
 
 [dev-dependencies]
 agentscope = { path = ".", features = ["perf-counters"] }

@@ -16,7 +16,7 @@ use crate::time::format_local;
 
 use super::RosterContext;
 use super::roster::{MIN_HEIGHT, MIN_WIDTH};
-use super::widgets::{Palette, fit, provider_name, search_prompt, status_text, tokens_text};
+use super::widgets::{Palette, fit, harness_name, search_prompt, status_text, tokens_text};
 
 const MARKER_W: usize = 2;
 const TIME_W: usize = 5;
@@ -96,7 +96,7 @@ fn header_lines(
                 fit(
                     &format!(
                         "< Back  {}",
-                        provider_name(transcript.key().provider).to_uppercase()
+                        harness_name(transcript.key().harness).to_uppercase()
                     ),
                     width,
                 ),
@@ -107,13 +107,13 @@ fn header_lines(
     };
     let s = row.session;
     let (icon, label) = status_text(row.status.label);
-    let title = display_safe(&s.title);
+    let title = display_safe(&s.meta.title);
     vec![
         Line::styled(
             fit(
                 &format!(
                     "< Back  {} / {title}",
-                    provider_name(s.key.provider).to_uppercase()
+                    harness_name(s.meta.key.harness).to_uppercase()
                 ),
                 width,
             ),
@@ -121,11 +121,12 @@ fn header_lines(
         ),
         plain(format!(
             "Project: {}   Model: {}   Session: {}",
-            s.project
+            s.meta
+                .project
                 .as_deref()
                 .map_or_else(|| "Unknown".into(), display_safe),
             model_text(s),
-            display_safe(&s.key.provider_session_id),
+            display_safe(&s.meta.key.native_id),
         )),
         Line::from(vec![Span::styled(
             fit(
@@ -144,11 +145,10 @@ fn header_lines(
 }
 
 fn model_text(s: &SessionSummary) -> String {
-    s.model_details
-        .first()
-        .map(|m| m.id.as_str())
-        .or_else(|| s.models.first().map(String::as_str))
-        .map_or_else(|| "Unknown".into(), display_safe)
+    s.meta
+        .model
+        .as_ref()
+        .map_or_else(|| "Unknown".into(), |m| display_safe(&m.id))
 }
 
 pub(super) fn class_name(class: AggregationClass) -> &'static str {
@@ -179,24 +179,42 @@ fn usage_text(s: &SessionSummary) -> String {
         Some((total, usage)) => format!("{} {}", grouped(total), class_name(usage.class)),
         None => "Unknown".into(),
     };
-    let context = s.context_window.map_or_else(
-        || "Unknown".into(),
-        |w| format!("{} window", tokens_text(Some(w))),
-    );
+    let usage = &s.metrics.context;
+    let context = match (usage.used, usage.capacity) {
+        (Some(used), Some(window)) => format!(
+            "{} of {} window",
+            tokens_text(Some(used)),
+            tokens_text(Some(window))
+        ),
+        (Some(used), None) => format!("{} used — window Unknown", tokens_text(Some(used))),
+        (None, Some(window)) => format!("{} window", tokens_text(Some(window))),
+        (None, None) => "Unknown".to_string(),
+    };
     format!(
         "Tokens: {tokens} · Cost: {} · Context: {context}",
         cost_text(s.usage.as_ref())
     )
 }
 
+/// USD with enough precision that a tiny positive amount is never shown as free.
+pub(super) fn money_text(usd: f64) -> String {
+    if usd <= 0.0 {
+        "$0.00".into()
+    } else if usd < 0.0001 {
+        "<$0.0001".into()
+    } else if usd < 0.01 {
+        format!("${usd:.4}")
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
 pub(super) fn cost_text(usage: Option<&UsageSummary>) -> String {
-    let Some(cost) = usage.map(|u| &u.cost) else {
-        return "Unknown".into();
-    };
-    match (cost.usd, cost.class) {
-        (None, _) | (Some(_), AggregationClass::Unknown) => "Unknown".into(),
-        (Some(usd), AggregationClass::Estimated) => format!("~${usd:.2} estimated"),
-        (Some(usd), class) => format!("${usd:.2} {}", class_name(class)),
+    let fact = super::session::cost_fact(usage, true);
+    if fact.head == "Unknown" {
+        "Unknown".into()
+    } else {
+        format!("{} {}", fact.head, fact.sub)
     }
 }
 

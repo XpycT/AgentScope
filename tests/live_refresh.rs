@@ -3,11 +3,16 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod support;
+
 use agentscope::app::{App, Panel, Screen};
 use agentscope::config::{CliOverrides, Config, Env};
 use agentscope::domain::*;
 use agentscope::processes::{ProcessInfo, ProcessSnapshot};
-use agentscope::providers::{ProviderDelta, ProviderError, ProviderReader, SourceRecord};
+use agentscope::providers::{
+    DiscoveryDelta, HydrationDelta, ProviderError, ProviderReader, ReadJobId, ReadProgress,
+    SourceRecord,
+};
 use agentscope::ui::{
     KeyAction, RosterContext, apply_worker_event, drain_worker, flush_requests, handle_key, render,
     reset_for_new_worker, worker_stopped,
@@ -16,61 +21,52 @@ use agentscope::worker::{WorkerEvent, WorkerHandle, WorkerRequest};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use support::facts::{self, metadata};
 
 const NOW: Timestamp = 1_800_000_000_000;
 
 fn codex_key() -> SessionKey {
     SessionKey {
-        provider: Provider::Codex,
-        provider_session_id: "codex-1".into(),
+        harness: Harness::Codex,
+        native_id: "codex-1".into(),
         source: SourceKey::File("codex-1.jsonl".into()),
     }
 }
 
 fn claude_key() -> SessionKey {
     SessionKey {
-        provider: Provider::Claude,
-        provider_session_id: "claude-1".into(),
+        harness: Harness::Claude,
+        native_id: "claude-1".into(),
         source: SourceKey::File("claude-1.jsonl".into()),
     }
 }
 
 fn session(key: SessionKey, title: &str, age_secs: i64, count: usize) -> SessionSummary {
+    let mut meta = metadata(key, title);
+    meta.project = Some("RipperGame".into());
+    meta.created_at = Some(NOW - 86_400_000);
+    meta.activity = ActivityStamp {
+        at: Some(NOW - age_secs * 1000),
+        class: AggregationClass::Reported,
+    };
     SessionSummary {
-        key,
-        title: title.into(),
-        title_derived: false,
-        project: Some("RipperGame".into()),
-        cwd: None,
-        models: vec![],
-        model_details: vec![],
-        provider_version: None,
-        created_at: Some(NOW - 86_400_000),
         last_event_at: Some(NOW - age_secs * 1000),
-        last_persisted_at: Some(NOW - age_secs * 1000),
         last_completion: None,
         unfinished_work: true,
         displayed_event_count: count,
         hidden_records: 0,
-        source_available: true,
-        archived: false,
-        context_window: None,
         server_tools: None,
         lifecycle: Lifecycle::Unknown,
         process: ProcessAssociation::Unmatched,
         usage: None,
-        lineage: Lineage {
-            parent: None,
-            fork: None,
-            sidechain: false,
-        },
         warnings: vec![],
+        ..facts::summary(meta)
     }
 }
 
 fn scan(done: bool) -> ScanProgress {
     ScanProgress {
-        provider: Provider::Codex,
+        harness: Harness::Codex,
         scanned: 2,
         total: Some(9),
         done,
@@ -90,13 +86,20 @@ fn roster_generation(
     done: bool,
 ) -> WorkerEvent {
     WorkerEvent::Roster {
-        generation,
-        sessions: vec![
-            session(codex_key(), "Inventory API", codex_age, count),
-            session(claude_key(), "Scanner refactor", claude_age, 1),
-        ],
+        snapshot: support::snapshot(
+            generation,
+            // A frozen generation lists its groups newest first.
+            {
+                let mut rows = vec![
+                    session(codex_key(), "Inventory API", codex_age, count),
+                    session(claude_key(), "Scanner refactor", claude_age, 1),
+                ];
+                rows.sort_by_key(|s| std::cmp::Reverse(s.meta.activity.at));
+                rows
+            },
+            scan(done),
+        ),
         warnings,
-        scan: scan(done),
     }
 }
 
@@ -140,7 +143,7 @@ fn draw(app: &App, ctx: &RosterContext, w: u16, h: u16) -> String {
 
 fn provenance() -> Provenance {
     Provenance {
-        provider: Provider::Codex,
+        harness: Harness::Codex,
         source: SourceKey::File("codex-1.jsonl".into()),
         locator: SourceLocator {
             session: codex_key(),
@@ -151,7 +154,7 @@ fn provenance() -> Provenance {
             generation: None,
         },
         record_type: "test".into(),
-        provider_version: None,
+        harness_version: None,
     }
 }
 
@@ -203,7 +206,10 @@ fn open_three(app: &mut App, ctx: &mut RosterContext) {
     assert_eq!(app.selected_key(), Some(codex_key()));
     press(app, KeyCode::Enter);
     let requests = app.take_requests();
-    let Some(WorkerRequest::Select { request_id, .. }) = requests.first() else {
+    let Some(WorkerRequest::Select { request_id, .. }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
         panic!("expected Select, got {requests:?}");
     };
     apply_worker_event(
@@ -211,10 +217,11 @@ fn open_three(app: &mut App, ctx: &mut RosterContext) {
         ctx,
         WorkerEvent::Transcript {
             request_id: *request_id,
-            page: page(&["first", "second", "third"], anchor(2)),
+            page: page(&["first", "second", "third"], anchor(0)),
         },
     );
-    ch(app, 'j');
+    // The transcript opens at its newest entry; step back to the middle.
+    ch(app, 'k');
     assert_eq!(app.transcript().unwrap().selected(), 1);
 }
 
@@ -255,17 +262,19 @@ fn live_append_updates_roster_and_counts_new_events_without_auto_scroll() {
         request_id,
         anchor: a,
         ..
-    }) = requests.first()
+    }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::CountAfter { .. }))
     else {
         panic!("expected CountAfter, got {requests:?}");
     };
-    assert_eq!(a, &anchor(2));
+    assert_eq!(a, &anchor(0));
     apply_worker_event(
         &mut app,
         &mut ctx,
         WorkerEvent::EventsAfter {
             request_id: *request_id,
-            count: 2,
+            count: 4,
         },
     );
 
@@ -453,7 +462,7 @@ fn process_snapshot_and_warning_banner_update_without_blocking_input() {
         WorkerEvent::Warning {
             warning: Warning {
                 key: WarningKey {
-                    provider: Provider::Claude,
+                    harness: Harness::Claude,
                     source: "projects".into(),
                     kind: WarningKind::Parse,
                 },
@@ -519,35 +528,65 @@ struct State {
 struct Live(Arc<Mutex<State>>);
 
 impl ProviderReader for Live {
-    fn provider(&self) -> Provider {
-        Provider::Codex
+    fn harness(&self) -> Harness {
+        Harness::Codex
     }
-    fn refresh(
+    fn discover(
         &mut self,
         _now: Timestamp,
         _budget: RefreshBudget,
-    ) -> Result<ProviderDelta, ProviderError> {
+    ) -> Result<DiscoveryDelta, ProviderError> {
         let s = self.0.lock().unwrap();
-        Ok(ProviderDelta {
-            sessions: s.sessions.clone(),
+        Ok(DiscoveryDelta {
+            sessions: s.sessions.iter().map(|s| s.meta.clone()).collect(),
             removed: vec![],
             invalidated: vec![],
             warnings: vec![],
             scan: ScanProgress {
-                provider: Provider::Codex,
+                harness: Harness::Codex,
                 scanned: s.sessions.len(),
                 total: None,
                 done: true,
             },
         })
     }
+    fn hydrate(
+        &mut self,
+        _job: ReadJobId,
+        key: &SessionKey,
+        _now: Timestamp,
+        _budget: RefreshBudget,
+    ) -> Result<HydrationDelta, ProviderError> {
+        let s = self.0.lock().unwrap();
+        s.sessions
+            .iter()
+            .find(|s| s.meta.key == *key)
+            .map(|summary| HydrationDelta {
+                summary: summary.clone(),
+                done: true,
+            })
+            .ok_or_else(|| ProviderError::Unavailable("unknown".into()))
+    }
+    fn cancel_read(&mut self, _key: &SessionKey, _job: ReadJobId) {}
+    fn details_page(
+        &mut self,
+        _job: ReadJobId,
+        _key: &SessionKey,
+        _anchor: Option<PageAnchor>,
+        _request: PageRequest,
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<SessionDetailPage>, ProviderError> {
+        Ok(ReadProgress::Ready(SessionDetailPage::default()))
+    }
     fn transcript_page(
         &mut self,
+        _job: ReadJobId,
         _key: &SessionKey,
         from: Option<PageAnchor>,
         direction: PageDirection,
         _request: PageRequest,
-    ) -> Result<TranscriptPage, ProviderError> {
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<TranscriptPage>, ProviderError> {
         let s = self.0.lock().unwrap();
         let at = |a: &PageAnchor| a.source_order as usize;
         let range = match (from.as_ref(), direction) {
@@ -559,30 +598,43 @@ impl ProviderReader for Live {
             .clone()
             .map(|i| event(i as u64, &s.bodies[i]))
             .collect();
-        Ok(TranscriptPage {
-            next: range.end.checked_sub(1).map(|i| anchor(i as u64)),
+        Ok(ReadProgress::Ready(TranscriptPage {
+            next: match direction {
+                PageDirection::Forward => range.end.checked_sub(1),
+                PageDirection::Backward => Some(range.start),
+            }
+            .map(|i| anchor(i as u64)),
             events,
             diagnostics: vec![],
             has_more: false,
             truncated: false,
-        })
+        }))
     }
     fn count_events_after(
         &mut self,
+        _job: ReadJobId,
         _key: &SessionKey,
         anchor: &PageAnchor,
-    ) -> Result<usize, ProviderError> {
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<usize>, ProviderError> {
         let s = self.0.lock().unwrap();
-        Ok(s.bodies
-            .len()
-            .saturating_sub(anchor.source_order as usize + 1))
+        Ok(ReadProgress::Ready(
+            s.bodies
+                .len()
+                .saturating_sub(anchor.source_order as usize + 1),
+        ))
     }
-    fn source_record(&mut self, _locator: &SourceLocator) -> Result<SourceRecord, ProviderError> {
-        Ok(SourceRecord {
+    fn source_record(
+        &mut self,
+        _job: ReadJobId,
+        _locator: &SourceLocator,
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<SourceRecord>, ProviderError> {
+        Ok(ReadProgress::Ready(SourceRecord {
             raw: String::new(),
             display: String::new(),
             unavailable: Some("not available in this test".into()),
-        })
+        }))
     }
 }
 
@@ -623,7 +675,8 @@ fn a_real_worker_delivers_live_appends_to_the_open_inspector() {
     pump_until(&mut app, &mut ctx, &worker, |a| {
         a.transcript().is_some_and(|t| t.events().len() == 3)
     });
-    ch(&mut app, 'j');
+    // Opens at the newest entry; select the middle event for the append checks.
+    ch(&mut app, 'k');
 
     {
         let mut s = state.lock().unwrap();
@@ -634,7 +687,13 @@ fn a_real_worker_delivers_live_appends_to_the_open_inspector() {
     // `r` asks the worker to refresh now.
     assert_eq!(ch(&mut app, 'r'), KeyAction::Refresh);
     worker.tx.send(WorkerRequest::Refresh).unwrap();
-    pump_until(&mut app, &mut ctx, &worker, |a| a.new_event_count() == 2);
+    // The changed session is rehydrated after the refresh; its summary and the count of
+    // events after the newest loaded one arrive independently.
+    pump_until(&mut app, &mut ctx, &worker, |a| {
+        a.new_event_count() == 2
+            && a.session(&codex_key())
+                .is_some_and(|r| r.session.displayed_event_count == 5)
+    });
 
     assert_eq!(app.transcript().unwrap().selected(), 1, "no auto-scroll");
     assert_eq!(app.transcript().unwrap().events().len(), 3);
@@ -646,4 +705,293 @@ fn a_real_worker_delivers_live_appends_to_the_open_inspector() {
         5
     );
     assert!(worker.shutdown());
+}
+
+// ---- B5 navigation smoke: real reader → worker → keys → render ---------------
+
+struct SmokeState {
+    sessions: Vec<SessionSummary>,
+    child: SessionKey,
+    parent: SessionKey,
+    bodies: Vec<String>,
+}
+
+fn smoke_state() -> SmokeState {
+    // The parent is the newest group; 54 more roots page 50 at a time.
+    let parent = codex_key();
+    let child = SessionKey {
+        native_id: "codex-child".into(),
+        ..codex_key()
+    };
+    let mut sessions = vec![session(parent.clone(), "Parent session", 1, 5)];
+    for i in 0..54 {
+        sessions.push(session(
+            SessionKey {
+                native_id: format!("codex-{i:02}"),
+                ..codex_key()
+            },
+            &format!("Root {i:02}"),
+            60 + i,
+            1,
+        ));
+    }
+    let mut child_meta = metadata(child.clone(), "Nested child");
+    child_meta.lineage.parent = Some(SessionLink::Unresolved(parent.native_id.clone()));
+    child_meta.activity = ActivityStamp {
+        at: Some(NOW - 2_000),
+        class: AggregationClass::Reported,
+    };
+    sessions.push(SessionSummary {
+        displayed_event_count: 0,
+        usage: None,
+        ..facts::summary(child_meta)
+    });
+    SmokeState {
+        sessions,
+        child,
+        parent,
+        bodies: vec![
+            "zero".into(),
+            "one".into(),
+            "two".into(),
+            "three".into(),
+            "four".into(),
+        ],
+    }
+}
+
+struct SmokeReader(Arc<Mutex<SmokeState>>);
+
+impl ProviderReader for SmokeReader {
+    fn harness(&self) -> Harness {
+        Harness::Codex
+    }
+    fn discover(
+        &mut self,
+        _now: Timestamp,
+        _budget: RefreshBudget,
+    ) -> Result<DiscoveryDelta, ProviderError> {
+        let s = self.0.lock().unwrap();
+        Ok(DiscoveryDelta {
+            sessions: s.sessions.iter().map(|s| s.meta.clone()).collect(),
+            removed: vec![],
+            invalidated: vec![],
+            warnings: vec![],
+            scan: ScanProgress {
+                harness: Harness::Codex,
+                scanned: s.sessions.len(),
+                total: Some(s.sessions.len()),
+                done: true,
+            },
+        })
+    }
+    fn hydrate(
+        &mut self,
+        _job: ReadJobId,
+        key: &SessionKey,
+        _now: Timestamp,
+        _budget: RefreshBudget,
+    ) -> Result<HydrationDelta, ProviderError> {
+        let s = self.0.lock().unwrap();
+        s.sessions
+            .iter()
+            .find(|s| s.meta.key == *key)
+            .map(|summary| HydrationDelta {
+                summary: summary.clone(),
+                done: true,
+            })
+            .ok_or_else(|| ProviderError::Unavailable("unknown".into()))
+    }
+    fn cancel_read(&mut self, _key: &SessionKey, _job: ReadJobId) {}
+    fn details_page(
+        &mut self,
+        _job: ReadJobId,
+        _key: &SessionKey,
+        _anchor: Option<PageAnchor>,
+        _request: PageRequest,
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<SessionDetailPage>, ProviderError> {
+        Ok(ReadProgress::Ready(SessionDetailPage {
+            recent: vec![event(0, "detail record")],
+            has_more: false,
+            ..SessionDetailPage::default()
+        }))
+    }
+    fn transcript_page(
+        &mut self,
+        _job: ReadJobId,
+        _key: &SessionKey,
+        anchor: Option<PageAnchor>,
+        direction: PageDirection,
+        _request: PageRequest,
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<TranscriptPage>, ProviderError> {
+        let s = self.0.lock().unwrap();
+        let len = s.bodies.len();
+        let at = anchor.as_ref().map_or(0, |a| a.source_order as usize);
+        let (start, end) = match (anchor.as_ref(), direction) {
+            (None, _) => (len.saturating_sub(3), len),
+            (Some(_), PageDirection::Backward) => (at.saturating_sub(3), at),
+            (Some(_), PageDirection::Forward) => ((at + 1).min(len), len.min(at + 4)),
+        };
+        let events: Vec<Event> = (start..end)
+            .map(|i| event(i as u64, &s.bodies[i]))
+            .collect();
+        let next = match direction {
+            PageDirection::Forward => events.last(),
+            PageDirection::Backward => events.first(),
+        }
+        .map(|e| PageAnchor {
+            timestamp: e.timestamp,
+            source_order: e.source_order,
+            stable_id: e.id.clone(),
+        });
+        Ok(ReadProgress::Ready(TranscriptPage {
+            events,
+            diagnostics: vec![],
+            next,
+            has_more: match direction {
+                PageDirection::Backward => start > 0,
+                PageDirection::Forward => end < len,
+            },
+            truncated: false,
+        }))
+    }
+    fn count_events_after(
+        &mut self,
+        _job: ReadJobId,
+        _key: &SessionKey,
+        anchor: &PageAnchor,
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<usize>, ProviderError> {
+        let s = self.0.lock().unwrap();
+        Ok(ReadProgress::Ready(
+            s.bodies
+                .len()
+                .saturating_sub(anchor.source_order as usize + 1),
+        ))
+    }
+    fn source_record(
+        &mut self,
+        _job: ReadJobId,
+        _locator: &SourceLocator,
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<SourceRecord>, ProviderError> {
+        Ok(ReadProgress::Ready(SourceRecord {
+            raw: String::new(),
+            display: String::new(),
+            unavailable: Some("synthetic".into()),
+        }))
+    }
+}
+
+#[test]
+fn b5_navigation_smoke_through_reader_worker_keys_and_render() {
+    let state = Arc::new(Mutex::new(smoke_state()));
+    let mut config = Config::load_with_env(&CliOverrides::default(), &Env::new()).unwrap();
+    config.refresh_ms = 3_600_000;
+    config.process_ms = 3_600_000;
+    config.process_enabled = false;
+    let worker = WorkerHandle::spawn(vec![Box::new(SmokeReader(state.clone()))], config);
+    let mut app = new_app();
+    let mut ctx = ctx();
+
+    // First root page: 50 of the 55 groups.
+    pump_until(&mut app, &mut ctx, &worker, |a| a.total_sessions() == 50);
+    assert!(app.roster_status().has_more);
+    let parent = state.lock().unwrap().parent.clone();
+    assert_eq!(app.selected_key(), Some(parent.clone()));
+
+    // `m` reveals the rest without moving the selection.
+    press(&mut app, KeyCode::Char('m'));
+    pump_until(&mut app, &mut ctx, &worker, |a| a.total_sessions() == 55);
+    assert_eq!(app.selected_key(), Some(parent.clone()));
+
+    // Space asks for the fast preview and the first child page.
+    press(&mut app, KeyCode::Char(' '));
+    pump_until(&mut app, &mut ctx, &worker, |a| {
+        matches!(
+            a.preview(),
+            agentscope::app::PreviewState::Ready { complete: true, .. }
+        ) && a
+            .children_of(&parent)
+            .is_some_and(|c| c.metadata.len() == 1)
+    });
+    let rows: Vec<String> = app
+        .roster_rows()
+        .filter_map(|item| match item {
+            agentscope::app::RosterItem::Session(row) => {
+                Some(row.session.meta.key.native_id.clone())
+            }
+            _ => None,
+        })
+        .take(2)
+        .collect();
+    assert_eq!(rows, ["codex-1".to_string(), "codex-child".to_string()]);
+    // The selected identity is still the parent; one loaded move reaches the child.
+    assert_eq!(app.selected_key(), Some(parent.clone()));
+    press(&mut app, KeyCode::Char('j'));
+    let child = state.lock().unwrap().child.clone();
+    assert_eq!(app.selected_key(), Some(child.clone()));
+    let screen = draw(&app, &ctx, 110, 30);
+    assert!(screen.contains("Nested child"), "{screen}");
+
+    // Back to the parent and open its newest entry.
+    press(&mut app, KeyCode::Char('k'));
+    press(&mut app, KeyCode::Enter);
+    pump_until(&mut app, &mut ctx, &worker, |a| {
+        a.transcript().is_some_and(|t| t.events().len() == 3)
+    });
+    assert_eq!(
+        app.transcript().unwrap().selected_event().unwrap().id,
+        "e4",
+        "the newest event is selected on opening"
+    );
+    let screen = draw(&app, &ctx, 110, 30);
+    assert!(screen.contains("four"), "{screen}");
+
+    // Page back to the previous content; the anchor stays on e2.
+    app.inspector_move(-2);
+    pump_until(&mut app, &mut ctx, &worker, |a| {
+        a.transcript().is_some_and(|t| t.events().len() == 5)
+    });
+    assert_eq!(app.transcript().unwrap().selected_event().unwrap().id, "e2");
+
+    // Two live events increment the indicator without moving the reader.
+    {
+        let mut s = state.lock().unwrap();
+        s.bodies.push("five".into());
+        s.bodies.push("six".into());
+        s.sessions[0] = session(s.parent.clone(), "Parent session", 1, 7);
+    }
+    // `r` in the inspector retries and asks for a refresh; the run loop turns
+    // that action into an App-queued Refresh.
+    assert_eq!(press(&mut app, KeyCode::Char('r')), KeyAction::Refresh);
+    app.refresh_roster();
+    pump_until(&mut app, &mut ctx, &worker, |a| {
+        a.session(&parent)
+            .is_some_and(|r| r.session.displayed_event_count == 7)
+    });
+    pump_until(&mut app, &mut ctx, &worker, |a| a.new_event_count() == 2);
+    assert_eq!(app.transcript().unwrap().selected_event().unwrap().id, "e2");
+    let screen = draw(&app, &ctx, 110, 30);
+    assert!(screen.contains("2 new"), "{screen}");
+
+    // Explicit End/follow reloads the newest page and lands on the new last event.
+    press(&mut app, KeyCode::Char('G'));
+    pump_until(&mut app, &mut ctx, &worker, |a| {
+        a.transcript()
+            .and_then(|t| t.selected_event())
+            .is_some_and(|e| e.id == "e6")
+    });
+    assert_eq!(app.new_event_count(), 0);
+
+    // Session info requests paged detailed facts; the worker answers them.
+    press(&mut app, KeyCode::Char('i'));
+    pump_until(&mut app, &mut ctx, &worker, |a| {
+        a.details().key() == Some(&parent) && a.details().page().recent.len() == 1
+    });
+    assert!(!app.details().page().has_more);
+    let _ = draw(&app, &ctx, 110, 30);
+    worker.shutdown();
 }

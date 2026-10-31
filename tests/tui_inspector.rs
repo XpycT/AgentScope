@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+mod support;
+
 use agentscope::app::{App, MAX_LOADED_EVENTS};
 use agentscope::domain::*;
 use agentscope::time::format_local;
@@ -9,37 +11,39 @@ use agentscope::worker::WorkerRequest;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use support::facts::{self, metadata};
 
 const NOW: Timestamp = 1_800_000_000_000;
 
 fn key() -> SessionKey {
     SessionKey {
-        provider: Provider::Codex,
-        provider_session_id: "sess-1".into(),
+        harness: Harness::Codex,
+        native_id: "sess-1".into(),
         source: SourceKey::File("sess-1.jsonl".into()),
     }
 }
 
 fn summary(count: usize) -> SessionSummary {
+    let mut meta = metadata(key(), "Inventory API");
+    meta.project = Some("RipperGame".into());
+    meta.model = Some(ModelDetail {
+        id: "gpt-5.1-codex".into(),
+        provider: None,
+        variant: None,
+        effort: None,
+        configured_effort: None,
+    });
+    meta.created_at = Some(NOW - 86_400_000);
+    meta.activity = ActivityStamp {
+        at: Some(NOW - 540_000),
+        class: AggregationClass::Reported,
+    };
     SessionSummary {
-        key: key(),
-        title: "Inventory API".into(),
-        title_derived: false,
-        project: Some("RipperGame".into()),
-        cwd: None,
-        models: vec!["gpt-5.1-codex".into()],
-        model_details: vec![],
-        provider_version: None,
-        created_at: Some(NOW - 86_400_000),
         last_event_at: Some(NOW - 540_000),
-        last_persisted_at: Some(NOW - 540_000),
         last_completion: None,
         unfinished_work: true,
         displayed_event_count: count,
         hidden_records: 0,
-        source_available: true,
-        archived: false,
-        context_window: Some(475_000),
         server_tools: Some(ServerToolCounts {
             web_search: 3,
             web_fetch: 1,
@@ -47,7 +51,6 @@ fn summary(count: usize) -> SessionSummary {
         lifecycle: Lifecycle::Unknown,
         process: ProcessAssociation::Candidates { count: 2 },
         usage: Some(UsageSummary {
-            model: None,
             categories: TokenCategories::default(),
             total: Some(73_214),
             class: AggregationClass::Reported,
@@ -56,14 +59,20 @@ fn summary(count: usize) -> SessionSummary {
                 class: AggregationClass::Estimated,
                 as_of: None,
                 note: None,
+                ..CostEstimate::default()
             },
+            ..UsageSummary::default()
         }),
-        lineage: Lineage {
-            parent: None,
-            fork: None,
-            sidechain: false,
-        },
         warnings: vec![],
+        metrics: SessionMetrics {
+            context: ContextUsage {
+                capacity: Some(475_000),
+                class: AggregationClass::Reported,
+                ..ContextUsage::default()
+            },
+            ..SessionMetrics::default()
+        },
+        ..facts::summary(meta)
     }
 }
 
@@ -81,7 +90,7 @@ fn app_with(s: SessionSummary) -> App {
 
 fn provenance() -> Provenance {
     Provenance {
-        provider: Provider::Codex,
+        harness: Harness::Codex,
         source: SourceKey::File("sess-1.jsonl".into()),
         locator: SourceLocator {
             session: key(),
@@ -92,7 +101,7 @@ fn provenance() -> Provenance {
             generation: None,
         },
         record_type: "test".into(),
-        provider_version: None,
+        harness_version: None,
     }
 }
 
@@ -182,7 +191,10 @@ fn hm(ts: Timestamp) -> String {
 fn open(app: &mut App, first: TranscriptPage) -> u64 {
     assert!(app.open_inspector());
     let requests = app.take_requests();
-    let [WorkerRequest::Select { request_id, key: k }] = requests.as_slice() else {
+    let Some(WorkerRequest::Select { request_id, key: k }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
         panic!("expected a single Select, got {requests:?}");
     };
     assert_eq!(k, &key());
@@ -269,7 +281,7 @@ fn renders_reported_context_window_and_server_tool_counts_and_unknown_otherwise(
     );
 
     let mut bare = summary(1);
-    bare.context_window = None;
+    bare.metrics.context.capacity = None;
     bare.server_tools = None;
     let mut app = app_with(bare);
     open(&mut app, page(vec![msg(0)], None, false));
@@ -298,6 +310,7 @@ fn expands_a_tool_row_and_shows_status_duration_exit_and_truncation() {
         started_at: Some(NOW),
         completed_at: Some(NOW + 1_200),
         orphan: false,
+        child_session: None,
     });
     open(&mut app, page(vec![msg(0), tool], None, false));
 
@@ -329,20 +342,26 @@ fn expands_a_tool_row_and_shows_status_duration_exit_and_truncation() {
 #[test]
 fn loads_forward_and_backward_pages_without_duplicates() {
     let mut app = app_with(summary(10));
-    open(&mut app, forward_page(0..5, true));
-    // Selection sits at the start of a 5-event window with newer pages left:
-    // the next forward page is requested from the continuation anchor.
-    let (id, anchor_sent, direction) = load_page(&app.take_requests());
-    assert_eq!(direction, PageDirection::Forward);
-    assert_eq!(anchor_sent, Some(anchor(4)));
+    open(&mut app, backward_page(5..10, true));
+    assert_eq!(app.transcript().unwrap().selected_event().unwrap().id, "e9");
+
+    // Scrolling to the start prepends the older page without duplicates.
+    app.inspector_move(-100);
+    let (older_id, older_anchor, direction) = load_page(&app.take_requests());
+    assert_eq!(direction, PageDirection::Backward);
+    assert_eq!(older_anchor, Some(anchor(5)));
     // A response for another request is ignored.
-    assert!(!app.apply_transcript(id + 99, forward_page(5..10, false)));
-    // The overlapping page is de-duplicated.
-    assert!(app.apply_transcript(id, forward_page(3..10, false)));
+    assert!(!app.apply_transcript(older_id + 99, backward_page(0..5, false)));
+    assert!(app.apply_transcript(older_id, backward_page(0..5, false)));
     let expected: Vec<String> = (0..10).map(|i| format!("e{i}")).collect();
     assert_eq!(ids(&app), expected);
     assert!(page_requests(&app.take_requests()).is_empty());
-    assert!(!app.transcript().unwrap().has_newer());
+    assert!(!app.transcript().unwrap().has_older());
+    assert_eq!(
+        app.transcript().unwrap().selected_event().unwrap().id,
+        "e5",
+        "selection stays on the same event after prepending"
+    );
 
     // `G` always reloads the tail, Backward from none, even when the window
     // already ends there: content can change without the row count growing.
@@ -382,7 +401,7 @@ fn initial_select_is_forward_from_start() {
     app.open_inspector();
     let requests = app.take_requests();
     assert!(
-        matches!(requests.as_slice(), [WorkerRequest::Select { key: k, .. }] if *k == key()),
+        matches!(requests.as_slice(), [WorkerRequest::HydratePreview { .. }, WorkerRequest::Select { key: k, .. }] if *k == key()),
         "{requests:?}"
     );
 }
@@ -398,6 +417,8 @@ fn labels_reasoning_as_provider_persisted_and_images_as_placeholders() {
     assert!(out.contains("[image]"), "{out}");
     assert!(!out.contains("weighing the options"), "collapsed: {out}");
 
+    // The transcript opens at its newest entry; the reasoning row is first.
+    app.inspector_first();
     app.inspector_toggle();
     let out = draw(&app, 110, 30);
     assert!(out.contains("weighing the options"), "{out}");
@@ -421,13 +442,13 @@ fn missing_timestamps_and_usage_show_unknown() {
 #[test]
 fn new_events_are_counted_without_scrolling_or_loading() {
     let mut app = app_with(summary(3));
-    open(&mut app, forward_page(0..3, false));
-    app.inspector_move(1);
+    open(&mut app, backward_page(0..3, false));
+    app.inspector_move(-1);
     assert_eq!(app.new_event_count(), 0);
 
     app.apply_roster(vec![summary(6)], vec![]);
-    // The count goes through the worker (`count_events_after`), anchored on
-    // the newest loaded event.
+    // The count goes through the worker (`count_events_after`) anchored on the
+    // oldest loaded event with the already-known tail discounted.
     let requests = app.take_requests();
     let [
         WorkerRequest::CountAfter {
@@ -439,9 +460,9 @@ fn new_events_are_counted_without_scrolling_or_loading() {
     else {
         panic!("expected CountAfter, got {requests:?}");
     };
-    assert_eq!(a, &anchor(2));
-    assert!(!app.apply_events_after(request_id + 9, 3), "stale response");
-    assert!(app.apply_events_after(*request_id, 3));
+    assert_eq!(a, &anchor(0));
+    assert!(!app.apply_events_after(request_id + 9, 5), "stale response");
+    assert!(app.apply_events_after(*request_id, 5));
     assert_eq!(app.new_event_count(), 3);
     assert_eq!(app.transcript().unwrap().selected(), 1, "no auto-scroll");
     assert_eq!(ids(&app).len(), 3, "no auto-load");
@@ -566,158 +587,37 @@ fn invalidation_rereads_the_boundary_and_chases_the_current_selection() {
 }
 
 #[test]
-fn invalidation_while_reading_history_rereads_from_the_window_end() {
+fn invalidation_while_reading_history_reloads_from_the_tail() {
     let mut app = app_with(summary(200));
-    open(&mut app, forward_page(0..60, true));
-    app.inspector_move(30);
-    assert!(page_requests(&app.take_requests()).is_empty());
+    // The newest window starts at e140; history before it is still unread.
+    open(&mut app, backward_page(140..200, true));
+    app.inspector_move(-90);
+    let selected = app
+        .transcript()
+        .unwrap()
+        .selected_event()
+        .unwrap()
+        .id
+        .clone();
+    app.take_requests(); // the near-edge older load is superseded by the reload
     app.invalidate_transcript(&key());
-    // One page forward from the window end: anchors are exclusive, so its last
-    // event anchors a backward read that re-reads the old last event.
-    let (rid, from, direction) = load_page(&app.take_requests());
-    assert_eq!(
-        (from, direction),
-        (Some(anchor(59)), PageDirection::Forward)
-    );
-    assert!(app.apply_transcript(rid, forward_page(60..70, true)));
-    let (rid, from, direction) = load_page(&app.take_requests());
-    assert_eq!(
-        (from, direction),
-        (Some(anchor(69)), PageDirection::Backward)
-    );
-    let mut middle = backward_page(30..69, true);
-    middle.events[29].text = Some(text("LAST-CHANGED")); // e59, the old window end
-    assert!(app.apply_transcript(rid, middle));
-    let (rid, from, _) = load_page(&app.take_requests());
-    assert_eq!(from, Some(anchor(30)));
-    let mut first = backward_page(0..30, false);
-    first.events[0].text = Some(text("FIRST-CHANGED"));
-    assert!(app.apply_transcript(rid, first));
-    let t = app.transcript().unwrap();
-    assert_eq!(t.selected_event().unwrap().id, "e30");
-    // The probe page is dropped; the window ends at the re-read old last event
-    // and continues from its own anchor.
-    assert_eq!(ids(&app).len(), 60);
-    assert_eq!(ids(&app).last().unwrap(), "e59");
-    assert!(t.has_newer() && !t.has_older());
-    let preview = |i: usize| t.events()[i].text.as_ref().unwrap().preview.clone();
-    assert_eq!(preview(0), "FIRST-CHANGED");
-    assert_eq!(preview(59), "LAST-CHANGED");
-    app.inspector_move(isize::MAX);
-    let (_, from, direction) = load_page(&app.take_requests());
-    assert_eq!(
-        (from, direction),
-        (Some(anchor(59)), PageDirection::Forward)
-    );
-}
-
-#[test]
-fn arrivals_before_the_baseline_response_stay_visible() {
-    let mut app = app_with(summary(100));
-    open(&mut app, forward_page(0..20, true));
-    let requests = app.take_requests();
-    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
-        panic!("expected a baseline CountAfter, got {requests:?}");
-    };
-    // Three events arrive before the worker answers the baseline count.
-    app.apply_roster(vec![summary(103)], vec![]);
-    assert!(app.take_requests().is_empty(), "one count at a time");
-    assert!(app.apply_events_after(*request_id, 83));
-    assert_eq!(app.new_event_count(), 3);
-    assert!(draw(&app, 110, 30).contains("3 new"));
-
-    app.apply_roster(vec![summary(104)], vec![]);
-    let requests = app.take_requests();
-    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
-        panic!("expected CountAfter, got {requests:?}");
-    };
-    assert!(app.apply_events_after(*request_id, 84));
-    assert_eq!(app.new_event_count(), 4);
-}
-
-#[test]
-fn a_full_probe_does_not_consume_the_reload_cap() {
-    let cap = MAX_LOADED_EVENTS as u64;
-    let mut app = app_with(summary(2 * cap as usize));
-    open(&mut app, forward_page(0..cap, true)); // e0..e19999, e0 selected
-    app.invalidate_transcript(&key());
-    let (rid, from, direction) = load_page(&app.take_requests());
-    assert_eq!(
-        (from, direction),
-        (Some(anchor(cap - 1)), PageDirection::Forward)
-    );
-    // A full probe page of events past the window end.
-    assert!(app.apply_transcript(rid, forward_page(cap..2 * cap, true)));
-    let (rid, from, direction) = load_page(&app.take_requests());
-    assert_eq!(
-        (from, direction),
-        (Some(anchor(2 * cap - 1)), PageDirection::Backward)
-    );
-    // The backward read overlaps the probe, then reaches the whole old window.
-    assert!(app.apply_transcript(rid, backward_page(cap..2 * cap - 1, true)));
-    let (rid, from, _) = load_page(&app.take_requests());
-    assert_eq!(from, Some(anchor(cap)));
-    let mut old = backward_page(0..cap, false);
-    old.events[0].text = Some(text("E0-CHANGED"));
-    assert!(app.apply_transcript(rid, old));
-
-    let t = app.transcript().unwrap();
-    assert!(t.failed().is_none() && !t.reload_capped());
-    assert_eq!(t.events().len(), MAX_LOADED_EVENTS);
-    assert_eq!(t.selected_event().unwrap().id, "e0");
-    assert_eq!(t.events()[0].text.as_ref().unwrap().preview, "E0-CHANGED");
-    assert!(t.has_newer());
-}
-
-#[test]
-fn history_reload_with_no_newer_events_falls_back_to_the_tail() {
-    let mut app = app_with(summary(60));
-    open(&mut app, forward_page(0..20, true));
-    app.invalidate_transcript(&key());
-    let (rid, from, direction) = load_page(&app.take_requests());
-    assert_eq!(
-        (from, direction),
-        (Some(anchor(19)), PageDirection::Forward)
-    );
-    // The old last event is now the newest event.
-    assert!(app.apply_transcript(rid, page(vec![], None, false)));
+    // No newer page exists, so the reload re-reads backward from the tail.
     let (rid, from, direction) = load_page(&app.take_requests());
     assert_eq!((from, direction), (None, PageDirection::Backward));
-    assert!(app.apply_transcript(rid, backward_page(0..20, false)));
-    assert_eq!(ids(&app).len(), 20);
-    assert!(!app.transcript().unwrap().has_newer());
-}
-
-#[test]
-fn arrivals_are_counted_when_opened_at_oldest_history() {
-    let mut app = app_with(summary(100));
-    open(&mut app, forward_page(0..20, true));
-    // The initial page does not reach the tail: a baseline count from the
-    // window end discounts the history that was already there.
-    let requests = app.take_requests();
-    let [
-        WorkerRequest::CountAfter {
-            request_id,
-            anchor: a,
-            ..
-        },
-    ] = requests.as_slice()
-    else {
-        panic!("expected a baseline CountAfter, got {requests:?}");
-    };
-    assert_eq!(a, &anchor(19));
-    assert!(app.apply_events_after(*request_id, 80));
-    assert_eq!(app.new_event_count(), 0);
-
-    app.apply_roster(vec![summary(103)], vec![]);
-    let requests = app.take_requests();
-    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
-        panic!("expected CountAfter, got {requests:?}");
-    };
-    assert!(app.apply_events_after(*request_id, 83));
-    assert_eq!(app.new_event_count(), 3);
-    assert!(draw(&app, 110, 30).contains("3 new"));
-    assert_eq!(app.transcript().unwrap().selected(), 0, "no auto-scroll");
+    let mut page = backward_page(140..200, true);
+    for event in &mut page.events {
+        if event.id == selected {
+            event.text = Some(text("CHANGED"));
+        }
+    }
+    assert!(app.apply_transcript(rid, page));
+    let t = app.transcript().unwrap();
+    assert_eq!(t.selected_event().unwrap().id, selected);
+    assert_eq!(
+        t.selected_event().unwrap().text.as_ref().unwrap().preview,
+        "CHANGED"
+    );
+    assert!(!t.has_newer());
 }
 
 #[test]
@@ -758,10 +658,7 @@ fn a_reload_beyond_the_window_cap_is_visible_and_retry_jumps_to_the_tail() {
 
 fn tail_at_60() -> App {
     let mut app = app_with(summary(60));
-    open(&mut app, forward_page(0..1, false));
-    app.inspector_last();
-    let (id, _, _) = load_page(&app.take_requests());
-    assert!(app.apply_transcript(id, backward_page(20..60, true)));
+    open(&mut app, backward_page(20..60, true));
     app
 }
 
@@ -831,17 +728,7 @@ fn r_retries_a_failed_older_or_newer_load() {
     assert_ne!(retry, id);
     assert!(app.transcript().unwrap().failed().is_none());
     assert!(app.apply_transcript(retry, backward_page(0..20, false)));
-    assert_eq!(ids(&app).len(), 60);
-
-    // Newer edge.
-    let mut app = app_with(summary(20));
-    open(&mut app, forward_page(0..5, true));
-    let (id, _, _) = load_page(&app.take_requests());
-    app.transcript_load_failed(id);
-    app.retry_transcript();
-    let (_, from, direction) = load_page(&app.take_requests());
-    assert_eq!(from, Some(anchor(4)));
-    assert_eq!(direction, PageDirection::Forward);
+    assert_eq!(app.transcript().unwrap().events().len(), 60);
 }
 
 #[test]
@@ -877,7 +764,10 @@ fn a_failed_initial_load_is_shown_and_retried() {
     let mut app = app_with(summary(1));
     assert!(app.open_inspector());
     let requests = app.take_requests();
-    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+    let Some(WorkerRequest::Select { request_id, .. }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
         panic!("{requests:?}");
     };
     app.transcript_load_failed(*request_id);
@@ -930,59 +820,50 @@ fn a_replacement_page_larger_than_the_window_is_rejected() {
     let mut app = app_with(summary(1));
     assert!(app.open_inspector());
     let requests = app.take_requests();
-    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+    let Some(WorkerRequest::Select { request_id, .. }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
         panic!("{requests:?}");
     };
-    let big = forward_page(0..(MAX_LOADED_EVENTS as u64 + 1), true);
+    let big = backward_page(0..(MAX_LOADED_EVENTS as u64 + 1), true);
     assert!(app.apply_transcript(*request_id, big));
     assert!(ids(&app).is_empty());
     assert!(app.transcript().unwrap().failed().is_some());
     // A page of exactly the cap fits and keeps its continuation anchor.
     app.retry_transcript();
     let requests = app.take_requests();
-    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+    let Some(WorkerRequest::Select { request_id, .. }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
         panic!("{requests:?}");
     };
-    let full = forward_page(0..MAX_LOADED_EVENTS as u64, true);
+    let full = backward_page(0..MAX_LOADED_EVENTS as u64, true);
     assert!(app.apply_transcript(*request_id, full));
     assert_eq!(ids(&app).len(), MAX_LOADED_EVENTS);
-    assert!(app.transcript().unwrap().has_newer());
+    assert!(app.transcript().unwrap().has_older());
 }
 
 #[test]
 fn loaded_events_stay_bounded_and_pages_stay_contiguous() {
-    let half = (MAX_LOADED_EVENTS / 2 + 2_000) as u64;
-    let mut app = app_with(summary(2 * half as usize));
-    open(&mut app, forward_page(0..half, true));
-    app.inspector_move(isize::MAX);
+    let cap = MAX_LOADED_EVENTS as u64;
+    let half = cap / 2;
+    let mut app = app_with(summary(cap as usize));
+    open(&mut app, backward_page(half..cap, true));
+    app.inspector_move(isize::MIN);
     let (id, from, direction) = load_page(&app.take_requests());
-    assert_eq!(
-        (from, direction),
-        (Some(anchor(half - 1)), PageDirection::Forward)
-    );
-    assert!(app.apply_transcript(id, forward_page(half..2 * half, false)));
+    assert_eq!(direction, PageDirection::Backward);
+    assert_eq!(from, Some(anchor(half)));
+    assert!(app.apply_transcript(id, backward_page(0..half, false)));
 
     let loaded = ids(&app);
     assert!(loaded.len() <= MAX_LOADED_EVENTS, "{}", loaded.len());
-    assert_eq!(loaded.last().unwrap(), &format!("e{}", 2 * half - 1));
-    // The window is one contiguous run, so nothing was skipped or repeated.
+    // The window stays one contiguous run after trimming to the cap.
     let first: u64 = loaded[0][1..].parse().unwrap();
     for (i, id) in loaded.iter().enumerate() {
         assert_eq!(id, &format!("e{}", first + i as u64));
     }
-    assert!(app.transcript().unwrap().has_older());
-
-    // Scrolling back up requests exactly the events just before the window.
-    app.inspector_move(isize::MIN);
-    let (id, from, direction) = load_page(&app.take_requests());
-    assert_eq!(direction, PageDirection::Backward);
-    let from = from.expect("older anchor");
-    assert_eq!(from.stable_id, format!("e{first}"));
-    assert!(app.apply_transcript(id, backward_page(first - 100..first, true)));
-    let loaded = ids(&app);
-    assert!(loaded.len() <= MAX_LOADED_EVENTS);
-    let first_now: u64 = loaded[0][1..].parse().unwrap();
-    assert_eq!(first_now, first - 100);
     let unique: HashSet<_> = loaded.iter().collect();
     assert_eq!(unique.len(), loaded.len());
 }
@@ -997,26 +878,21 @@ fn escape_returns_to_the_roster() {
     assert!(out.contains("AgentScope"), "{out}");
 }
 
-#[test]
-fn opencode_shaped_activity_counts_surface_arrivals_before_the_baseline() {
-    // OpenCode publishes a message-activity total, not displayed rows: 10
-    // messages here expand to 20 loaded events.
-    let mut app = app_with(summary(10));
-    open(&mut app, forward_page(0..20, true));
-    let requests = app.take_requests();
-    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
-        panic!("expected a baseline CountAfter, got {requests:?}");
-    };
-    // Three messages arrive before the baseline count executes.
-    app.apply_roster(vec![summary(13)], vec![]);
-    assert!(app.apply_events_after(*request_id, 83));
-    assert_eq!(app.new_event_count(), 3, "not 0 and not 1");
-    assert!(draw(&app, 110, 30).contains("3 new"));
-}
-
 fn populated_usage() -> UsageSummary {
     UsageSummary {
-        model: Some("claude-sonnet-test".into()),
+        models: vec![ModelUsageSummary {
+            model: ModelDetail {
+                id: "claude-sonnet-test".into(),
+                provider: None,
+                variant: None,
+                effort: None,
+                configured_effort: None,
+            },
+            categories: TokenCategories::default(),
+            total: None,
+            cost: CostEstimate::default(),
+            coverage: UsageCoverage::default(),
+        }],
         categories: TokenCategories {
             input: Some(1_200),
             cached_input: None,
@@ -1027,6 +903,7 @@ fn populated_usage() -> UsageSummary {
             output: Some(5_555),
             reasoning: Some(77),
             total: Some(47_055),
+            ..TokenCategories::default()
         },
         total: Some(47_055),
         class: AggregationClass::Reported,
@@ -1035,7 +912,9 @@ fn populated_usage() -> UsageSummary {
             class: AggregationClass::Estimated,
             as_of: Some("2026-10-01".into()),
             note: Some("server-tool fees excluded".into()),
+            ..CostEstimate::default()
         },
+        ..UsageSummary::default()
     }
 }
 
@@ -1055,7 +934,7 @@ fn session_info_shows_categories_dated_pricing_and_fee_exclusion_note() {
     );
     assert!(app.open_session_info());
     assert_eq!(app.screen, agentscope::app::Screen::Session);
-    let screen = draw(&app, 140, 30);
+    let screen = draw(&app, 140, 40);
     for needle in [
         "Input: 1,200",
         "Cached input: —",
@@ -1096,8 +975,8 @@ fn session_info_is_reachable_by_key_and_listed_in_the_inspector_footer() {
 #[test]
 fn session_info_renders_resolved_ambiguous_and_unresolved_lineage() {
     let parent = SessionKey {
-        provider: Provider::Codex,
-        provider_session_id: "parent-7".into(),
+        harness: Harness::Codex,
+        native_id: "parent-7".into(),
         source: SourceKey::File("parent-7.jsonl".into()),
     };
     let cases = [
@@ -1124,15 +1003,16 @@ fn session_info_renders_resolved_ambiguous_and_unresolved_lineage() {
     ];
     for (parent, fork, sidechain, expected) in cases {
         let mut s = summary(1);
-        s.lineage = Lineage {
+        s.meta.lineage = Lineage {
             parent,
             fork,
             sidechain,
+            ..Lineage::default()
         };
         let mut app = app_with(s);
         open_empty(&mut app);
         assert!(app.open_session_info());
-        let screen = draw(&app, 120, 30);
+        let screen = draw(&app, 120, 40);
         for needle in expected {
             assert!(screen.contains(needle), "missing {needle:?}:\n{screen}");
         }
@@ -1146,6 +1026,9 @@ fn event_details_show_per_event_usage_categories() {
         model: None,
         scope: UsageScope::Message,
         categories: populated_usage().categories,
+        accounting: TokenAccounting::default(),
+        request: None,
+        money: RecordedMoney::default(),
         provenance: provenance(),
     });
     let mut app = app_with(summary(1));
@@ -1154,4 +1037,188 @@ fn event_details_show_per_event_usage_categories() {
     let screen = draw(&app, 160, 30);
     assert!(screen.contains("Usage (message):"), "{screen}");
     assert!(screen.contains("cache read 40,000"), "{screen}");
+}
+
+fn measured_model(id: &str) -> ModelDetail {
+    ModelDetail {
+        id: id.into(),
+        provider: None,
+        variant: None,
+        effort: None,
+        configured_effort: None,
+    }
+}
+
+#[test]
+fn session_info_renders_measured_speed_context_timing_and_compaction_facts() {
+    let mut s = summary(1);
+    s.metrics = SessionMetrics {
+        timing: SessionTiming {
+            started_at: Some(NOW - 3_600_000),
+            ended_at: None,
+            elapsed_ms: None,
+            active_ms: Some(1_500),
+            model_ms: Some(70_000.0),
+            active_complete: false,
+        },
+        speed: SpeedSummary {
+            latest: Some(TimedRate {
+                model: Some(measured_model("gpt-5.0-codex")),
+                request_id: Some("req-9".into()),
+                started_at: Some(NOW - 20_000),
+                completed_at: Some(NOW - 1_000),
+                output_tokens: 1_600,
+                duration_ms: 19_000.0,
+                ttft_ms: Some(400.0),
+                tokens_per_second: 1_600.0 / 19.0,
+            }),
+            weighted_tokens_per_second: Some(5_500.0 / 70.0),
+            measured_output: 5_500,
+            measured_duration_ms: 70_000.0,
+            measured_requests: 5,
+            total_requests: 8,
+            complete: false,
+        },
+        context: ContextUsage {
+            used: Some(215_000),
+            capacity: Some(1_000_000),
+            class: AggregationClass::Reported,
+            recorded_at: Some(NOW - 5_000),
+            model: Some(measured_model("gpt-5.1-codex")),
+            compaction_epoch: Some("c2".into()),
+        },
+        compactions: CompactionSummary {
+            observed: 2,
+            history_complete: true,
+            known_cost_usd: None,
+            cost_scope: CompactionScope::Unknown,
+            unpriced: 1,
+            latest: Some(CompactionObservation {
+                id: "compact-1".into(),
+                timestamp: Some(NOW - 10_000),
+                method: None,
+                trigger: Some("auto".into()),
+                summary: None,
+                before_tokens: Some(180_000),
+                after_tokens: Some(42_000),
+                duration_ms: None,
+                usage: None,
+                scope: CompactionScope::Event,
+                provenance: provenance(),
+            }),
+        },
+    };
+    let mut app = app_with(s);
+    open_empty(&mut app);
+    assert!(app.open_session_info());
+    let screen = draw(&app, 160, 60);
+    for needle in [
+        "# Measured",
+        "Elapsed: Unknown",
+        "Active: 1s (incomplete coverage)",
+        "Model time: 1m 10s",
+        "Latest speed: 84.2 tok/s — gpt-5.0-codex (measured on an earlier model) at ",
+        "Latest request: 1,600 output in 19s · TTFT 400 ms",
+        "Weighted speed: 78.6 tok/s — 5,500 output over 1m 10s across 5 of 8 requests (incomplete coverage)",
+        "Context: 215,000 of 1.0M window (reported, recorded ",
+        "epoch c2",
+        "Compactions: 2 observed · cost Unknown · 1 unpriced",
+        "Latest compaction: ",
+        "trigger auto · tokens removed 138,000",
+        "Cost by category: input Unknown",
+    ] {
+        assert!(screen.contains(needle), "missing {needle:?} in:\n{screen}");
+    }
+}
+
+#[test]
+fn session_info_shows_unmeasured_facts_as_unknown_not_zero() {
+    let mut s = summary(1);
+    s.metrics = SessionMetrics::default();
+    let mut app = app_with(s);
+    open_empty(&mut app);
+    assert!(app.open_session_info());
+    let screen = draw(&app, 160, 60);
+    for needle in [
+        "Started: Unknown",
+        "Active: Unknown (incomplete coverage)",
+        "Latest speed: Unknown",
+        "Weighted speed: Unknown — no measured requests",
+        "Context: Unknown of Unknown window",
+        "Compactions: 0 observed (history incomplete) · cost Unknown · 0 unpriced",
+    ] {
+        assert!(screen.contains(needle), "missing {needle:?} in:\n{screen}");
+    }
+    assert!(!screen.contains("0 tok/s"), "{screen}");
+}
+
+#[test]
+fn session_info_never_shows_a_tiny_positive_cost_as_free() {
+    let mut s = summary(1);
+    let usage = s.usage.as_mut().expect("usage fixture");
+    usage.cost.usd = Some(0.00003);
+    usage.cost.breakdown.input = Some(0.00003);
+    s.metrics.compactions = CompactionSummary {
+        observed: 1,
+        history_complete: true,
+        known_cost_usd: Some(0.00003),
+        cost_scope: CompactionScope::Event,
+        unpriced: 0,
+        latest: None,
+    };
+    let mut app = app_with(s);
+    open_empty(&mut app);
+    assert!(app.open_session_info());
+    let screen = draw(&app, 160, 60);
+    for needle in [
+        "Cost by category: input <$0.0001",
+        "Compactions: 1 observed · cost <$0.0001 · 0 unpriced",
+    ] {
+        assert!(screen.contains(needle), "missing {needle:?} in:\n{screen}");
+    }
+    assert!(!screen.contains("input $0.00"), "{screen}");
+}
+
+#[test]
+fn incomplete_compaction_history_labels_money_as_a_subtotal_and_unknown_model_is_not_stale() {
+    let mut s = summary(1);
+    s.meta.model = None;
+    s.metrics.speed = SpeedSummary {
+        latest: Some(TimedRate {
+            model: Some(measured_model("gpt-5.0-codex")),
+            request_id: None,
+            started_at: None,
+            completed_at: Some(NOW - 1_000),
+            output_tokens: 100,
+            duration_ms: 2_000.0,
+            ttft_ms: None,
+            tokens_per_second: 50.0,
+        }),
+        weighted_tokens_per_second: Some(50.0),
+        measured_output: 100,
+        measured_duration_ms: 2_000.0,
+        measured_requests: 1,
+        total_requests: 1,
+        complete: true,
+    };
+    s.metrics.compactions = CompactionSummary {
+        observed: 256,
+        history_complete: false,
+        known_cost_usd: Some(0.5),
+        cost_scope: CompactionScope::Event,
+        unpriced: 0,
+        latest: None,
+    };
+    let mut app = app_with(s);
+    open_empty(&mut app);
+    assert!(app.open_session_info());
+    let screen = draw(&app, 160, 60);
+    assert!(
+        !screen.contains("measured on an earlier model"),
+        "an unknown current model is not evidence of a stale rate:\n{screen}"
+    );
+    assert!(
+        screen.contains("Compactions: 256 observed (history incomplete) · cost $0.50 known subtotal (not a total) · 0 unpriced"),
+        "{screen}"
+    );
 }

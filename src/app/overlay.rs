@@ -65,6 +65,8 @@ pub(super) struct Overlays {
     reveal: Option<SourceLocator>,
     details_scroll: usize,
     session_scroll: usize,
+    /// Compaction summaries in the session view are shown in full.
+    summaries_expanded: bool,
     diag_selected: usize,
     /// Largest scroll offset of the last rendered overlay body.
     extent: Cell<usize>,
@@ -102,13 +104,27 @@ impl App {
         self.overlays.session_scroll
     }
 
+    /// Compaction summaries in the session view are shown in full.
+    pub fn summaries_expanded(&self) -> bool {
+        self.overlays.summaries_expanded
+    }
+
+    /// `Space`/`Enter` in the session view: expand or collapse compaction summaries.
+    pub fn toggle_summaries(&mut self) {
+        if self.screen == Screen::Session {
+            self.overlays.summaries_expanded = !self.overlays.summaries_expanded;
+        }
+    }
+
     /// `i`: usage categories, pricing provenance and lineage of the open session.
     pub fn open_session_info(&mut self) -> bool {
         if self.screen != Screen::Inspector || self.transcript.is_none() {
             return false;
         }
         self.overlays.session_scroll = 0;
+        self.overlays.summaries_expanded = false;
         self.screen = Screen::Session;
+        self.request_details();
         true
     }
 

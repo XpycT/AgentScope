@@ -23,7 +23,7 @@ fn process_note(p: &ProcessAssociation) -> &'static str {
 
 pub fn synthesize(session: &SessionSummary, now: Timestamp, thresholds: &Thresholds) -> Status {
     // 1. Source unavailable wins over everything.
-    if !session.source_available {
+    if !session.meta.source_available {
         return status(
             StatusLabel::Unavailable,
             "source unavailable; state not inferred",
@@ -42,7 +42,7 @@ pub fn synthesize(session: &SessionSummary, now: Timestamp, thresholds: &Thresho
     let pnote = process_note(&session.process);
     let completed = session.last_completion.is_some() && !session.unfinished_work;
     let activity = [
-        session.last_persisted_at,
+        session.meta.activity.at,
         session.last_event_at,
         session.last_completion,
     ]

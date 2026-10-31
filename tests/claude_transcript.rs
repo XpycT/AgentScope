@@ -1,7 +1,7 @@
 mod support;
 
 use agentscope::config::{CliOverrides, Config, Env};
-use agentscope::domain::{EventKind, Provider, RefreshBudget, SessionKey, SourceKey, ToolStatus};
+use agentscope::domain::{EventKind, Harness, RefreshBudget, SessionKey, SourceKey, ToolStatus};
 use agentscope::providers::claude::ClaudeScanner;
 use serde_json::json;
 use support::claude::message;
@@ -9,8 +9,8 @@ use support::{NOW, write_lines};
 
 fn key() -> SessionKey {
     SessionKey {
-        provider: Provider::Claude,
-        provider_session_id: "session".into(),
+        harness: Harness::Claude,
+        native_id: "session".into(),
         source: SourceKey::File("fixture.jsonl".into()),
     }
 }
@@ -175,25 +175,25 @@ fn title_precedence_and_duplicate_sessions_are_separate_sources() {
             .collect::<Vec<_>>(),
     );
     let mut scanner = ClaudeScanner::new(&config(&root)).unwrap();
-    let delta = scanner.scan_roster(NOW, BIG).unwrap();
+    let delta = support::world::rescan(&mut scanner, NOW, BIG);
     assert!(delta.scan.done);
     assert_eq!(delta.sessions.len(), 2);
     let first = delta
         .sessions
         .iter()
-        .find(|s| s.key.source == SourceKey::File(a.clone()))
+        .find(|s| s.meta.key.source == SourceKey::File(a.clone()))
         .unwrap();
     let second = delta
         .sessions
         .iter()
-        .find(|s| s.key.source == SourceKey::File(b.clone()))
+        .find(|s| s.meta.key.source == SourceKey::File(b.clone()))
         .unwrap();
-    assert_eq!(first.title, "real prompt");
-    assert!(first.title_derived);
-    assert_eq!(second.title, "Generated title");
-    assert!(!second.title_derived);
-    assert!(first.source_available && second.source_available);
-    assert_ne!(first.key, second.key);
+    assert_eq!(first.meta.title, "real prompt");
+    assert!(first.meta.title_derived);
+    assert_eq!(second.meta.title, "Generated title");
+    assert!(!second.meta.title_derived);
+    assert!(first.meta.source_available && second.meta.source_available);
+    assert_ne!(first.meta.key, second.meta.key);
 }
 
 #[test]
@@ -209,11 +209,11 @@ fn replacement_rebuilds_summary_without_replaying_old_content() {
         ],
     );
     let mut scanner = ClaudeScanner::new(&config(&root)).unwrap();
-    let first = scanner.scan_roster(NOW, BIG).unwrap();
+    let first = support::world::rescan(&mut scanner, NOW, BIG);
     assert_eq!(first.sessions[0].hidden_records, 1);
     write_lines(&file, &[message("user", "new", json!("new")).to_string()]);
-    let second = scanner.scan_roster(NOW, BIG).unwrap();
-    assert_eq!(second.sessions[0].title, "new");
+    let second = support::world::rescan(&mut scanner, NOW, BIG);
+    assert_eq!(second.sessions[0].meta.title, "new");
     assert_eq!(second.sessions[0].displayed_event_count, 1);
     assert_eq!(second.sessions[0].hidden_records, 0);
 }
@@ -251,7 +251,7 @@ fn duplicate_ids_warn_and_explicit_parent_is_not_inferred() {
     other_record["parentUuid"] = json!("ordinary-message-parent");
     write_lines(&b, &[other_record.to_string()]);
     let mut scanner = ClaudeScanner::new(&config(&root)).unwrap();
-    let delta = scanner.scan_roster(NOW, BIG).unwrap();
+    let delta = support::world::rescan(&mut scanner, NOW, BIG);
     assert_eq!(delta.sessions.len(), 2);
     for s in &delta.sessions {
         assert!(
@@ -263,23 +263,23 @@ fn duplicate_ids_warn_and_explicit_parent_is_not_inferred() {
     let child = delta
         .sessions
         .iter()
-        .find(|s| s.key.source == SourceKey::File(a.clone()))
+        .find(|s| s.meta.key.source == SourceKey::File(a.clone()))
         .unwrap();
     assert_eq!(
-        child.lineage.parent,
+        child.meta.lineage.parent,
         Some(agentscope::domain::SessionLink::Unresolved(
             "parent-session".into()
         ))
     );
-    assert!(child.lineage.sidechain);
+    assert!(child.meta.lineage.sidechain);
     let other = delta
         .sessions
         .iter()
-        .find(|s| s.key.source == SourceKey::File(b.clone()))
+        .find(|s| s.meta.key.source == SourceKey::File(b.clone()))
         .unwrap();
-    assert_eq!(other.lineage.parent, None);
+    assert_eq!(other.meta.lineage.parent, None);
     std::fs::remove_file(b).unwrap();
-    let next = scanner.scan_roster(NOW, BIG).unwrap();
+    let next = support::world::rescan(&mut scanner, NOW, BIG);
     assert_eq!(next.removed.len(), 1);
     assert_eq!(next.sessions.len(), 1);
     assert!(
@@ -291,7 +291,7 @@ fn duplicate_ids_warn_and_explicit_parent_is_not_inferred() {
 }
 
 #[test]
-fn sidechain_parent_uuid_is_kept_unresolved() {
+fn sidechain_parent_uuid_is_not_a_session_edge() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("projects");
     let mut record = message("assistant", "child", json!("response"));
@@ -299,38 +299,52 @@ fn sidechain_parent_uuid_is_kept_unresolved() {
     record["parentUuid"] = json!("parent-record");
     write_lines(&root.join("p/child.jsonl"), &[record.to_string()]);
     let mut scanner = ClaudeScanner::new(&config(&root)).unwrap();
-    let delta = scanner.scan_roster(NOW, BIG).unwrap();
-    assert_eq!(
-        delta.sessions[0].lineage.parent,
-        Some(agentscope::domain::SessionLink::Unresolved(
-            "parent-record".into()
-        ))
-    );
+    let delta = support::world::rescan(&mut scanner, NOW, BIG);
+    // `parentUuid` names a message, so it never becomes a session parent.
+    assert_eq!(delta.sessions[0].meta.lineage.parent, None);
+    assert!(delta.sessions[0].meta.lineage.sidechain);
 }
 
+/// A source's key is fixed by discovery's bounded head probe; hydration answers to it.
 #[test]
-fn retiring_stem_key_when_session_id_arrives_on_later_budget() {
+fn a_session_id_beyond_the_probe_window_keeps_the_discovered_stem_key() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("projects");
-    let file = root.join("p/stem.jsonl");
+    let early = root.join("p/early.jsonl");
+    let late = root.join("p/late.jsonl");
     write_lines(
-        &file,
+        &early,
         &[
             json!({"type":"attachment"}).to_string(),
             message("user", "u", json!("hello")).to_string(),
         ],
     );
+    // The only ID sits between 10 KiB of ID-free records and a 54 KiB tail of them: past
+    // the 4 KiB prefix and before the 32 KiB tail.
+    let filler = json!({"type": "attachment", "pad": "x".repeat(900)}).to_string();
+    let mut lines = vec![filler.clone(); 12];
+    lines.push(message("user", "u", json!("hello")).to_string());
+    lines.extend(vec![filler; 60]);
+    write_lines(&late, &lines);
     let mut scanner = ClaudeScanner::new(&config(&root)).unwrap();
-    let tiny = RefreshBudget {
-        max_records: 1,
-        ..BIG
+    let found = support::world::discover_pass(&mut scanner, NOW, BIG);
+    let key_of = |path: &std::path::Path| {
+        found
+            .sessions
+            .iter()
+            .find(|m| m.key.source == SourceKey::File(path.to_path_buf()))
+            .unwrap()
+            .key
+            .clone()
     };
-    let first = scanner.scan_roster(NOW, tiny).unwrap();
-    assert_eq!(first.sessions[0].key.provider_session_id, "stem");
-    let old = first.sessions[0].key.clone();
-    let second = scanner.scan_roster(NOW, tiny).unwrap();
-    assert_eq!(second.sessions[0].key.provider_session_id, "session");
-    assert_eq!(second.removed, vec![old]);
+    // The ID inside the head window identifies the first source...
+    assert_eq!(key_of(&early).native_id, "session");
+    // ...the other stays under its file stem, and hydration does not rename it.
+    let late_key = key_of(&late);
+    assert_eq!(late_key.native_id, "late");
+    let summary = support::world::hydrate_complete(&mut scanner, &late_key, NOW);
+    assert_eq!(summary.meta.key, late_key);
+    assert_eq!(summary.displayed_event_count, 1);
 }
 
 #[test]
@@ -349,7 +363,7 @@ fn malformed_and_oversized_lines_are_warnings_not_auxiliary() {
     let mut cfg = config(&root);
     cfg.max_record_bytes = 250;
     let mut scanner = ClaudeScanner::new(&cfg).unwrap();
-    let delta = scanner.scan_roster(NOW, BIG).unwrap();
+    let delta = support::world::rescan(&mut scanner, NOW, BIG);
     let s = &delta.sessions[0];
     assert_eq!(s.hidden_records, 0);
     assert!(
@@ -384,6 +398,6 @@ fn roster_pairs_more_than_256_outstanding_tool_calls() {
         &records.iter().map(ToString::to_string).collect::<Vec<_>>(),
     );
     let mut scanner = ClaudeScanner::new(&config(&root)).unwrap();
-    let delta = scanner.scan_roster(NOW, BIG).unwrap();
+    let delta = support::world::rescan(&mut scanner, NOW, BIG);
     assert_eq!(delta.sessions[0].displayed_event_count, 300);
 }

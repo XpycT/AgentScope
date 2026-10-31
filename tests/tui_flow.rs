@@ -3,6 +3,8 @@
 
 use std::time::Duration;
 
+mod support;
+
 use agentscope::app::{App, Panel, Screen};
 use agentscope::domain::*;
 use agentscope::ui::{KeyAction, RosterContext, apply_worker_event, handle_key, render};
@@ -10,19 +12,20 @@ use agentscope::worker::{WorkerEvent, WorkerRequest};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use support::facts::{self, metadata};
 
 const NOW: Timestamp = 1_800_000_000_000;
 
-fn key_of(provider: Provider, id: &str) -> SessionKey {
+fn key_of(provider: Harness, id: &str) -> SessionKey {
     SessionKey {
-        provider,
-        provider_session_id: id.into(),
+        harness: provider,
+        native_id: id.into(),
         source: SourceKey::File(format!("{id}.jsonl").into()),
     }
 }
 
 fn session(
-    provider: Provider,
+    provider: Harness,
     id: &str,
     title: &str,
     project: &str,
@@ -30,30 +33,24 @@ fn session(
     age_secs: i64,
     tokens: Option<u64>,
 ) -> SessionSummary {
+    let mut meta = metadata(key_of(provider, id), title);
+    meta.project = Some(project.into());
+    meta.cwd = Some(cwd.into());
+    meta.created_at = Some(NOW - 86_400_000);
+    meta.activity = ActivityStamp {
+        at: Some(NOW - age_secs * 1000),
+        class: AggregationClass::Reported,
+    };
     SessionSummary {
-        key: key_of(provider, id),
-        title: title.into(),
-        title_derived: false,
-        project: Some(project.into()),
-        cwd: Some(cwd.into()),
-        models: vec![],
-        model_details: vec![],
-        provider_version: None,
-        created_at: Some(NOW - 86_400_000),
         last_event_at: Some(NOW - age_secs * 1000),
-        last_persisted_at: Some(NOW - age_secs * 1000),
         last_completion: None,
         unfinished_work: true,
         displayed_event_count: 3,
         hidden_records: 0,
-        source_available: true,
-        archived: false,
-        context_window: None,
         server_tools: None,
         lifecycle: Lifecycle::Unknown,
         process: ProcessAssociation::Unmatched,
         usage: tokens.map(|t| UsageSummary {
-            model: None,
             categories: TokenCategories::default(),
             total: Some(t),
             class: AggregationClass::Reported,
@@ -62,21 +59,19 @@ fn session(
                 class: AggregationClass::Unknown,
                 as_of: None,
                 note: None,
+                ..CostEstimate::default()
             },
+            ..UsageSummary::default()
         }),
-        lineage: Lineage {
-            parent: None,
-            fork: None,
-            sidechain: false,
-        },
         warnings: vec![],
+        ..facts::summary(meta)
     }
 }
 
 fn roster() -> Vec<SessionSummary> {
     vec![
         session(
-            Provider::Codex,
+            Harness::Codex,
             "codex-1",
             "Inventory API",
             "RipperGame",
@@ -85,7 +80,7 @@ fn roster() -> Vec<SessionSummary> {
             Some(91_000),
         ),
         session(
-            Provider::Claude,
+            Harness::Claude,
             "claude-1",
             "Scanner refactor",
             "RipperGame",
@@ -94,7 +89,7 @@ fn roster() -> Vec<SessionSummary> {
             Some(73_000),
         ),
         session(
-            Provider::OpenCode,
+            Harness::OpenCode,
             "oc-9",
             "PR review",
             "CortexSandbox",
@@ -107,7 +102,7 @@ fn roster() -> Vec<SessionSummary> {
 
 fn scan() -> ScanProgress {
     ScanProgress {
-        provider: Provider::Codex,
+        harness: Harness::Codex,
         scanned: 3,
         total: Some(3),
         done: true,
@@ -136,10 +131,8 @@ fn discover(app: &mut App, ctx: &mut RosterContext, generation: u64) {
         app,
         ctx,
         WorkerEvent::Roster {
-            generation,
-            sessions: roster(),
+            snapshot: support::snapshot(generation, roster(), scan()),
             warnings: vec![],
-            scan: scan(),
         },
     );
 }
@@ -179,7 +172,7 @@ fn draw(app: &App, w: u16, h: u16) -> String {
 fn titles(app: &App) -> Vec<String> {
     app.visible_rows()
         .iter()
-        .map(|r| r.session.title.clone())
+        .map(|r| r.session.meta.title.clone())
         .collect()
 }
 
@@ -187,7 +180,7 @@ fn titles(app: &App) -> Vec<String> {
 
 fn provenance(k: &SessionKey) -> Provenance {
     Provenance {
-        provider: k.provider,
+        harness: k.harness,
         source: k.source.clone(),
         locator: SourceLocator {
             session: k.clone(),
@@ -198,7 +191,7 @@ fn provenance(k: &SessionKey) -> Provenance {
             generation: None,
         },
         record_type: "test".into(),
-        provider_version: None,
+        harness_version: None,
     }
 }
 
@@ -254,7 +247,10 @@ fn open_with(app: &mut App, ctx: &mut RosterContext, bodies: &[&str]) {
     assert_eq!(press(app, KeyCode::Enter), KeyAction::None);
     assert_eq!(app.screen, Screen::Inspector);
     let requests = app.take_requests();
-    let Some(WorkerRequest::Select { request_id, key }) = requests.first() else {
+    let Some(WorkerRequest::Select { request_id, key }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
         panic!("expected Select, got {requests:?}");
     };
     let page = transcript_page(key, bodies);
@@ -276,7 +272,7 @@ fn keyboard_flow_discovers_opens_expands_searches_and_returns() {
     let mut ctx = ctx();
     discover(&mut app, &mut ctx, 1);
     assert_eq!(app.visible_rows().len(), 3);
-    assert_eq!(app.selected_key(), Some(key_of(Provider::Codex, "codex-1")));
+    assert_eq!(app.selected_key(), Some(key_of(Harness::Codex, "codex-1")));
 
     open_with(
         &mut app,
@@ -290,8 +286,9 @@ fn keyboard_flow_discovers_opens_expands_searches_and_returns() {
     );
     assert_eq!(app.transcript().unwrap().events().len(), 4);
 
-    // Expand the second event.
-    ch(&mut app, 'j');
+    // The newest entry is selected on opening; step back to the second event.
+    ch(&mut app, 'k');
+    ch(&mut app, 'k');
     press(&mut app, KeyCode::Enter);
     let t = app.transcript().unwrap();
     assert_eq!(t.selected(), 1);
@@ -319,7 +316,7 @@ fn keyboard_flow_discovers_opens_expands_searches_and_returns() {
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.screen, Screen::Roster);
     assert!(app.transcript().is_none());
-    assert_eq!(app.selected_key(), Some(key_of(Provider::Codex, "codex-1")));
+    assert_eq!(app.selected_key(), Some(key_of(Harness::Codex, "codex-1")));
     assert_eq!(ch(&mut app, 'q'), KeyAction::Quit);
 }
 
@@ -333,7 +330,7 @@ fn slash_searches_roster_and_loaded_transcript_with_n_and_shift_n() {
     ch(&mut app, '/');
     type_text(&mut app, "SANDBOX");
     assert_eq!(titles(&app), vec!["PR review"]);
-    assert_eq!(app.selected_key(), Some(key_of(Provider::OpenCode, "oc-9")));
+    assert_eq!(app.selected_key(), Some(key_of(Harness::OpenCode, "oc-9")));
     press(&mut app, KeyCode::Backspace);
     press(&mut app, KeyCode::Backspace);
     press(&mut app, KeyCode::Backspace);
@@ -387,31 +384,32 @@ fn slash_searches_roster_and_loaded_transcript_with_n_and_shift_n() {
     type_text(&mut app, "alpha");
     press(&mut app, KeyCode::Enter);
     let t = app.transcript().unwrap();
-    assert_eq!((t.selected(), t.match_count()), (0, 3));
+    // The newest event already matches; search starts there.
+    assert_eq!((t.selected(), t.match_count()), (4, 3));
+    ch(&mut app, 'n');
+    assert_eq!(app.transcript().unwrap().selected(), 0, "n wraps");
     ch(&mut app, 'n');
     assert_eq!(app.transcript().unwrap().selected(), 2);
     ch(&mut app, 'n');
     assert_eq!(app.transcript().unwrap().selected(), 4);
-    ch(&mut app, 'n');
-    assert_eq!(app.transcript().unwrap().selected(), 0, "n wraps");
     ch(&mut app, 'N');
-    assert_eq!(app.transcript().unwrap().selected(), 4, "N wraps backwards");
+    assert_eq!(app.transcript().unwrap().selected(), 2, "N steps backwards");
     ch(&mut app, 'N');
-    assert_eq!(app.transcript().unwrap().selected(), 2);
+    assert_eq!(app.transcript().unwrap().selected(), 0);
     let screen = draw(&app, 100, 30);
-    assert!(screen.contains("match 2/3 (loaded events)"), "{screen}");
+    assert!(screen.contains("match 1/3 (loaded events)"), "{screen}");
 
     // No match is reported, and the selection stays put.
     ch(&mut app, '/');
     type_text(&mut app, "-nothing");
-    assert_eq!(app.transcript().unwrap().selected(), 2);
+    assert_eq!(app.transcript().unwrap().selected(), 0);
     let screen = draw(&app, 100, 30);
     assert!(screen.contains("no matches (loaded events)"), "{screen}");
     // Esc restores the previous query and selection.
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.screen, Screen::Inspector);
     assert_eq!(app.transcript().unwrap().search_query(), "alpha");
-    assert_eq!(app.transcript().unwrap().selected(), 2);
+    assert_eq!(app.transcript().unwrap().selected(), 0);
 }
 
 #[test]
@@ -441,7 +439,7 @@ fn filter_panel_and_sort_keys_update_the_roster() {
     // Selection moved to the only remaining row.
     assert_eq!(
         app.selected_key(),
-        Some(key_of(Provider::Claude, "claude-1"))
+        Some(key_of(Harness::Claude, "claude-1"))
     );
     // Multi-select within a group.
     ch(&mut app, 'k');
@@ -526,7 +524,7 @@ fn help_is_contextual_and_closes_without_quitting() {
     // Other keys do not leak through the panel.
     ch(&mut app, 'j');
     ch(&mut app, 's');
-    assert_eq!(app.selected_key(), Some(key_of(Provider::Codex, "codex-1")));
+    assert_eq!(app.selected_key(), Some(key_of(Harness::Codex, "codex-1")));
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.panel(), Panel::None);
 
@@ -591,16 +589,16 @@ fn esc_restores_the_original_roster_selection_when_the_query_excluded_it() {
     ch(&mut app, 'j');
     assert_eq!(
         app.selected_key(),
-        Some(key_of(Provider::Claude, "claude-1"))
+        Some(key_of(Harness::Claude, "claude-1"))
     );
     ch(&mut app, '/');
     type_text(&mut app, "sandbox");
-    assert_eq!(app.selected_key(), Some(key_of(Provider::OpenCode, "oc-9")));
+    assert_eq!(app.selected_key(), Some(key_of(Harness::OpenCode, "oc-9")));
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.visible_rows().len(), 3);
     assert_eq!(
         app.selected_key(),
-        Some(key_of(Provider::Claude, "claude-1")),
+        Some(key_of(Harness::Claude, "claude-1")),
         "Esc returns to the session selected before the search"
     );
 }
@@ -611,9 +609,12 @@ fn transcript_search_origin_survives_an_older_page_prepending() {
     let mut ctx = ctx();
     discover(&mut app, &mut ctx, 1);
     press(&mut app, KeyCode::Enter);
-    let k = key_of(Provider::Codex, "codex-1");
+    let k = key_of(Harness::Codex, "codex-1");
     let requests = app.take_requests();
-    let Some(WorkerRequest::Select { request_id, .. }) = requests.first() else {
+    let Some(WorkerRequest::Select { request_id, .. }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
         panic!("expected Select, got {requests:?}");
     };
     apply_worker_event(
@@ -686,7 +687,7 @@ fn tab_focus_cycling_retains_the_transcript_and_its_state() {
     let mut ctx = ctx();
     discover(&mut app, &mut ctx, 1);
     open_with(&mut app, &mut ctx, &["alpha", "beta", "alpha two"]);
-    ch(&mut app, 'j');
+    ch(&mut app, 'k');
     press(&mut app, KeyCode::Enter);
     ch(&mut app, '/');
     type_text(&mut app, "alpha");
@@ -719,7 +720,10 @@ fn search_opened_while_the_first_page_loads_works_once_it_arrives() {
     discover(&mut app, &mut ctx, 1);
     press(&mut app, KeyCode::Enter);
     let requests = app.take_requests();
-    let Some(WorkerRequest::Select { request_id, key }) = requests.first() else {
+    let Some(WorkerRequest::Select { request_id, key }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
         panic!("expected Select, got {requests:?}");
     };
     ch(&mut app, '/');
@@ -735,7 +739,7 @@ fn search_opened_while_the_first_page_loads_works_once_it_arrives() {
     type_text(&mut app, "target");
     assert_eq!(app.transcript().unwrap().selected(), 2);
     press(&mut app, KeyCode::Esc);
-    assert_eq!(app.transcript().unwrap().selected(), 0, "Esc restores");
+    assert_eq!(app.transcript().unwrap().selected(), 2, "Esc restores");
 }
 
 #[test]
@@ -746,8 +750,8 @@ fn process_panel_follows_the_selected_roster_row_after_leaving_the_inspector() {
     open_with(&mut app, &mut ctx, &["one"]);
     ch(&mut app, 'p');
     assert_eq!(
-        app.process_view().session.unwrap().key,
-        key_of(Provider::Codex, "codex-1")
+        app.process_view().session.unwrap().meta.key,
+        key_of(Harness::Codex, "codex-1")
     );
     press(&mut app, KeyCode::Esc); // close the panel
     press(&mut app, KeyCode::BackTab); // roster, transcript retained
@@ -755,7 +759,677 @@ fn process_panel_follows_the_selected_roster_row_after_leaving_the_inspector() {
     ch(&mut app, 'j');
     ch(&mut app, 'p');
     assert_eq!(
-        app.process_view().session.unwrap().key,
-        key_of(Provider::Claude, "claude-1")
+        app.process_view().session.unwrap().meta.key,
+        key_of(Harness::Claude, "claude-1")
     );
+}
+
+// ---- responsive layout, Load more focus and read-only mouse -----------------
+
+use agentscope::app::{LoadFocus, PreviewState};
+use agentscope::ui::{RosterLayout, handle_event, handle_mouse};
+use crossterm::event::{Event as TermEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+
+fn lines(screen: &str) -> Vec<&str> {
+    screen.lines().collect()
+}
+
+fn col_of(line: &str, needle: &str) -> usize {
+    let byte = line
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} not found in {line:?}"));
+    line[..byte].chars().count()
+}
+
+fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn click(app: &mut App, area: Rect, column: u16, row: u16) {
+    let layout = RosterLayout::for_area(area, app.horizontal_column());
+    handle_mouse(
+        app,
+        mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+        &layout,
+    );
+}
+
+/// Three loaded roots and an explicit root Load more row.
+fn paged_app() -> App {
+    let mut app = new_app();
+    let mut snap = support::snapshot(1, roster(), scan());
+    snap.has_more = true;
+    assert!(app.apply_roster_snapshot(snap, vec![]));
+    app.take_requests();
+    app
+}
+
+fn load_more_requested(app: &mut App) -> bool {
+    app.take_requests()
+        .iter()
+        .any(|r| matches!(r, WorkerRequest::LoadRosterMore { .. }))
+}
+
+#[test]
+fn tab_swaps_list_and_preview_on_narrow_terminals_and_keeps_the_selection() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    handle_event(&mut app, TermEvent::Resize(90, 25), Rect::new(0, 0, 90, 25));
+    ch(&mut app, 'j');
+    let selected = app.selected_key();
+    assert_eq!(selected, Some(key_of(Harness::Claude, "claude-1")));
+    assert!(draw(&app, 90, 25).contains("HARNESS/PROV"));
+
+    press(&mut app, KeyCode::Tab);
+    assert!(app.preview_replaces_list());
+    assert_eq!(
+        app.screen,
+        Screen::Roster,
+        "Tab swaps panes, it does not navigate"
+    );
+    let swapped = draw(&app, 90, 25);
+    assert!(swapped.contains("Preview"), "{swapped}");
+    assert!(
+        swapped.contains("Scanner refactor"),
+        "the selected session's preview:\n{swapped}"
+    );
+    assert!(!swapped.contains("HARNESS/PROV"), "{swapped}");
+    assert_eq!(app.selected_key(), selected);
+
+    // Vertical keys scroll the preview, not the selection.
+    ch(&mut app, 'j');
+    assert_eq!(app.selected_key(), selected);
+    press(&mut app, KeyCode::Tab);
+    assert!(!app.preview_replaces_list());
+    assert!(draw(&app, 90, 25).contains("HARNESS/PROV"));
+    assert_eq!(app.selected_key(), selected);
+
+    // From 150 columns the preview has its own column and Tab keeps its old job.
+    handle_event(
+        &mut app,
+        TermEvent::Resize(160, 40),
+        Rect::new(0, 0, 160, 40),
+    );
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.screen, Screen::Inspector);
+    assert!(!app.preview_replaces_list());
+}
+
+#[test]
+fn resizing_between_sizes_keeps_selection_and_a_swapped_preview_only_while_narrow() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    ch(&mut app, 'j');
+    let selected = app.selected_key();
+    handle_event(&mut app, TermEvent::Resize(90, 25), Rect::new(0, 0, 90, 25));
+    press(&mut app, KeyCode::Tab);
+    assert!(app.preview_replaces_list());
+    for (w, h) in [(60, 20), (160, 40), (90, 25), (60, 20)] {
+        handle_event(&mut app, TermEvent::Resize(w, h), Rect::new(0, 0, w, h));
+        let screen = draw(&app, w, h);
+        assert_eq!(app.selected_key(), selected, "{w}x{h}");
+        if w >= 150 {
+            assert!(!app.preview_replaces_list(), "the swap ends once both fit");
+            assert!(
+                screen.contains("HARNESS/PROV") && screen.contains("Preview"),
+                "{screen}"
+            );
+        } else {
+            assert!(screen.contains("Scanner refactor"), "{w}x{h}:\n{screen}");
+        }
+        for line in lines(&screen) {
+            assert_eq!(line.chars().count(), w as usize, "{w}x{h} row width");
+        }
+    }
+}
+
+#[test]
+fn horizontal_keys_scroll_whole_columns_and_stop_at_the_ends() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    press(&mut app, KeyCode::Left);
+    assert_eq!(app.horizontal_column(), 0);
+    press(&mut app, KeyCode::Right);
+    ch(&mut app, 'l');
+    assert_eq!(app.horizontal_column(), 2);
+    let screen = draw(&app, 60, 20);
+    assert!(
+        screen.contains("TOKENS") && screen.contains("91k"),
+        "{screen}"
+    );
+    for _ in 0..20 {
+        press(&mut app, KeyCode::Right);
+    }
+    assert_eq!(app.horizontal_column(), agentscope::app::COLUMN_COUNT - 1);
+    assert!(draw(&app, 60, 20).contains("LATEST TOK/S"));
+    ch(&mut app, 'h');
+    assert_eq!(app.horizontal_column(), agentscope::app::COLUMN_COUNT - 2);
+}
+
+#[test]
+fn root_load_more_is_keyboard_focusable_and_enter_activates_it() {
+    let mut app = paged_app();
+    ch(&mut app, 'G');
+    assert_eq!(app.selected_key(), Some(key_of(Harness::OpenCode, "oc-9")));
+    assert!(app.load_focus().is_none());
+    ch(&mut app, 'j');
+    assert_eq!(app.load_focus(), Some(&LoadFocus::Roots));
+    let screen = draw(&app, 90, 25);
+    let row = lines(&screen)
+        .into_iter()
+        .find(|l| l.contains("Load more sessions"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(
+        row.starts_with("> "),
+        "the focus marker is on the row: {row:?}"
+    );
+    // The session row loses its marker while Load more holds the focus.
+    assert!(
+        !lines(&screen)
+            .iter()
+            .any(|l| l.starts_with("> ") && l.contains("PR review"))
+    );
+    assert!(!load_more_requested(&mut app), "moving never loads");
+
+    press(&mut app, KeyCode::Enter);
+    assert!(load_more_requested(&mut app));
+    assert_eq!(
+        app.screen,
+        Screen::Roster,
+        "Enter on Load more does not open a session"
+    );
+
+    ch(&mut app, 'k');
+    assert!(app.load_focus().is_none());
+    assert_eq!(app.selected_key(), Some(key_of(Harness::OpenCode, "oc-9")));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.screen, Screen::Inspector);
+}
+
+#[test]
+fn child_load_more_is_keyboard_focusable_and_asks_for_its_own_family() {
+    let mut app = new_app();
+    let snap = support::snapshot(1, roster(), scan());
+    assert!(app.apply_roster_snapshot(snap, vec![]));
+    app.take_requests();
+    let parent = key_of(Harness::Codex, "codex-1");
+    assert!(app.load_children(&parent));
+    let requests = app.take_requests();
+    let [WorkerRequest::LoadChildren { request_id, .. }] = requests.as_slice() else {
+        panic!("expected a child page request, got {requests:?}");
+    };
+    let child = key_of(Harness::Codex, "child-1");
+    assert!(app.apply_children(
+        *request_id,
+        &parent,
+        vec![std::sync::Arc::new(metadata(child.clone(), "Child task"))],
+        Some(key_of(Harness::Codex, "child-2")),
+    ));
+    ch(&mut app, ' ');
+    app.take_requests();
+    ch(&mut app, 'j');
+    assert_eq!(app.selected_key(), Some(child));
+    ch(&mut app, 'j');
+    assert_eq!(app.load_focus(), Some(&LoadFocus::Children(parent.clone())));
+    let screen = draw(&app, 90, 25);
+    assert!(screen.contains("Load more children"), "{screen}");
+    press(&mut app, KeyCode::Enter);
+    let requests = app.take_requests();
+    assert!(
+        requests.iter().any(|r| matches!(
+            r,
+            WorkerRequest::LoadChildren { parent: p, .. } if *p == parent
+        )),
+        "{requests:?}"
+    );
+    // Space does nothing on a Load more row.
+    ch(&mut app, ' ');
+    assert!(app.take_requests().is_empty());
+}
+
+#[test]
+fn mouse_selects_expands_and_loads_more_only_where_rows_are_drawn() {
+    let area = Rect::new(0, 0, 90, 25);
+    let mut app = paged_app();
+    handle_event(&mut app, TermEvent::Resize(90, 25), area);
+    let layout = RosterLayout::for_area(area, 0);
+    let first_y = layout.rows.y;
+
+    // A click on the second row (either of its two physical lines) selects it.
+    click(&mut app, area, 12, first_y + 2);
+    assert_eq!(
+        app.selected_key(),
+        Some(key_of(Harness::Claude, "claude-1"))
+    );
+    click(&mut app, area, 12, first_y + 5);
+    assert_eq!(app.selected_key(), Some(key_of(Harness::OpenCode, "oc-9")));
+
+    // The marker column is the Space-equivalent expander.
+    app.take_requests();
+    click(&mut app, area, 0, first_y);
+    assert_eq!(app.selected_key(), Some(key_of(Harness::Codex, "codex-1")));
+    let requests = app.take_requests();
+    assert!(
+        requests
+            .iter()
+            .any(|r| matches!(r, WorkerRequest::LoadChildren { .. })),
+        "{requests:?}"
+    );
+
+    // Load more rows are activated by a click, and only when they are shown.
+    let _ = app.take_requests();
+    let before = app.selected_key();
+    click(&mut app, area, 12, first_y + 6);
+    assert!(load_more_requested(&mut app));
+    assert_eq!(app.selected_key(), before, "Load more is not a session");
+    assert_eq!(app.load_focus(), Some(&LoadFocus::Roots));
+
+    // Nothing outside the drawn rows is a hit: header, footer, beyond the list.
+    for (x, y) in [
+        (12, first_y - 1),
+        (12, area.height - 1),
+        (12, first_y + 20),
+        (95, first_y),
+    ] {
+        let selected = app.selected_key();
+        click(&mut app, area, x, y);
+        assert_eq!(app.selected_key(), selected, "({x},{y}) is not a row");
+        assert!(app.take_requests().is_empty(), "({x},{y})");
+    }
+}
+
+#[test]
+fn mouse_is_ignored_for_hidden_modified_and_stale_geometry() {
+    let area = Rect::new(0, 0, 90, 25);
+    let layout = RosterLayout::for_area(area, 0);
+    let y = layout.rows.y + 2;
+    let down = |app: &mut App, layout: &RosterLayout, modifiers| {
+        let mut event = mouse(MouseEventKind::Down(MouseButton::Left), 12, y);
+        event.modifiers = modifiers;
+        handle_mouse(app, event, layout);
+    };
+
+    // Shift belongs to the terminal's own selection.
+    let mut app = paged_app();
+    let first = app.selected_key();
+    down(&mut app, &layout, KeyModifiers::SHIFT);
+    assert_eq!(app.selected_key(), first);
+
+    // A terminal below the minimum size draws no rows, so there is nothing to hit.
+    let tiny = RosterLayout::for_area(Rect::new(0, 0, 59, 19), 0);
+    down(&mut app, &tiny, KeyModifiers::NONE);
+    assert_eq!(app.selected_key(), first);
+
+    // A swapped-in preview hides the list.
+    handle_event(&mut app, TermEvent::Resize(90, 25), area);
+    press(&mut app, KeyCode::Tab);
+    assert!(app.preview_replaces_list());
+    down(&mut app, &layout, KeyModifiers::NONE);
+    assert_eq!(app.selected_key(), first);
+    press(&mut app, KeyCode::Tab);
+
+    // A panel owns the screen.
+    ch(&mut app, '?');
+    assert_ne!(app.panel(), Panel::None);
+    down(&mut app, &layout, KeyModifiers::NONE);
+    assert_eq!(app.selected_key(), first);
+    press(&mut app, KeyCode::Esc);
+
+    // The inspector's transcript scrollback is not roster geometry.
+    let mut ctx = ctx();
+    open_with(&mut app, &mut ctx, &["one", "two"]);
+    let selected_event = app.transcript().unwrap().selected();
+    down(&mut app, &layout, KeyModifiers::NONE);
+    handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 12, y), &layout);
+    assert_eq!(app.screen, Screen::Inspector);
+    assert_eq!(app.selected_key(), first);
+    assert_eq!(app.transcript().unwrap().selected(), selected_event);
+
+    // Pointer motion carries no action.
+    let mut moved = paged_app();
+    let before = moved.selected_key();
+    handle_event(
+        &mut moved,
+        TermEvent::Mouse(mouse(MouseEventKind::Moved, 12, y)),
+        area,
+    );
+    assert_eq!(moved.selected_key(), before);
+}
+
+#[test]
+fn the_wheel_scrolls_the_preview_independently_of_the_list() {
+    let area = Rect::new(0, 0, 160, 20);
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    handle_event(&mut app, TermEvent::Resize(160, 20), area);
+    let before = app.selected_key();
+    let screen = draw(&app, 160, 20);
+    assert!(screen.contains("Preview"), "{screen}");
+
+    let layout = RosterLayout::for_area(area, 0);
+    let preview = layout.preview.expect("preview column");
+    let (px, py) = (preview.x + 5, preview.y + 5);
+    handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, px, py), &layout);
+    assert!(app.preview_scroll() > 0, "the preview scrolled");
+    assert_eq!(app.selected_key(), before, "the list did not move");
+    let scrolled = draw(&app, 160, 20);
+    assert_ne!(scrolled, screen);
+    handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, px, py), &layout);
+    assert_eq!(app.preview_scroll(), 0);
+
+    // A wheel notch over the list moves the selection and resets the preview scroll.
+    handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, px, py), &layout);
+    handle_mouse(
+        &mut app,
+        mouse(MouseEventKind::ScrollDown, 10, layout.rows.y + 1),
+        &layout,
+    );
+    assert_eq!(
+        app.selected_key(),
+        Some(key_of(Harness::Claude, "claude-1"))
+    );
+    assert_eq!(app.preview_scroll(), 0, "a new selection starts at the top");
+
+    // `J`/`K` scroll the preview from the keyboard.
+    draw(&app, 160, 20);
+    ch(&mut app, 'J');
+    assert_eq!(app.preview_scroll(), 1);
+    ch(&mut app, 'K');
+    assert_eq!(app.preview_scroll(), 0);
+}
+
+/// Real readers over the synthetic three-harness store, through the worker into
+/// `App`, then Crossterm events into the Ratatui test backend.
+#[test]
+fn real_store_reader_worker_app_event_and_terminal_surface() {
+    use support::world::World;
+    let world = World::new();
+    let worker = agentscope::worker::WorkerHandle::spawn(world.readers(), world.config());
+    let mut app = App::new(
+        support::NOW,
+        Thresholds {
+            quiet: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+        },
+    );
+    let mut ctx = ctx();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if let Ok(event) = worker.rx.recv_timeout(Duration::from_millis(50)) {
+            apply_worker_event(&mut app, &mut ctx, event);
+        }
+        if app.total_sessions() == 3 && matches!(app.preview(), PreviewState::Empty) {
+            // The first row is under the cursor: ask for its preview like a key move does.
+            let first = app.selected_key().expect("a selected row");
+            app.select_session(&first);
+        }
+        agentscope::ui::flush_requests(&mut app, &worker);
+        if app.total_sessions() == 3
+            && matches!(app.preview(), PreviewState::Ready { complete: true, .. })
+        {
+            break;
+        }
+    }
+    assert_eq!(app.total_sessions(), 3);
+    assert!(matches!(
+        app.preview(),
+        PreviewState::Ready { complete: true, .. }
+    ));
+
+    for (w, h) in [(60u16, 20u16), (90, 25), (160, 40), (90, 25)] {
+        let area = Rect::new(0, 0, w, h);
+        handle_event(&mut app, TermEvent::Resize(w, h), area);
+        let screen = draw(&app, w, h);
+        assert!(!screen.contains('\x1b'), "{w}x{h}");
+        let all = lines(&screen);
+        assert_eq!(all.len(), h as usize);
+        let header = all.iter().find(|l| l.contains("HARNESS/PROV")).unwrap();
+        let at = col_of(header, "HARNESS/PROV");
+        for row in app.visible_rows() {
+            let title: String = row.session.meta.title.chars().take(10).collect();
+            let first = all
+                .iter()
+                .position(|l| {
+                    l.chars()
+                        .take(at)
+                        .collect::<String>()
+                        .contains(title.as_str())
+                })
+                .unwrap_or_else(|| panic!("{title} not drawn at {w}x{h}:\n{screen}"));
+            let harness = agentscope::ui::widgets::harness_name(row.session.meta.key.harness);
+            let shown: String = all[first]
+                .chars()
+                .skip(at)
+                .take(harness.chars().count())
+                .collect();
+            assert_eq!(shown, harness, "{w}x{h} harness column");
+            let second: Vec<char> = all[first + 1].chars().collect();
+            assert!(
+                second.get(at).is_some_and(|c| !c.is_whitespace()),
+                "{w}x{h}: provider starts under the harness:\n{}\n{}",
+                all[first],
+                all[first + 1]
+            );
+        }
+    }
+
+    // Click the second row, then walk to the swap and the scrolled columns.
+    let area = Rect::new(0, 0, 90, 25);
+    handle_event(&mut app, TermEvent::Resize(90, 25), area);
+    let layout = RosterLayout::for_area(area, 0);
+    let second = app.visible_rows()[1].session.meta.key.clone();
+    handle_event(
+        &mut app,
+        TermEvent::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            12,
+            layout.rows.y + 2,
+        )),
+        area,
+    );
+    assert_eq!(app.selected_key(), Some(second.clone()));
+    agentscope::ui::flush_requests(&mut app, &worker);
+    handle_event(
+        &mut app,
+        TermEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        area,
+    );
+    assert!(app.preview_replaces_list());
+    let title = app.session(&second).unwrap().session.meta.title.clone();
+    assert!(draw(&app, 90, 25).contains(&title));
+    assert_eq!(app.selected_key(), Some(second));
+    let _ = worker.tx.send(WorkerRequest::Shutdown);
+}
+
+#[test]
+fn quit_keys_work_in_every_roster_mode_so_the_terminal_is_always_released() {
+    let area = Rect::new(0, 0, 90, 25);
+    let ctrl_c = TermEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    let q = TermEvent::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+
+    let mut app = paged_app();
+    handle_event(&mut app, TermEvent::Resize(90, 25), area);
+    assert_eq!(
+        handle_event(&mut app, ctrl_c.clone(), area),
+        KeyAction::Quit
+    );
+    assert_eq!(handle_event(&mut app, q.clone(), area), KeyAction::Quit);
+
+    // Swapped-in preview, Load more focus, search editing and an open panel.
+    press(&mut app, KeyCode::Tab);
+    assert!(app.preview_replaces_list());
+    assert_eq!(handle_event(&mut app, q.clone(), area), KeyAction::Quit);
+    assert_eq!(
+        handle_event(&mut app, ctrl_c.clone(), area),
+        KeyAction::Quit
+    );
+    press(&mut app, KeyCode::Tab);
+    ch(&mut app, 'G');
+    ch(&mut app, 'j');
+    assert!(app.load_focus().is_some());
+    assert_eq!(handle_event(&mut app, q, area), KeyAction::Quit);
+    ch(&mut app, '/');
+    assert!(app.is_editing());
+    assert_eq!(
+        handle_event(&mut app, ctrl_c.clone(), area),
+        KeyAction::Quit
+    );
+    press(&mut app, KeyCode::Esc);
+    ch(&mut app, '?');
+    assert_eq!(handle_event(&mut app, ctrl_c, area), KeyAction::Quit);
+}
+
+// ---- B7: the integrated native world through the real keyboard path ----------------
+
+#[test]
+fn native_world_keyboard_pages_roots_expands_families_opens_at_the_tail_and_drops_stale_replies() {
+    use support::world::{ROOT_COUNT, World};
+
+    let world = World::native();
+    let g = world.grown();
+    let mut config = world.config();
+    config.refresh_ms = 3_600_000;
+    let worker = agentscope::worker::WorkerHandle::spawn(world.readers(), config);
+    let mut app = App::new(
+        support::NOW,
+        Thresholds {
+            quiet: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+        },
+    );
+    let mut ctx = ctx();
+    let mut first_generation: Option<WorkerEvent> = None;
+    let mut pump_until = |app: &mut App, ctx: &mut RosterContext, done: &dyn Fn(&App) -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            agentscope::ui::flush_requests(app, &worker);
+            if done(app) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "the app stalled");
+            if let Ok(event) = worker.rx.recv_timeout(Duration::from_millis(20)) {
+                if first_generation.is_none()
+                    && matches!(&event, WorkerEvent::Roster { snapshot, .. } if !snapshot.provisional && snapshot.generation == 1)
+                {
+                    first_generation = Some(event.clone());
+                }
+                apply_worker_event(app, ctx, event);
+            }
+        }
+    };
+    let expected = g.expected_roots();
+    let visible = |app: &App| -> Vec<SessionKey> {
+        app.visible_rows()
+            .iter()
+            .filter(|r| g.is_root(&r.session.meta.key))
+            .map(|r| r.session.meta.key.clone())
+            .collect()
+    };
+    let hidden_released = |keys: &[SessionKey]| -> Vec<SessionKey> {
+        keys.iter()
+            .filter(|k| **k != g.desktop_released)
+            .cloned()
+            .collect()
+    };
+
+    // 50, then 100, then all 125 roots, each only by the keyboard's Load more row.
+    pump_until(&mut app, &mut ctx, &|a| a.total_sessions() == 50);
+    assert_eq!(visible(&app), hidden_released(&expected[..50]));
+    for loaded in [100, ROOT_COUNT] {
+        ch(&mut app, 'G');
+        ch(&mut app, 'j');
+        assert_eq!(app.load_focus(), Some(&agentscope::app::LoadFocus::Roots));
+        press(&mut app, KeyCode::Enter);
+        pump_until(&mut app, &mut ctx, &|a| a.total_sessions() == loaded);
+        assert_eq!(visible(&app), hidden_released(&expected[..loaded]));
+    }
+    ch(&mut app, 'G');
+    ch(&mut app, 'j');
+    assert!(
+        app.load_focus().is_none(),
+        "every root is loaded: no Load more"
+    );
+
+    // Families expand in place; a fork is a root of its own and never a child.
+    for (parent, child) in [
+        (&g.codex.parent, &g.codex.child),
+        (&g.claude.parent, &g.claude.child),
+        (&g.opencode.parent, &g.opencode.child),
+        (&g.desktop_code, &g.desktop_child),
+    ] {
+        assert!(app.select_row(parent));
+        ch(&mut app, ' ');
+        pump_until(&mut app, &mut ctx, &|a| {
+            a.children_of(parent)
+                .is_some_and(|c| c.metadata.iter().any(|m| &m.key == child))
+        });
+        assert!(app.children_expanded(parent));
+        let loaded: Vec<&SessionKey> = app
+            .children_of(parent)
+            .unwrap()
+            .metadata
+            .iter()
+            .map(|m| &m.key)
+            .collect();
+        assert_eq!(loaded, [child]);
+        assert!(
+            !app.children_of(parent)
+                .unwrap()
+                .metadata
+                .iter()
+                .any(|m| g.is_root(&m.key))
+        );
+    }
+    for (fork, _) in &g.forks {
+        assert!(
+            app.visible_rows()
+                .iter()
+                .any(|r| &r.session.meta.key == fork)
+        );
+    }
+
+    // Every session opens at its newest entry.
+    for (key, tail) in &g.tails {
+        assert!(app.select_row(key));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Inspector);
+        pump_until(&mut app, &mut ctx, &|a| {
+            a.transcript().is_some_and(|t| t.loaded() && t.key() == key)
+        });
+        let t = app.transcript().unwrap();
+        let selected = t.selected_event().expect("a selected entry");
+        assert_eq!(
+            selected.text.as_ref().map(|x| x.preview.as_str()),
+            Some(tail.as_str()),
+            "{:?} opens at its newest entry",
+            key.harness
+        );
+        assert!(draw(&app, 120, 40).contains(tail.as_str()));
+        // A reply to a request that is not the current one changes nothing.
+        let page = transcript_page(key, &["a reply for another request"]);
+        assert!(!app.apply_transcript(0, page));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Roster);
+    }
+
+    // A refresh opens a new generation; the old first generation can no longer replace it.
+    assert!(app.refresh_roster());
+    pump_until(&mut app, &mut ctx, &|a| a.generation() >= 2);
+    let generation = app.generation();
+    let shown = visible(&app);
+    let stale = first_generation.expect("the first generation was observed");
+    apply_worker_event(&mut app, &mut ctx, stale);
+    assert_eq!(app.generation(), generation);
+    assert_eq!(visible(&app), shown, "a stale generation changes nothing");
+    let _ = worker.tx.send(WorkerRequest::Shutdown);
 }

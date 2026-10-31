@@ -1,8 +1,9 @@
 mod support;
 use agentscope::config::{CliOverrides, Config, Env};
 use agentscope::domain::{
-    AggregationClass, EventKind, Provider, RefreshBudget, SessionKey, SourceKey,
+    AggregationClass, EventKind, Harness, RefreshBudget, SessionKey, SourceKey,
 };
+use agentscope::providers::ProviderReader;
 use agentscope::providers::claude::ClaudeScanner;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -42,8 +43,8 @@ fn setup(
 #[test]
 fn blocks_survive_shared_message_id_and_same_block_revision_replaces() {
     let key = SessionKey {
-        provider: Provider::Claude,
-        provider_session_id: "s".into(),
+        harness: Harness::Claude,
+        native_id: "s".into(),
         source: SourceKey::File("x".into()),
     };
     let records = vec![
@@ -76,7 +77,7 @@ fn blocks_survive_shared_message_id_and_same_block_revision_replaces() {
 }
 #[test]
 fn ledger_overflow_freezes_and_marks_partial() {
-    for (entries, bytes) in [(1, 100), (100, 1)] {
+    for (entries, bytes) in [(1, 1_000_000), (100, 1)] {
         let (_dir, _path, mut scanner) = setup(
             &[
                 record("a", "first", json!("a")),
@@ -87,9 +88,7 @@ fn ledger_overflow_freezes_and_marks_partial() {
             entries,
             bytes,
         );
-        let u = scanner
-            .scan_roster(NOW, BIG)
-            .unwrap()
+        let u = support::world::rescan(&mut scanner, NOW, BIG)
             .sessions
             .remove(0)
             .usage
@@ -102,9 +101,7 @@ fn ledger_overflow_freezes_and_marks_partial() {
 fn duplicate_after_refresh_does_not_add_again() {
     let (_dir, path, mut scanner) = setup(&[record("a", "m", json!("a"))], 100, 1000);
     assert_eq!(
-        scanner
-            .scan_roster(NOW, BIG)
-            .unwrap()
+        support::world::rescan(&mut scanner, NOW, BIG)
             .sessions
             .remove(0)
             .usage
@@ -115,9 +112,7 @@ fn duplicate_after_refresh_does_not_add_again() {
     let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     writeln!(file, "{}", record("b", "m", json!("b"))).unwrap();
     assert_eq!(
-        scanner
-            .scan_roster(NOW, BIG)
-            .unwrap()
+        support::world::rescan(&mut scanner, NOW, BIG)
             .sessions
             .remove(0)
             .usage
@@ -135,8 +130,10 @@ fn sidechain_record_does_not_change_parent_totals() {
         100,
         1000,
     );
-    let s = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
-    assert!(s.lineage.sidechain);
+    let s = support::world::rescan(&mut scanner, NOW, BIG)
+        .sessions
+        .remove(0);
+    assert!(s.meta.lineage.sidechain);
     assert_eq!(s.usage.unwrap().total, Some(3));
 }
 
@@ -145,22 +142,26 @@ fn sidechain_only_file_has_own_usage_and_parent_after_sidechain_excludes_it() {
     let mut side = record("side", "child", json!("child"));
     side["isSidechain"] = json!(true);
     let (_dir, _path, mut scanner) = setup(&[side.clone()], 100, 1000);
-    let summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+    let summary = support::world::rescan(&mut scanner, NOW, BIG)
+        .sessions
+        .remove(0);
     assert_eq!(summary.usage.unwrap().total, Some(3));
     let (_dir, _path, mut scanner) = setup(
         &[side, record("parent", "parent", json!("parent"))],
         100,
         1000,
     );
-    let summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+    let summary = support::world::rescan(&mut scanner, NOW, BIG)
+        .sessions
+        .remove(0);
     assert_eq!(summary.usage.unwrap().total, Some(3));
 }
 
 #[test]
 fn partial_record_revision_keeps_other_blocks() {
     let key = SessionKey {
-        provider: Provider::Claude,
-        provider_session_id: "s".into(),
+        harness: Harness::Claude,
+        native_id: "s".into(),
         source: SourceKey::File("x".into()),
     };
     let records = vec![
@@ -203,13 +204,15 @@ fn roster_matches_transcript_after_block_revisions() {
         ),
     ];
     let (_dir, _path, mut scanner) = setup(&records, 100, 10000);
-    let summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+    let summary = support::world::rescan(&mut scanner, NOW, BIG)
+        .sessions
+        .remove(0);
     let indexed = records
         .into_iter()
         .enumerate()
         .map(|(i, v)| (i as u64, v))
         .collect::<Vec<_>>();
-    let mapped = ClaudeScanner::map_transcript(&summary.key, &indexed);
+    let mapped = ClaudeScanner::map_transcript(&summary.meta.key, &indexed);
     assert_eq!(summary.displayed_event_count, mapped.events.len());
     assert_eq!(summary.hidden_records, mapped.hidden_records);
 }
@@ -230,20 +233,26 @@ fn sidechain_first_budget_split_never_exposes_child_as_parent_usage() {
         100,
         1000,
     );
+    let key = support::world::discover_pass(&mut scanner, NOW, BIG)
+        .sessions
+        .remove(0)
+        .key;
+    // One record of work: the sidechain record is all that has been read so far.
     let first = scanner
-        .scan_roster(
+        .hydrate(
+            support::world::new_job(),
+            &key,
             NOW,
             RefreshBudget {
                 max_records: 1,
                 ..BIG
             },
         )
-        .unwrap()
-        .sessions
-        .remove(0);
-    assert!(first.usage.is_none());
-    assert!(first.server_tools.is_none());
-    let final_summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+        .unwrap();
+    assert!(!first.done);
+    assert!(first.summary.usage.is_none());
+    assert!(first.summary.server_tools.is_none());
+    let final_summary = support::world::hydrate_complete(&mut scanner, &key, NOW);
     assert_eq!(final_summary.usage.unwrap().total, Some(3));
     assert!(final_summary.server_tools.is_none());
 }
@@ -255,7 +264,9 @@ fn parent_without_assistant_does_not_inherit_sidechain_usage() {
     let parent_user =
         json!({"type":"user","uuid":"user","sessionId":"s","message":{"content":"hello"}});
     let (_dir, _path, mut scanner) = setup(&[side, parent_user], 100, 1000);
-    let summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+    let summary = support::world::rescan(&mut scanner, NOW, BIG)
+        .sessions
+        .remove(0);
     assert!(summary.usage.is_none());
 }
 
@@ -275,7 +286,9 @@ fn roster_revision_of_paired_tool_call_matches_transcript() {
         ),
     ];
     let (_dir, _path, mut scanner) = setup(&records, 100, 1000);
-    let summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+    let summary = support::world::rescan(&mut scanner, NOW, BIG)
+        .sessions
+        .remove(0);
     let indexed = records
         .into_iter()
         .enumerate()
@@ -283,7 +296,7 @@ fn roster_revision_of_paired_tool_call_matches_transcript() {
         .collect::<Vec<_>>();
     assert_eq!(
         summary.displayed_event_count,
-        ClaudeScanner::map_transcript(&summary.key, &indexed)
+        ClaudeScanner::map_transcript(&summary.meta.key, &indexed)
             .events
             .len()
     );
@@ -302,7 +315,9 @@ fn revision_metadata_overflow_warns_and_counts_approximately() {
             ),
         ];
         let (_dir, path, mut scanner) = setup(&records, entries, bytes);
-        let summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+        let summary = support::world::rescan(&mut scanner, NOW, BIG)
+            .sessions
+            .remove(0);
         assert_eq!(summary.displayed_event_count, 3);
         assert!(
             summary
@@ -310,10 +325,16 @@ fn revision_metadata_overflow_warns_and_counts_approximately() {
                 .iter()
                 .any(|w| w.message.contains("approximate"))
         );
-        assert_eq!(summary.usage.unwrap().total, Some(3));
+        // A one-byte budget cannot hold even one request's retained state.
+        assert_eq!(
+            summary.usage.unwrap().total,
+            if bytes == 1 { None } else { Some(3) }
+        );
         let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
         writeln!(file, "{}", record("a", "m", json!("later duplicate"))).unwrap();
-        let later = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+        let later = support::world::rescan(&mut scanner, NOW, BIG)
+            .sessions
+            .remove(0);
         assert_eq!(later.displayed_event_count, 4);
         assert_eq!(
             later
@@ -323,7 +344,10 @@ fn revision_metadata_overflow_warns_and_counts_approximately() {
                 .count(),
             1
         );
-        assert_eq!(later.usage.unwrap().total, Some(3));
+        assert_eq!(
+            later.usage.unwrap().total,
+            if bytes == 1 { None } else { Some(3) }
+        );
     }
 }
 
@@ -333,9 +357,7 @@ fn parent_user_after_sidechain_only_refresh_clears_side_usage() {
     side["isSidechain"] = json!(true);
     let (_dir, path, mut scanner) = setup(&[side], 100, 10000);
     assert_eq!(
-        scanner
-            .scan_roster(NOW, BIG)
-            .unwrap()
+        support::world::rescan(&mut scanner, NOW, BIG)
             .sessions
             .remove(0)
             .usage
@@ -351,9 +373,7 @@ fn parent_user_after_sidechain_only_refresh_clears_side_usage() {
     )
     .unwrap();
     assert!(
-        scanner
-            .scan_roster(NOW, BIG)
-            .unwrap()
+        support::world::rescan(&mut scanner, NOW, BIG)
             .sessions
             .remove(0)
             .usage
@@ -369,7 +389,7 @@ fn same_timestamp_block_revision_is_reported_as_invalidated() {
         100,
         1 << 20,
     );
-    let first = scanner.scan_roster(NOW, BIG).unwrap();
+    let first = support::world::rescan(&mut scanner, NOW, BIG);
     assert!(first.invalidated.is_empty());
     let count = first.sessions[0].displayed_event_count;
     let mut file = std::fs::OpenOptions::new()
@@ -382,9 +402,12 @@ fn same_timestamp_block_revision_is_reported_as_invalidated() {
         record("a", "m", json!([{"type":"text","text":"new"}]))
     )
     .unwrap();
-    let second = scanner.scan_roster(NOW, BIG).unwrap();
+    let second = support::world::rescan(&mut scanner, NOW, BIG);
     assert_eq!(second.sessions[0].displayed_event_count, count);
-    assert_eq!(second.invalidated, vec![second.sessions[0].key.clone()]);
+    assert_eq!(
+        second.invalidated,
+        vec![second.sessions[0].meta.key.clone()]
+    );
     // A plain append of a new block is not an invalidation.
     writeln!(
         file,
@@ -392,6 +415,6 @@ fn same_timestamp_block_revision_is_reported_as_invalidated() {
         record("b", "m2", json!([{"type":"text","text":"next"}]))
     )
     .unwrap();
-    let third = scanner.scan_roster(NOW, BIG).unwrap();
+    let third = support::world::rescan(&mut scanner, NOW, BIG);
     assert!(third.invalidated.is_empty());
 }

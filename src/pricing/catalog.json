@@ -1,0 +1,4098 @@
+{
+ "schema_version": 1,
+ "revision": "2026-10-30.2",
+ "checked_at": "2026-10-30",
+ "sources": [
+  {
+   "id": "anthropic-pricing",
+   "name": "Anthropic model pricing",
+   "url": "https://platform.claude.com/docs/en/about-claude/pricing",
+   "checked_at": "2026-10-30"
+  },
+  {
+   "id": "openai-pricing",
+   "name": "OpenAI API pricing",
+   "url": "https://developers.openai.com/api/docs/pricing",
+   "checked_at": "2026-10-30"
+  },
+  {
+   "id": "openai-gpt-6.1-sol",
+   "name": "OpenAI GPT-6.1 Sol model page",
+   "url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+   "checked_at": "2026-10-30"
+  },
+  {
+   "id": "opencode-go",
+   "name": "OpenCode Go pricing",
+   "url": "https://opencode.ai/docs/go/",
+   "checked_at": "2026-10-30"
+  },
+  {
+   "id": "opencode-zen",
+   "name": "OpenCode Zen pricing",
+   "url": "https://opencode.ai/docs/zen/",
+   "checked_at": "2026-10-30"
+  },
+  {
+   "id": "anthropic-models",
+   "name": "Anthropic model IDs, deprecations and context windows",
+   "url": "https://platform.claude.com/docs/en/about-claude/model-deprecations",
+   "checked_at": "2026-10-30"
+  },
+  {
+   "id": "anthropic-models-overview",
+   "name": "Anthropic models overview",
+   "url": "https://platform.claude.com/docs/en/models/overview",
+   "checked_at": "2026-10-30"
+  },
+  {
+   "id": "openai-model-pages",
+   "name": "OpenAI model pages (context windows)",
+   "url": "https://developers.openai.com/api/docs/models",
+   "checked_at": "2026-10-30"
+  }
+ ],
+ "inventory": [
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Fable 5.1",
+   "status": "priced",
+   "model": "claude-fable-5-1"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Mythos 5.1",
+   "status": "priced",
+   "note": "id from the official model-deprecations table; limited availability",
+   "model": "claude-mythos-5-1"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Fable 5",
+   "status": "priced",
+   "model": "claude-fable-5"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Mythos 5",
+   "status": "priced",
+   "note": "id from the official model-deprecations table; limited availability",
+   "model": "claude-mythos-5"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Opus 5.5",
+   "status": "priced",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Opus 5",
+   "status": "priced",
+   "model": "claude-opus-5"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Opus 4.8",
+   "status": "priced",
+   "model": "claude-opus-4-8"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Opus 4.7",
+   "status": "priced",
+   "model": "claude-opus-4-7"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Opus 4.6",
+   "status": "priced",
+   "model": "claude-opus-4-6"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Opus 4.5",
+   "status": "priced",
+   "model": "claude-opus-4-5"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Opus 4.1",
+   "status": "priced",
+   "note": "id from the official model-deprecations table; retired on the first-party API",
+   "model": "claude-opus-4-1-20250805"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Opus 4",
+   "status": "priced",
+   "note": "id from the official model-deprecations table; retired on the first-party API",
+   "model": "claude-opus-4-20250514"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Sonnet 5.5",
+   "status": "priced",
+   "model": "claude-sonnet-5-5"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Sonnet 5",
+   "status": "priced",
+   "model": "claude-sonnet-5"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Sonnet 4.6",
+   "status": "priced",
+   "model": "claude-sonnet-4-6"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Sonnet 4.5",
+   "status": "priced",
+   "model": "claude-sonnet-4-5"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Sonnet 4",
+   "status": "priced",
+   "note": "id from the official model-deprecations table; retired on the first-party API",
+   "model": "claude-sonnet-4-20250514"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Haiku 5.5",
+   "status": "priced",
+   "model": "claude-haiku-5-5"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Haiku 4.5",
+   "status": "priced",
+   "model": "claude-haiku-4-5"
+  },
+  {
+   "source": "anthropic-pricing",
+   "row": "Claude Haiku 3.5",
+   "status": "priced",
+   "note": "id from the official model-deprecations table; retired on the first-party API",
+   "model": "claude-3-5-haiku-20241022"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-6-astra",
+   "status": "priced",
+   "model": "gpt-6-astra",
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-6.1-sol",
+   "status": "priced",
+   "model": "gpt-6.1-sol",
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-6.1-terra",
+   "status": "priced",
+   "model": "gpt-6.1-terra",
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-6-luna",
+   "status": "priced",
+   "model": "gpt-6-luna",
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-6-sol",
+   "status": "priced",
+   "model": "gpt-6-sol",
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.6-sol",
+   "status": "priced",
+   "model": "gpt-5.6-sol",
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.6-terra",
+   "status": "priced",
+   "model": "gpt-5.6-terra",
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.6-luna",
+   "status": "priced",
+   "model": "gpt-5.6-luna",
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.5 (<272K context length)",
+   "status": "priced",
+   "model": "gpt-5.5"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.5-pro (<272K context length)",
+   "status": "priced",
+   "model": "gpt-5.5-pro"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.4 (<272K context length)",
+   "status": "priced",
+   "model": "gpt-5.4"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.4-pro (<272K context length)",
+   "status": "priced",
+   "model": "gpt-5.4-pro"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.4-mini",
+   "status": "priced",
+   "model": "gpt-5.4-mini"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.4-nano",
+   "status": "priced",
+   "model": "gpt-5.4-nano"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.2",
+   "status": "priced",
+   "model": "gpt-5.2"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.2-pro",
+   "status": "priced",
+   "model": "gpt-5.2-pro"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.1",
+   "status": "priced",
+   "model": "gpt-5.1"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5",
+   "status": "priced",
+   "model": "gpt-5"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5-mini",
+   "status": "priced",
+   "model": "gpt-5-mini"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5-nano",
+   "status": "priced",
+   "model": "gpt-5-nano"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5-pro",
+   "status": "priced",
+   "model": "gpt-5-pro"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-4.1",
+   "status": "priced",
+   "model": "gpt-4.1"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-4.1-mini",
+   "status": "priced",
+   "model": "gpt-4.1-mini"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-4.1-nano",
+   "status": "priced",
+   "model": "gpt-4.1-nano"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-4o",
+   "status": "priced",
+   "model": "gpt-4o"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-4o-2024-05-13",
+   "status": "priced",
+   "model": "gpt-4o-2024-05-13"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-4o-mini",
+   "status": "priced",
+   "model": "gpt-4o-mini"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "o1",
+   "status": "priced",
+   "model": "o1"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "o1-pro",
+   "status": "priced",
+   "model": "o1-pro"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "o3-pro",
+   "status": "priced",
+   "model": "o3-pro"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "o3",
+   "status": "priced",
+   "model": "o3"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "o4-mini",
+   "status": "priced",
+   "model": "o4-mini"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "o3-mini",
+   "status": "priced",
+   "model": "o3-mini"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-4-turbo-2024-04-09",
+   "status": "priced",
+   "model": "gpt-4-turbo-2024-04-09"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-4-0613",
+   "status": "priced",
+   "model": "gpt-4-0613"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-3.5-turbo",
+   "status": "priced",
+   "model": "gpt-3.5-turbo"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-3.5-turbo-0125",
+   "status": "priced",
+   "model": "gpt-3.5-turbo-0125"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.6-sol",
+   "status": "priced",
+   "model": "gpt-5.6-sol",
+   "note": "Cyber-section row repeats the flagship price; flagship card used"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.6-cyber",
+   "status": "priced",
+   "model": "gpt-5.6-cyber",
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-5.5-cyber",
+   "status": "priced",
+   "model": "gpt-5.5-cyber"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-6-rosalind",
+   "status": "priced",
+   "model": "gpt-6-rosalind",
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-rosalind-research",
+   "status": "priced",
+   "model": "gpt-rosalind-research"
+  },
+  {
+   "source": "openai-pricing",
+   "row": "gpt-rosalind-discovery",
+   "status": "priced",
+   "model": "gpt-rosalind-discovery"
+  },
+  {
+   "source": "openai-gpt-6.1-sol",
+   "row": "gpt-6.1-sol",
+   "status": "priced",
+   "model": "gpt-6.1-sol",
+   "note": "metadata cross-check: input $2, cached $0.1, cache writes $2.5, output $10, context 1,050,000"
+  },
+  {
+   "source": "opencode-go",
+   "row": "GLM-5.3-Flash",
+   "status": "priced",
+   "model": "glm-5.3-flash"
+  },
+  {
+   "source": "opencode-go",
+   "row": "GLM-5.3",
+   "status": "priced",
+   "model": "glm-5.3"
+  },
+  {
+   "source": "opencode-go",
+   "row": "GLM-5.2",
+   "status": "priced",
+   "model": "glm-5.2"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Kimi K3.1 Pro",
+   "status": "priced",
+   "model": "kimi-k3.1-pro"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Kimi K3",
+   "status": "priced",
+   "model": "kimi-k3"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Kimi K2.7 Code",
+   "status": "priced",
+   "model": "kimi-k2.7-code"
+  },
+  {
+   "source": "opencode-go",
+   "row": "LongCat-2.0",
+   "status": "priced",
+   "model": "longcat-2.0"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Step 5 Preview",
+   "status": "priced",
+   "model": "step-5-preview"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Beam Free",
+   "status": "free",
+   "model": "beam-free"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Iceman Contributor Free",
+   "status": "free",
+   "model": "iceman-contributor-free"
+  },
+  {
+   "source": "opencode-go",
+   "row": "MiMo-V2.6-Flash",
+   "status": "priced",
+   "model": "mimo-v2.6-flash"
+  },
+  {
+   "source": "opencode-go",
+   "row": "MiMo-V2.6-Pro",
+   "status": "priced",
+   "model": "mimo-v2.6-pro"
+  },
+  {
+   "source": "opencode-go",
+   "row": "MiMo-V2.5",
+   "status": "priced",
+   "model": "mimo-v2.5"
+  },
+  {
+   "source": "opencode-go",
+   "row": "MiMo-V2.5-Pro",
+   "status": "priced",
+   "model": "mimo-v2.5-pro"
+  },
+  {
+   "source": "opencode-go",
+   "row": "MiniMax M3.1 Flash",
+   "status": "priced",
+   "model": "minimax-m3.1-flash"
+  },
+  {
+   "source": "opencode-go",
+   "row": "MiniMax M3 (≤ 512K tokens)",
+   "status": "priced",
+   "model": "minimax-m3"
+  },
+  {
+   "source": "opencode-go",
+   "row": "MiniMax M3 (> 512K tokens)",
+   "status": "priced",
+   "model": "minimax-m3"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Muse Spark 1.3 Contributor",
+   "status": "priced",
+   "model": "muse-spark-1.3-contributor"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Muse Spark 1.2 Contributor",
+   "status": "priced",
+   "model": "muse-spark-1.2-contributor"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Qwen3.8 Max",
+   "status": "priced",
+   "model": "qwen3.8-max"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Qwen3.8 Flash",
+   "status": "priced",
+   "model": "qwen3.8-flash"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Qwen3.7 Plus (≤ 256K tokens)",
+   "status": "priced",
+   "model": "qwen3.7-plus"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Qwen3.7 Plus (> 256K tokens)",
+   "status": "priced",
+   "model": "qwen3.7-plus"
+  },
+  {
+   "source": "opencode-go",
+   "row": "DeepSeek V4.1 Flash (Off-Peak)",
+   "status": "priced",
+   "model": "deepseek-v4.1-flash",
+   "note": "Peak is 01:00-04:00 and 06:00-10:00 UTC Monday-Friday; every other hour is Off-Peak"
+  },
+  {
+   "source": "opencode-go",
+   "row": "DeepSeek V4.1 Flash (Peak)",
+   "status": "priced",
+   "model": "deepseek-v4.1-flash",
+   "note": "Peak is 01:00-04:00 and 06:00-10:00 UTC Monday-Friday; every other hour is Off-Peak"
+  },
+  {
+   "source": "opencode-go",
+   "row": "DeepSeek V4 Pro (Off-Peak)",
+   "status": "priced",
+   "model": "deepseek-v4-pro",
+   "note": "Peak is 01:00-04:00 and 06:00-10:00 UTC Monday-Friday; every other hour is Off-Peak"
+  },
+  {
+   "source": "opencode-go",
+   "row": "DeepSeek V4 Pro (Peak)",
+   "status": "priced",
+   "model": "deepseek-v4-pro",
+   "note": "Peak is 01:00-04:00 and 06:00-10:00 UTC Monday-Friday; every other hour is Off-Peak"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Hy4 preview",
+   "status": "priced",
+   "model": "hy4-preview"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Hy3",
+   "status": "priced",
+   "model": "hy3"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Grok 4.7 (≤ 200K tokens)",
+   "status": "priced",
+   "model": "grok-4.7"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Grok 4.7 (> 200K tokens)",
+   "status": "priced",
+   "model": "grok-4.7"
+  },
+  {
+   "source": "opencode-go",
+   "row": "GPT 6 Luna (≤ 272K tokens)",
+   "status": "priced",
+   "model": "gpt-6-luna"
+  },
+  {
+   "source": "opencode-go",
+   "row": "GPT 6 Luna (> 272K tokens)",
+   "status": "priced",
+   "model": "gpt-6-luna"
+  },
+  {
+   "source": "opencode-go",
+   "row": "GPT 5.6 Luna (≤ 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.6-luna"
+  },
+  {
+   "source": "opencode-go",
+   "row": "GPT 5.6 Luna (> 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.6-luna"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Claude Haiku 5.5 (≤ 100K tokens)",
+   "status": "priced",
+   "model": "claude-haiku-5-5"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Claude Haiku 5.5 (> 100K tokens)",
+   "status": "priced",
+   "model": "claude-haiku-5-5"
+  },
+  {
+   "source": "opencode-go",
+   "row": "Gemini 4 Argon (50% off)",
+   "status": "priced",
+   "model": "gemini-4-argon",
+   "note": "50% launch discount through November 30, 2026 per the page"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Big Pickle",
+   "status": "free",
+   "model": "big-pickle"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GLM-5.3-Flash Free",
+   "status": "free",
+   "model": "glm-5.3-flash-free"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "DeepSeek V4.1 Flash Free",
+   "status": "free",
+   "model": "deepseek-v4.1-flash-free"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Beam Free",
+   "status": "free",
+   "model": "beam-free"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Flint 40B Free",
+   "status": "free",
+   "model": "flint-40b-free"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "MiMo-V2.6-Flash Free",
+   "status": "free",
+   "model": "mimo-v2.6-flash-free"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Nemotron 3 Ultra Free",
+   "status": "free",
+   "model": "nemotron-3-ultra-free"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Nemotron 3.5 Lightning Free",
+   "status": "free",
+   "model": "nemotron-3.5-lightning-free"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Nemotron 3.5 Super VL Free",
+   "status": "free",
+   "model": "nemotron-3.5-super-vl-free"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Jev 1.13 Free",
+   "status": "unmapped",
+   "note": "System One model, not a text token model"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Jev 1.13",
+   "status": "unmapped",
+   "note": "System One model, not a text token model"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "MiniMax M3",
+   "status": "priced",
+   "model": "minimax-m3"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "MiniMax M2.7",
+   "status": "priced",
+   "model": "minimax-m2.7"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "MiniMax M2.5",
+   "status": "priced",
+   "model": "minimax-m2.5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GLM 5.3 Flash",
+   "status": "priced",
+   "model": "glm-5.3-flash"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GLM 5.3",
+   "status": "priced",
+   "model": "glm-5.3"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GLM 5.2",
+   "status": "priced",
+   "model": "glm-5.2"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GLM 5.1",
+   "status": "priced",
+   "model": "glm-5.1"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GLM 5",
+   "status": "priced",
+   "model": "glm-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Kimi K2.7 Code",
+   "status": "priced",
+   "model": "kimi-k2.7-code"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Kimi K3",
+   "status": "priced",
+   "model": "kimi-k3"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Kimi K2.6",
+   "status": "priced",
+   "model": "kimi-k2.6"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Kimi K2.5",
+   "status": "priced",
+   "model": "kimi-k2.5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Mistral Large 4 (50% off)",
+   "status": "priced",
+   "model": "mistral-large-4",
+   "note": "50% discount; the page states no end date"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Qwen3.8 Max",
+   "status": "priced",
+   "model": "qwen3.8-max"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Qwen3.8 Flash",
+   "status": "priced",
+   "model": "qwen3.8-flash"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Qwen3.6 Plus",
+   "status": "priced",
+   "model": "qwen3.6-plus"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Qwen3.5 Plus",
+   "status": "priced",
+   "model": "qwen3.5-plus"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "DeepSeek V4.1 Flash",
+   "status": "priced",
+   "model": "deepseek-v4.1-flash"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "DeepSeek V4 Pro",
+   "status": "priced",
+   "model": "deepseek-v4-pro"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Fable 5.1",
+   "status": "priced",
+   "model": "claude-fable-5-1"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Fable 5",
+   "status": "priced",
+   "model": "claude-fable-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Opus 5.5",
+   "status": "priced",
+   "model": "claude-opus-5-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Opus 5",
+   "status": "priced",
+   "model": "claude-opus-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Opus 4.8",
+   "status": "priced",
+   "model": "claude-opus-4-8"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Opus 4.7",
+   "status": "priced",
+   "model": "claude-opus-4-7"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Opus 4.6",
+   "status": "priced",
+   "model": "claude-opus-4-6"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Opus 4.5",
+   "status": "priced",
+   "model": "claude-opus-4-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Sonnet 5.5",
+   "status": "priced",
+   "model": "claude-sonnet-5-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Sonnet 5",
+   "status": "priced",
+   "model": "claude-sonnet-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Sonnet 4.6",
+   "status": "priced",
+   "model": "claude-sonnet-4-6"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Sonnet 4.5 (≤ 200K tokens)",
+   "status": "priced",
+   "model": "claude-sonnet-4-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Sonnet 4.5 (> 200K tokens)",
+   "status": "priced",
+   "model": "claude-sonnet-4-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Haiku 5.5 (≤ 100K tokens)",
+   "status": "priced",
+   "model": "claude-haiku-5-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Haiku 5.5 (> 100K tokens)",
+   "status": "priced",
+   "model": "claude-haiku-5-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Claude Haiku 4.5",
+   "status": "priced",
+   "model": "claude-haiku-4-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Gemini 4 Argon (50% off)",
+   "status": "priced",
+   "model": "gemini-4-argon",
+   "note": "50% launch discount through November 30, 2026 per the page"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Gemini 3.8 Flash",
+   "status": "priced",
+   "model": "gemini-3.8-flash"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Gemini 3.7 Flash",
+   "status": "priced",
+   "model": "gemini-3.7-flash"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Gemini 3.6 Flash",
+   "status": "priced",
+   "model": "gemini-3.6-flash"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Gemini 3.5 Flash",
+   "status": "priced",
+   "model": "gemini-3.5-flash"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Gemini 3.5 Flash Lite",
+   "status": "priced",
+   "model": "gemini-3.5-flash-lite"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Gemini 3.1 Pro (≤ 200K tokens)",
+   "status": "priced",
+   "model": "gemini-3.1-pro"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Gemini 3.1 Pro (> 200K tokens)",
+   "status": "priced",
+   "model": "gemini-3.1-pro"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Gemini 3 Flash",
+   "status": "priced",
+   "model": "gemini-3-flash"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Grok 4.7 (≤ 200K tokens)",
+   "status": "priced",
+   "model": "grok-4.7"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Grok 4.7 (> 200K tokens)",
+   "status": "priced",
+   "model": "grok-4.7"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Grok 4.6 (≤ 200K tokens)",
+   "status": "priced",
+   "model": "grok-4.6"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Grok 4.6 (> 200K tokens)",
+   "status": "priced",
+   "model": "grok-4.6"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Grok 4.5 (≤ 200K tokens)",
+   "status": "priced",
+   "model": "grok-4.5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Grok 4.5 (> 200K tokens)",
+   "status": "priced",
+   "model": "grok-4.5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Grok Build 0.1",
+   "status": "priced",
+   "model": "grok-build-0.1"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Muse Wonder 1.0",
+   "status": "priced",
+   "model": "muse-wonder-1.0"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Muse Spark 1.3",
+   "status": "priced",
+   "model": "muse-spark-1.3"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "Muse Spark 1.2",
+   "status": "priced",
+   "model": "muse-spark-1.2"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 6 Astra (≤ 272K tokens)",
+   "status": "priced",
+   "model": "gpt-6-astra"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 6 Astra (> 272K tokens)",
+   "status": "priced",
+   "model": "gpt-6-astra"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 6 Sol (≤ 272K tokens)",
+   "status": "priced",
+   "model": "gpt-6-sol"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 6 Sol (> 272K tokens)",
+   "status": "priced",
+   "model": "gpt-6-sol"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 6.1 Sol (≤ 272K tokens)",
+   "status": "priced",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 6.1 Sol (> 272K tokens)",
+   "status": "priced",
+   "model": "gpt-6.1-sol"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 6 Luna (≤ 272K tokens)",
+   "status": "priced",
+   "model": "gpt-6-luna"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 6 Luna (> 272K tokens)",
+   "status": "priced",
+   "model": "gpt-6-luna"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.6 Sol (≤ 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.6-sol"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.6 Sol (> 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.6-sol"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.6 Terra (≤ 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.6-terra"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.6 Terra (> 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.6-terra"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.6 Luna (≤ 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.6-luna"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.6 Luna (> 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.6-luna"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.5 (≤ 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.5 (> 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.5 Pro",
+   "status": "priced",
+   "model": "gpt-5.5-pro"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.4 (≤ 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.4"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.4 (> 272K tokens)",
+   "status": "priced",
+   "model": "gpt-5.4"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.4 Pro",
+   "status": "priced",
+   "model": "gpt-5.4-pro"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.4 Mini",
+   "status": "priced",
+   "model": "gpt-5.4-mini"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.4 Nano",
+   "status": "priced",
+   "model": "gpt-5.4-nano"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.3 Codex Spark",
+   "status": "priced",
+   "model": "gpt-5.3-codex-spark"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.3 Codex",
+   "status": "priced",
+   "model": "gpt-5.3-codex"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.2",
+   "status": "priced",
+   "model": "gpt-5.2"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.2 Codex",
+   "status": "priced",
+   "model": "gpt-5.2-codex"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.1",
+   "status": "priced",
+   "model": "gpt-5.1"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.1 Codex",
+   "status": "priced",
+   "model": "gpt-5.1-codex"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.1 Codex Max",
+   "status": "priced",
+   "model": "gpt-5.1-codex-max"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5.1 Codex Mini",
+   "status": "priced",
+   "model": "gpt-5.1-codex-mini"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5",
+   "status": "priced",
+   "model": "gpt-5"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5 Codex",
+   "status": "priced",
+   "model": "gpt-5-codex"
+  },
+  {
+   "source": "opencode-zen",
+   "row": "GPT 5 Nano",
+   "status": "priced",
+   "model": "gpt-5-nano"
+  }
+ ],
+ "cards": [
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-fable-5",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 10.0,
+    "output": 50.0,
+    "cache_read": 1.0,
+    "cache_write_5m": 12.5,
+    "cache_write_1h": 20.0
+   },
+   "region_multipliers": {
+    "us": 1.1
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "context_capacity": 1000000
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-fable-5-1",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 10.0,
+    "output": 50.0,
+    "cache_read": 0.25,
+    "cache_write_5m": 12.5,
+    "cache_write_1h": 20.0
+   },
+   "region_multipliers": {
+    "us": 1.1
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "context_capacity": 1000000
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-haiku-4-5",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.0,
+    "output": 5.0,
+    "cache_read": 0.1,
+    "cache_write_5m": 1.25,
+    "cache_write_1h": 2.0
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "aliases": [
+    "claude-haiku-4-5-20251001"
+   ]
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-haiku-5-5",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write_5m": 0.125,
+    "cache_write_1h": 0.2
+   },
+   "threshold": {
+    "input_tokens": 100000,
+    "inclusive": true,
+    "above": {
+     "input": 0.5,
+     "output": 2.5,
+     "cache_read": 0.05,
+     "cache_write_5m": 0.625,
+     "cache_write_1h": 1.0
+    }
+   },
+   "note": "prompt length counts input, cache reads and cache writes of the request",
+   "region_multipliers": {
+    "us": 1.1
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "context_capacity": 1000000
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-opus-4-5",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5,
+    "cache_write_5m": 6.25,
+    "cache_write_1h": 10.0
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "aliases": [
+    "claude-opus-4-5-20251101"
+   ]
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-opus-4-6",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5,
+    "cache_write_5m": 6.25,
+    "cache_write_1h": 10.0
+   },
+   "region_multipliers": {
+    "us": 1.1
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "context_capacity": 1000000
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-opus-4-7",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5,
+    "cache_write_5m": 6.25,
+    "cache_write_1h": 10.0
+   },
+   "region_multipliers": {
+    "us": 1.1
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "context_capacity": 1000000
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-opus-4-8",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5,
+    "cache_write_5m": 6.25,
+    "cache_write_1h": 10.0
+   },
+   "service_multipliers": {
+    "fast": 2.0,
+    "batch": 0.5
+   },
+   "region_multipliers": {
+    "us": 1.1
+   },
+   "context_capacity": 1000000
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-opus-5",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5,
+    "cache_write_5m": 6.25,
+    "cache_write_1h": 10.0
+   },
+   "service_multipliers": {
+    "fast": 2.0,
+    "batch": 0.5
+   },
+   "region_multipliers": {
+    "us": 1.1
+   },
+   "context_capacity": 1000000
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-opus-5-5",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 4.0,
+    "output": 20.0,
+    "cache_read": 0.2,
+    "cache_write_5m": 5.0,
+    "cache_write_1h": 8.0
+   },
+   "service_multipliers": {
+    "fast": 2.0,
+    "batch": 0.5
+   },
+   "region_multipliers": {
+    "us": 1.1
+   },
+   "context_capacity": 1000000
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-sonnet-4-5",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 3.0,
+    "output": 15.0,
+    "cache_read": 0.3,
+    "cache_write_5m": 3.75,
+    "cache_write_1h": 6.0
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "aliases": [
+    "claude-sonnet-4-5-20250929"
+   ]
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-sonnet-4-6",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 3.0,
+    "output": 15.0,
+    "cache_read": 0.3,
+    "cache_write_5m": 3.75,
+    "cache_write_1h": 6.0
+   },
+   "region_multipliers": {
+    "us": 1.1
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "context_capacity": 1000000
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-sonnet-5",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.2,
+    "cache_write_5m": 2.5,
+    "cache_write_1h": 4.0
+   },
+   "region_multipliers": {
+    "us": 1.1
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "context_capacity": 1000000
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-sonnet-5-5",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_5m": 2.5,
+    "cache_write_1h": 4.0
+   },
+   "region_multipliers": {
+    "us": 1.1
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "context_capacity": 1000000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-3.5-turbo",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.5,
+    "output": 1.5
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-3.5-turbo-0125",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.5,
+    "output": 1.5
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-4-0613",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 30.0,
+    "output": 60.0
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-4-turbo-2024-04-09",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 10.0,
+    "output": 30.0
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-4.1",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5
+   },
+   "service_multipliers": {
+    "fast": 1.75,
+    "priority": 1.75,
+    "batch": 0.5
+   },
+   "service_unpublished": {
+    "batch": {
+     "base": [
+      "cache_read"
+     ],
+     "above": []
+    }
+   },
+   "context_capacity": 1047576
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-4.1-mini",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.4,
+    "output": 1.6,
+    "cache_read": 0.1
+   },
+   "service_multipliers": {
+    "fast": 1.75,
+    "priority": 1.75,
+    "batch": 0.5
+   },
+   "service_unpublished": {
+    "batch": {
+     "base": [
+      "cache_read"
+     ],
+     "above": []
+    }
+   },
+   "context_capacity": 1047576
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-4.1-nano",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.1,
+    "output": 0.4,
+    "cache_read": 0.025
+   },
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "batch": 0.5
+   },
+   "service_unpublished": {
+    "batch": {
+     "base": [
+      "cache_read"
+     ],
+     "above": []
+    }
+   },
+   "context_capacity": 1047576
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-4o",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.5,
+    "output": 10.0,
+    "cache_read": 1.25
+   },
+   "service_multipliers": {
+    "fast": 1.7,
+    "priority": 1.7,
+    "batch": 0.5
+   },
+   "service_unpublished": {
+    "batch": {
+     "base": [
+      "cache_read"
+     ],
+     "above": []
+    }
+   },
+   "context_capacity": 128000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-4o-2024-05-13",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 15.0
+   },
+   "service_multipliers": {
+    "fast": 1.75,
+    "priority": 1.75,
+    "batch": 0.5
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-4o-mini",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.075
+   },
+   "service_multipliers": {
+    "fast": 1.666667,
+    "priority": 1.666667,
+    "batch": 0.5
+   },
+   "service_unpublished": {
+    "batch": {
+     "base": [
+      "cache_read"
+     ],
+     "above": []
+    }
+   },
+   "context_capacity": 128000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125
+   },
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 400000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5-mini",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.25,
+    "output": 2.0,
+    "cache_read": 0.025
+   },
+   "service_multipliers": {
+    "fast": 1.8,
+    "priority": 1.8,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 400000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5-nano",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.05,
+    "output": 0.4,
+    "cache_read": 0.005
+   },
+   "service_multipliers": {
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 400000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5-pro",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 15.0,
+    "output": 120.0
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.1",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125
+   },
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 400000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.2",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.75,
+    "output": 14.0,
+    "cache_read": 0.175
+   },
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 400000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.2-pro",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 21.0,
+    "output": 168.0
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.4",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.5,
+    "output": 15.0,
+    "cache_read": 0.25
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 5.0,
+     "output": 22.5,
+     "cache_read": 0.5
+    }
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.4-mini",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.75,
+    "output": 4.5,
+    "cache_read": 0.075
+   },
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 400000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.4-nano",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.2,
+    "output": 1.25,
+    "cache_read": 0.02
+   },
+   "service_multipliers": {
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 400000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.4-pro",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 30.0,
+    "output": 180.0
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 60.0,
+     "output": 270.0
+    }
+   },
+   "service_multipliers": {
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.5",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 30.0,
+    "cache_read": 0.5
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 10.0,
+     "output": 45.0,
+     "cache_read": 1.0
+    }
+   },
+   "service_multipliers": {
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.5-cyber",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 12.5,
+    "output": 75.0,
+    "cache_read": 1.25
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {}
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.5-pro",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 30.0,
+    "output": 180.0
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 60.0,
+     "output": 270.0
+    }
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.6-cyber",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 12.5,
+    "output": 75.0,
+    "cache_read": 1.25
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {}
+   },
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.6-luna",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.2,
+    "output": 1.2,
+    "cache_read": 0.02
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 0.4,
+     "output": 1.8,
+     "cache_read": 0.04
+    }
+   },
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg",
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.6-sol",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 4.0,
+    "output": 20.0,
+    "cache_read": 0.4
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 8.0,
+     "output": 30.0,
+     "cache_read": 0.8
+    }
+   },
+   "note": "promotional pricing is available at least through November 21, 2026 per the page",
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-5.6-terra",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 12.0,
+    "cache_read": 0.2
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 4.0,
+     "output": 18.0,
+     "cache_read": 0.4
+    }
+   },
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg",
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-6-astra",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 10.0,
+    "output": 50.0,
+    "cache_read": 1.0
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 20.0,
+     "output": 75.0,
+     "cache_read": 2.0
+    }
+   },
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg",
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "ultrafast": 6.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-6-luna",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 0.2,
+     "output": 0.75,
+     "cache_read": 0.02
+    }
+   },
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg",
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-6-rosalind",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 15.0,
+    "output": 75.0,
+    "cache_read": 1.5
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 30.0,
+     "output": 112.5,
+     "cache_read": 3.0
+    }
+   },
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg"
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-6-sol",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.2
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 4.0,
+     "output": 15.0,
+     "cache_read": 0.4
+    }
+   },
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg",
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-6.1-sol",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 4.0,
+     "output": 15.0,
+     "cache_read": 0.2
+    }
+   },
+   "note": "context window 1,050,000 per the model page; prompts over 272K input tokens pay 2x input/cache and 1.5x output for the full request",
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "ultrafast": 6.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-6.1-terra",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.0,
+    "output": 5.0,
+    "cache_read": 0.05
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 2.0,
+     "output": 7.5,
+     "cache_read": 0.1
+    }
+   },
+   "note": "30m/12h cache-write rates exist on the page but are not mapped to a retention leg",
+   "service_multipliers": {
+    "fast": 2.0,
+    "priority": 2.0,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "context_capacity": 1050000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-rosalind-discovery",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {}
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "gpt-rosalind-research",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {}
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "o1",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 15.0,
+    "output": 60.0,
+    "cache_read": 7.5
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "service_unpublished": {
+    "batch": {
+     "base": [
+      "cache_read"
+     ],
+     "above": []
+    }
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "o1-pro",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 150.0,
+    "output": 600.0
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "o3",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5
+   },
+   "service_multipliers": {
+    "fast": 1.75,
+    "priority": 1.75,
+    "batch": 0.5,
+    "flex": 0.5
+   },
+   "service_unpublished": {
+    "batch": {
+     "base": [
+      "cache_read"
+     ],
+     "above": []
+    }
+   },
+   "context_capacity": 200000
+  },
+  {
+   "billing_provider": "openai",
+   "model": "o3-mini",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.1,
+    "output": 4.4,
+    "cache_read": 0.55
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "service_unpublished": {
+    "batch": {
+     "base": [
+      "cache_read"
+     ],
+     "above": []
+    }
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "o3-pro",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 20.0,
+    "output": 80.0
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   }
+  },
+  {
+   "billing_provider": "openai",
+   "model": "o4-mini",
+   "source": "openai-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.1,
+    "output": 4.4,
+    "cache_read": 0.275
+   },
+   "service_multipliers": {
+    "fast": 1.818182,
+    "priority": 1.818182,
+    "batch": 0.5
+   },
+   "service_unpublished": {
+    "batch": {
+     "base": [
+      "cache_read"
+     ],
+     "above": []
+    }
+   },
+   "context_capacity": 200000
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "beam-free",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.0,
+    "output": 0.0,
+    "cache_read": 0.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "big-pickle",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.0,
+    "output": 0.0,
+    "cache_read": 0.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-fable-5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 10.0,
+    "output": 50.0,
+    "cache_read": 1.0,
+    "cache_write": 12.5
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-fable-5-1",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 10.0,
+    "output": 50.0,
+    "cache_read": 0.25,
+    "cache_write": 12.5
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-haiku-4-5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.0,
+    "output": 5.0,
+    "cache_read": 0.1,
+    "cache_write": 1.25
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-haiku-5-5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write": 0.125
+   },
+   "threshold": {
+    "input_tokens": 100000,
+    "inclusive": true,
+    "above": {
+     "input": 0.5,
+     "output": 2.5,
+     "cache_read": 0.05,
+     "cache_write": 0.625
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-opus-4-5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5,
+    "cache_write": 6.25
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-opus-4-6",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5,
+    "cache_write": 6.25
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-opus-4-7",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5,
+    "cache_write": 6.25
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-opus-4-8",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5,
+    "cache_write": 6.25
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-opus-5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_read": 0.5,
+    "cache_write": 6.25
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-opus-5-5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 4.0,
+    "output": 20.0,
+    "cache_read": 0.2,
+    "cache_write": 5.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-sonnet-4-5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 3.0,
+    "output": 15.0,
+    "cache_read": 0.3,
+    "cache_write": 3.75
+   },
+   "threshold": {
+    "input_tokens": 200000,
+    "inclusive": true,
+    "above": {
+     "input": 6.0,
+     "output": 22.5,
+     "cache_read": 0.6,
+     "cache_write": 7.5
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-sonnet-4-6",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 3.0,
+    "output": 15.0,
+    "cache_read": 0.3,
+    "cache_write": 3.75
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-sonnet-5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.2,
+    "cache_write": 2.5
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "claude-sonnet-5-5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.2,
+    "cache_write": 2.5
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "deepseek-v4-pro",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.74,
+    "output": 3.48,
+    "cache_read": 0.145
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "deepseek-v4.1-flash",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.3,
+    "output": 1.2,
+    "cache_read": 0.006
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "deepseek-v4.1-flash-free",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.0,
+    "output": 0.0,
+    "cache_read": 0.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "flint-40b-free",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.0,
+    "output": 0.0,
+    "cache_read": 0.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gemini-3-flash",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.5,
+    "output": 3.0,
+    "cache_read": 0.05
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gemini-3.1-pro",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 12.0,
+    "cache_read": 0.2
+   },
+   "threshold": {
+    "input_tokens": 200000,
+    "inclusive": true,
+    "above": {
+     "input": 4.0,
+     "output": 18.0,
+     "cache_read": 0.4
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gemini-3.5-flash",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.5,
+    "output": 9.0,
+    "cache_read": 0.15
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gemini-3.5-flash-lite",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.3,
+    "output": 2.5,
+    "cache_read": 0.03
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gemini-3.6-flash",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.5,
+    "output": 7.5,
+    "cache_read": 0.15
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gemini-3.7-flash",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.5,
+    "output": 7.5,
+    "cache_read": 0.15
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gemini-3.8-flash",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.5,
+    "output": 7.5,
+    "cache_read": 0.15
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gemini-4-argon",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1
+   },
+   "effective_until": "2026-12-01",
+   "note": "50% launch discount through November 30, 2026 per the page"
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gemini-4-argon",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "effective_from": "2026-12-01",
+   "rates": {
+    "input": 4.0,
+    "output": 20.0,
+    "cache_read": 0.2
+   },
+   "note": "struck-through list price shown on the page; applies after the promotion"
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "glm-5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.0,
+    "output": 3.2,
+    "cache_read": 0.2
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "glm-5.1",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.4,
+    "output": 4.4,
+    "cache_read": 0.26
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "glm-5.2",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.4,
+    "output": 4.4,
+    "cache_read": 0.26
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "glm-5.3",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.4,
+    "output": 4.4,
+    "cache_read": 0.26
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "glm-5.3-flash",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.15,
+    "output": 0.5,
+    "cache_read": 0.03
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "glm-5.3-flash-free",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.0,
+    "output": 0.0,
+    "cache_read": 0.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.07,
+    "output": 8.5,
+    "cache_read": 0.107
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5-codex",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.07,
+    "output": 8.5,
+    "cache_read": 0.107
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5-nano",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.05,
+    "output": 0.4,
+    "cache_read": 0.005
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.1",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.07,
+    "output": 8.5,
+    "cache_read": 0.107
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.1-codex",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.07,
+    "output": 8.5,
+    "cache_read": 0.107
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.1-codex-max",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.1-codex-mini",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.25,
+    "output": 2.0,
+    "cache_read": 0.025
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.2",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.75,
+    "output": 14.0,
+    "cache_read": 0.175
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.2-codex",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.75,
+    "output": 14.0,
+    "cache_read": 0.175
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.3-codex",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.75,
+    "output": 14.0,
+    "cache_read": 0.175
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.3-codex-spark",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.75,
+    "output": 14.0,
+    "cache_read": 0.175
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.4",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.5,
+    "output": 15.0,
+    "cache_read": 0.25
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 5.0,
+     "output": 22.5,
+     "cache_read": 0.5
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.4-mini",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.75,
+    "output": 4.5,
+    "cache_read": 0.075
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.4-nano",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.2,
+    "output": 1.25,
+    "cache_read": 0.02
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.4-pro",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 30.0,
+    "output": 180.0,
+    "cache_read": 30.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 5.0,
+    "output": 30.0,
+    "cache_read": 0.5
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 10.0,
+     "output": 45.0,
+     "cache_read": 1.0
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.5-pro",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 30.0,
+    "output": 180.0,
+    "cache_read": 30.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.6-luna",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.2,
+    "output": 1.2,
+    "cache_read": 0.02,
+    "cache_write": 0.25
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 0.4,
+     "output": 1.8,
+     "cache_read": 0.04,
+     "cache_write": 0.5
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.6-sol",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 4.0,
+    "output": 20.0,
+    "cache_read": 0.4,
+    "cache_write": 5.0
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 8.0,
+     "output": 30.0,
+     "cache_read": 0.8,
+     "cache_write": 10.0
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-5.6-terra",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 12.0,
+    "cache_read": 0.2,
+    "cache_write": 2.5
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 4.0,
+     "output": 18.0,
+     "cache_read": 0.4,
+     "cache_write": 5.0
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-6-astra",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 10.0,
+    "output": 50.0,
+    "cache_read": 1.0,
+    "cache_write": 12.5
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 20.0,
+     "output": 75.0,
+     "cache_read": 2.0,
+     "cache_write": 25.0
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-6-luna",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write": 0.125
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 0.2,
+     "output": 0.75,
+     "cache_read": 0.02,
+     "cache_write": 0.25
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-6-sol",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.2,
+    "cache_write": 2.5
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 4.0,
+     "output": 15.0,
+     "cache_read": 0.4,
+     "cache_write": 5.0
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "gpt-6.1-sol",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write": 2.5
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 4.0,
+     "output": 15.0,
+     "cache_read": 0.2,
+     "cache_write": 5.0
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "grok-4.5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 6.0,
+    "cache_read": 0.3
+   },
+   "threshold": {
+    "input_tokens": 200000,
+    "inclusive": true,
+    "above": {
+     "input": 4.0,
+     "output": 12.0,
+     "cache_read": 0.6
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "grok-4.6",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 6.0,
+    "cache_read": 0.5
+   },
+   "threshold": {
+    "input_tokens": 200000,
+    "inclusive": true,
+    "above": {
+     "input": 4.0,
+     "output": 12.0,
+     "cache_read": 1.0
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "grok-4.7",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 6.0,
+    "cache_read": 0.5
+   },
+   "threshold": {
+    "input_tokens": 200000,
+    "inclusive": true,
+    "above": {
+     "input": 4.0,
+     "output": 12.0,
+     "cache_read": 1.0
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "grok-build-0.1",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.0,
+    "output": 2.0,
+    "cache_read": 0.2
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "kimi-k2.5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.6,
+    "output": 3.0,
+    "cache_read": 0.1
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "kimi-k2.6",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.95,
+    "output": 4.0,
+    "cache_read": 0.16
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "kimi-k2.7-code",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.95,
+    "output": 4.0,
+    "cache_read": 0.19
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "kimi-k3",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 3.0,
+    "output": 15.0,
+    "cache_read": 0.3,
+    "cache_write": 3.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "mimo-v2.6-flash-free",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.0,
+    "output": 0.0,
+    "cache_read": 0.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "minimax-m2.5",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.3,
+    "output": 1.2,
+    "cache_read": 0.06
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "minimax-m2.7",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.3,
+    "output": 1.2,
+    "cache_read": 0.06
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "minimax-m3",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.3,
+    "output": 1.2,
+    "cache_read": 0.06
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "mistral-large-4",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.68,
+    "output": 2.09,
+    "cache_read": 0.07
+   },
+   "note": "50% discount; the page states no end date"
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "muse-spark-1.2",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.25,
+    "output": 4.25,
+    "cache_read": 0.15
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "muse-spark-1.3",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.25,
+    "output": 4.25,
+    "cache_read": 0.15
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "muse-wonder-1.0",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 4.0,
+    "output": 20.0,
+    "cache_read": 0.2
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "nemotron-3-ultra-free",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.0,
+    "output": 0.0,
+    "cache_read": 0.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "nemotron-3.5-lightning-free",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.0,
+    "output": 0.0,
+    "cache_read": 0.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "nemotron-3.5-super-vl-free",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.0,
+    "output": 0.0,
+    "cache_read": 0.0
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "qwen3.5-plus",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.2,
+    "output": 1.2,
+    "cache_read": 0.02,
+    "cache_write": 0.25
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "qwen3.6-plus",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.5,
+    "output": 3.0,
+    "cache_read": 0.05,
+    "cache_write": 0.625
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "qwen3.8-flash",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.15,
+    "output": 0.47,
+    "cache_read": 0.016,
+    "cache_write": 0.2
+   }
+  },
+  {
+   "billing_provider": "opencode",
+   "model": "qwen3.8-max",
+   "source": "opencode-zen",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 6.0,
+    "cache_read": 0.25,
+    "cache_write": 2.5
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "beam-free",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.0,
+    "output": 0.0,
+    "cache_read": 0.0
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "claude-haiku-5-5",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write": 0.125
+   },
+   "threshold": {
+    "input_tokens": 100000,
+    "inclusive": true,
+    "above": {
+     "input": 0.5,
+     "output": 2.5,
+     "cache_read": 0.05,
+     "cache_write": 0.625
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "deepseek-v4-pro",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.66,
+    "output": 1.98,
+    "cache_read": 0.022
+   },
+   "tariff": [
+    {
+     "name": "peak",
+     "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+     ],
+     "start_minute": 60,
+     "end_minute": 240,
+     "rates": {
+      "input": 1.32,
+      "output": 3.96,
+      "cache_read": 0.044
+     }
+    },
+    {
+     "name": "peak",
+     "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+     ],
+     "start_minute": 360,
+     "end_minute": 600,
+     "rates": {
+      "input": 1.32,
+      "output": 3.96,
+      "cache_read": 0.044
+     }
+    }
+   ],
+   "note": "Peak is 01:00-04:00 and 06:00-10:00 UTC Monday-Friday; every other hour is Off-Peak"
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "deepseek-v4.1-flash",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003
+   },
+   "tariff": [
+    {
+     "name": "peak",
+     "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+     ],
+     "start_minute": 60,
+     "end_minute": 240,
+     "rates": {
+      "input": 0.3,
+      "output": 1.2,
+      "cache_read": 0.006
+     }
+    },
+    {
+     "name": "peak",
+     "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+     ],
+     "start_minute": 360,
+     "end_minute": 600,
+     "rates": {
+      "input": 0.3,
+      "output": 1.2,
+      "cache_read": 0.006
+     }
+    }
+   ],
+   "note": "Peak is 01:00-04:00 and 06:00-10:00 UTC Monday-Friday; every other hour is Off-Peak"
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "gemini-4-argon",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1
+   },
+   "effective_until": "2026-12-01",
+   "note": "50% launch discount through November 30, 2026 per the page"
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "gemini-4-argon",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "effective_from": "2026-12-01",
+   "rates": {
+    "input": 4.0,
+    "output": 20.0,
+    "cache_read": 0.2
+   },
+   "note": "struck-through list price shown on the page; applies after the promotion"
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "glm-5.2",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.4,
+    "output": 4.4,
+    "cache_read": 0.26
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "glm-5.3",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.4,
+    "output": 4.4,
+    "cache_read": 0.26
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "glm-5.3-flash",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.15,
+    "output": 0.5,
+    "cache_read": 0.03
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "gpt-5.6-luna",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.2,
+    "output": 1.2,
+    "cache_read": 0.02,
+    "cache_write": 0.25
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 0.4,
+     "output": 1.8,
+     "cache_read": 0.04,
+     "cache_write": 0.5
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "gpt-6-luna",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write": 0.125
+   },
+   "threshold": {
+    "input_tokens": 272000,
+    "inclusive": true,
+    "above": {
+     "input": 0.2,
+     "output": 0.75,
+     "cache_read": 0.02,
+     "cache_write": 0.25
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "grok-4.7",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 6.0,
+    "cache_read": 0.5
+   },
+   "threshold": {
+    "input_tokens": 200000,
+    "inclusive": true,
+    "above": {
+     "input": 4.0,
+     "output": 12.0,
+     "cache_read": 1.0
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "hy3",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.14,
+    "output": 0.58,
+    "cache_read": 0.035
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "hy4-preview",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.834,
+    "output": 2.501,
+    "cache_read": 0.042
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "iceman-contributor-free",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.0,
+    "output": 0.0,
+    "cache_read": 0.0
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "kimi-k2.7-code",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.95,
+    "output": 4.0,
+    "cache_read": 0.19
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "kimi-k3",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 3.0,
+    "output": 15.0,
+    "cache_read": 0.3,
+    "cache_write": 3.0
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "kimi-k3.1-pro",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.2,
+    "cache_write": 2.0
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "longcat-2.0",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.3,
+    "output": 1.2,
+    "cache_read": 0.006
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "mimo-v2.5",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.14,
+    "output": 0.28,
+    "cache_read": 0.0028
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "mimo-v2.5-pro",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.435,
+    "output": 0.87,
+    "cache_read": 0.003625
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "mimo-v2.6-flash",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.14,
+    "output": 0.28,
+    "cache_read": 0.0028
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "mimo-v2.6-pro",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.435,
+    "output": 0.87,
+    "cache_read": 0.003625
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "minimax-m3",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.3,
+    "output": 1.2,
+    "cache_read": 0.06
+   },
+   "threshold": {
+    "input_tokens": 512000,
+    "inclusive": true,
+    "above": {
+     "input": 0.6,
+     "output": 2.4,
+     "cache_read": 0.12
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "minimax-m3.1-flash",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.015
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "muse-spark-1.2-contributor",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.1,
+    "output": 0.2,
+    "cache_read": 0.002
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "muse-spark-1.3-contributor",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.1,
+    "output": 0.2,
+    "cache_read": 0.002
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "qwen3.7-plus",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.4,
+    "output": 1.6,
+    "cache_read": 0.04,
+    "cache_write": 0.5
+   },
+   "threshold": {
+    "input_tokens": 256000,
+    "inclusive": true,
+    "above": {
+     "input": 1.2,
+     "output": 4.8,
+     "cache_read": 0.12,
+     "cache_write": 1.5
+    }
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "qwen3.8-flash",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.15,
+    "output": 0.47,
+    "cache_read": 0.016,
+    "cache_write": 0.2
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "qwen3.8-max",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 2.0,
+    "output": 6.0,
+    "cache_read": 0.25,
+    "cache_write": 2.5
+   }
+  },
+  {
+   "billing_provider": "opencode-go",
+   "model": "step-5-preview",
+   "source": "opencode-go",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 1.0,
+    "output": 2.7,
+    "cache_read": 0.1
+   }
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-mythos-5-1",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 10,
+    "output": 50,
+    "cache_read": 0.25,
+    "cache_write_5m": 12.5,
+    "cache_write_1h": 20
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "note": "limited availability per the page"
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-mythos-5",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 10,
+    "output": 50,
+    "cache_read": 1,
+    "cache_write_5m": 12.5,
+    "cache_write_1h": 20
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "note": "limited availability per the page"
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-opus-4-1-20250805",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 15,
+    "output": 75,
+    "cache_read": 1.5,
+    "cache_write_5m": 18.75,
+    "cache_write_1h": 30
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "note": "retired on the first-party API per the page"
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-opus-4-20250514",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 15,
+    "output": 75,
+    "cache_read": 1.5,
+    "cache_write_5m": 18.75,
+    "cache_write_1h": 30
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "note": "retired on the first-party API per the page"
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-sonnet-4-20250514",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 3,
+    "output": 15,
+    "cache_read": 0.3,
+    "cache_write_5m": 3.75,
+    "cache_write_1h": 6
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "note": "retired on the first-party API per the page"
+  },
+  {
+   "billing_provider": "anthropic",
+   "model": "claude-3-5-haiku-20241022",
+   "source": "anthropic-pricing",
+   "checked_at": "2026-10-30",
+   "rates": {
+    "input": 0.8,
+    "output": 4,
+    "cache_read": 0.08,
+    "cache_write_5m": 1,
+    "cache_write_1h": 1.6
+   },
+   "service_multipliers": {
+    "batch": 0.5
+   },
+   "note": "retired on the first-party API per the page"
+  }
+ ]
+}

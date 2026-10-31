@@ -14,7 +14,7 @@ use crate::time::format_local;
 use super::RosterContext;
 use super::inspector::process_line;
 use super::roster::{MIN_HEIGHT, MIN_WIDTH};
-use super::widgets::{Palette, fit, provider_name, status_text};
+use super::widgets::{Palette, fit, harness_name, status_text};
 
 pub(super) fn render_panel(frame: &mut Frame, app: &App, ctx: &RosterContext) {
     let area = frame.area();
@@ -93,15 +93,34 @@ fn help_lines(screen: Screen) -> Vec<String> {
     match screen {
         Screen::Roster => {
             out.push("# Roster".into());
-            out.push(key("j/k, arrows", "Move selection"));
+            out.push(key("j/k, arrows", "Move; rests on Load more rows"));
             out.push(key("g/G, Home/End", "First / last row"));
             out.push(key("PgUp/PgDn, Ctrl+u/d", "Page"));
-            out.push(key("Enter, Tab", "Open the inspector"));
+            out.push(key("Enter", "Open the inspector / load more"));
+            out.push(key("Tab", "Wide: inspector. Narrow: list/preview"));
+            out.push(key("Space", "Show or hide a family's children"));
+            out.push(key("Left/Right, h/l", "Scroll the trailing columns"));
+            out.push(key("J/K", "Scroll the preview"));
+            out.push(key("Mouse", "Click selects; marker expands; wheel"));
+            out.push(key("Shift+drag", "Terminal text selection (capture)"));
             out.push(key("/", "Search title, project, cwd, session id"));
             out.push(key("f", "Filter: provider, status, project, usage"));
             out.push(key("s / S", "Cycle sort / reverse direction"));
             out.push(key("r", "Refresh now (retries a paused worker)"));
             out.push(key("p", "Process candidates for the selection"));
+            out.push(key("m", "Load 50 more top-level sessions"));
+            out.push("# Capability limits".into());
+            out.push("Rows show \"…\" until a session's details are read; discovery".into());
+            out.push("reads only file head/tail, never whole transcripts.".into());
+            out.push("OpenCode: no compaction markers are recorded, and request-level".into());
+            out.push("detail needs the v2 schema (legacy databases list none).".into());
+            out.push("Child links exist only where the tool metadata records the".into());
+            out.push("documented session id; other fields stay unread.".into());
+            out.push("Codex records cumulative usage only, so it has no request list.".into());
+            out.push("A Claude ID beyond the probe window is flagged approximate.".into());
+            out.push("Not read: Desktop chat history (only Code manifests and".into());
+            out.push("Cowork project stores), WSL, remote and cloud sessions, and".into());
+            out.push("OMP, Hermes and Pi sessions (no reader yet).".into());
         }
         Screen::Inspector => {
             out.push("# Inspector".into());
@@ -131,6 +150,8 @@ fn help_lines(screen: Screen) -> Vec<String> {
         Screen::Session => {
             out.push("# Session info".into());
             out.push(key("j/k, PgUp/PgDn", "Scroll"));
+            out.push(key("m", "Load the next older detail page"));
+            out.push(key("Space, Enter", "Expand compaction summaries"));
             out.push(key("Esc, Shift+Tab", "Back to the inspector"));
         }
         Screen::Source => {
@@ -164,8 +185,8 @@ fn process_lines(app: &App) -> Vec<String> {
     };
     out.push(format!(
         "# {} / {}",
-        provider_name(session.key.provider),
-        display_safe(&session.title)
+        harness_name(session.meta.key.harness),
+        display_safe(&session.meta.title)
     ));
     out.push(format!(
         "Association: {}",
@@ -184,7 +205,7 @@ fn process_lines(app: &App) -> Vec<String> {
             if view.candidates.is_empty() {
                 out.push(format!(
                     "No {} processes in the latest sample.",
-                    provider_name(session.key.provider)
+                    harness_name(session.meta.key.harness)
                 ));
             }
             let matched = match session.process {
@@ -239,6 +260,7 @@ fn filter_lines(app: &App, width: usize, height: usize, palette: Palette) -> Vec
             FilterTarget::Status(_) => "Status",
             FilterTarget::Usage(_) => "Usage",
             FilterTarget::Project(_) => "Project",
+            FilterTarget::Released => "",
             FilterTarget::Clear => "",
         };
         if heading != section {
@@ -269,7 +291,7 @@ fn filter_lines(app: &App, width: usize, height: usize, palette: Palette) -> Vec
 fn item_text(item: &FilterItem, at_cursor: bool) -> String {
     let marker = if at_cursor { "> " } else { "  " };
     let (checkbox, label) = match &item.target {
-        FilterTarget::Provider(p) => (true, provider_name(*p).to_string()),
+        FilterTarget::Provider(p) => (true, harness_name(*p).to_string()),
         FilterTarget::Status(l) => {
             let (icon, text) = status_text(*l);
             (true, format!("{icon} {text}"))
@@ -286,6 +308,7 @@ fn item_text(item: &FilterItem, at_cursor: bool) -> String {
         ),
         FilterTarget::Project(None) => (false, "Any project".to_string()),
         FilterTarget::Project(Some(name)) => (false, display_safe(name)),
+        FilterTarget::Released => (true, "Include released sessions".to_string()),
         FilterTarget::Clear => return format!("{marker}Clear all filters (c)"),
     };
     let box_ = match (checkbox, item.selected) {

@@ -10,8 +10,8 @@ use agentscope::domain::{
     PageRequest, RefreshBudget, SessionKey, SessionSummary, SourceKey, SourceLocator, ToolStatus,
     TranscriptPage,
 };
+use agentscope::providers::ProviderError;
 use agentscope::providers::codex::CodexScanner;
-use agentscope::providers::{ProviderError, ProviderReader};
 use serde_json::json;
 use support::codex::*;
 use support::{NOW, config_for, dated, set_modified, write_lines};
@@ -34,14 +34,7 @@ struct Fixture {
 }
 
 fn scan(scanner: &mut CodexScanner) -> Vec<SessionSummary> {
-    let mut out = Vec::new();
-    loop {
-        let delta = scanner.refresh(NOW, BIG).expect("refresh");
-        out.extend(delta.sessions);
-        if delta.scan.done {
-            return out;
-        }
-    }
+    support::world::hydrated_all(scanner, NOW, BIG)
 }
 
 fn open_with(lines: &[String], tweak: impl FnOnce(&mut Config)) -> (Fixture, SessionSummary) {
@@ -69,9 +62,16 @@ fn open(lines: &[String]) -> (Fixture, SessionSummary) {
 }
 
 fn first(f: &mut Fixture, key: &SessionKey) -> TranscriptPage {
-    f.scanner
-        .transcript_page(key, None, PageDirection::Forward, ALL)
-        .expect("page")
+    support::world::try_transcript(
+        &mut f.scanner,
+        key,
+        None,
+        PageDirection::Forward,
+        ALL,
+        BIG,
+        support::world::STEPS,
+    )
+    .expect("page")
 }
 
 fn anchor_of(e: &Event) -> PageAnchor {
@@ -139,7 +139,7 @@ fn renders_user_assistant_reasoning_and_one_row_per_tool() {
         ),
         token_count("2026-10-29T10:00:06Z", usage(10, 0, 5, 0, 15), Some(1000)),
     ]);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(
         kinds(&page),
         vec![
@@ -196,7 +196,7 @@ fn tool_exit_code_is_tool_status_not_session_failure() {
         ),
         task_complete("2026-10-29T10:00:03Z"),
     ]);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     let tool = page
         .events
         .iter()
@@ -230,7 +230,7 @@ fn pending_and_orphan_tools_are_labeled() {
                    "arguments": {"a": 1}, "status": "in_progress"}),
         ),
     ]);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 3);
     let pending = page.events[0].tool.as_ref().unwrap();
     assert_eq!(pending.status, ToolStatus::Pending);
@@ -264,7 +264,7 @@ fn pending_and_orphan_tools_are_labeled() {
         .as_bytes(),
     );
     scan(&mut f.scanner);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 2);
     assert!(page.events.iter().all(|e| {
         e.tool
@@ -288,7 +288,7 @@ fn suppressed_custom_calls_are_source_only_and_addressable() {
         record("2026-10-29T10:00:04Z", "future_thing", json!({"x": 1})),
         record("2026-10-29T10:00:05Z", "world_state", json!({})),
     ]);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 1);
     let source_only = diag(&page, "custom_tool_call");
     assert_eq!(source_only.len(), 2);
@@ -298,12 +298,30 @@ fn suppressed_custom_calls_are_source_only_and_addressable() {
     assert!(unknown[0].hidden);
     assert_eq!(diag(&page, "world_state").len(), 1);
 
-    let call = f.scanner.source_record(&source_only[0].locator).unwrap();
+    let call = support::world::try_source(
+        &mut f.scanner,
+        &source_only[0].locator,
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert!(call.raw.contains("apply_patch"));
     assert!(call.unavailable.is_none());
-    let output = f.scanner.source_record(&source_only[1].locator).unwrap();
+    let output = support::world::try_source(
+        &mut f.scanner,
+        &source_only[1].locator,
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert!(output.raw.contains("Done!"));
-    let future = f.scanner.source_record(&unknown[0].locator).unwrap();
+    let future = support::world::try_source(
+        &mut f.scanner,
+        &unknown[0].locator,
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert!(future.raw.contains("future_thing"));
     assert!(future.display.contains("future_thing"));
 
@@ -325,7 +343,7 @@ fn suppressed_custom_calls_are_source_only_and_addressable() {
         },
         SourceLocator {
             session: SessionKey {
-                provider_session_id: "nope".into(),
+                native_id: "nope".into(),
                 ..good.session.clone()
             },
             kind: good.kind.clone(),
@@ -367,18 +385,22 @@ fn suppressed_custom_calls_are_source_only_and_addressable() {
     ];
     for locator in &bad {
         assert!(
-            f.scanner.source_record(locator).is_err(),
+            support::world::try_source(&mut f.scanner, locator, BIG, support::world::STEPS)
+                .is_err(),
             "accepted {locator:?}"
         );
     }
-    let missing = f.scanner.transcript_page(
+    let missing = support::world::try_transcript(
+        &mut f.scanner,
         &SessionKey {
-            provider_session_id: "nope".into(),
-            ..s.key.clone()
+            native_id: "nope".into(),
+            ..s.meta.key.clone()
         },
         None,
         PageDirection::Forward,
         ALL,
+        BIG,
+        support::world::STEPS,
     );
     assert!(missing.is_err());
 }
@@ -418,10 +440,16 @@ fn chain(
     let mut pages = Vec::new();
     let mut anchor = None;
     loop {
-        let page = f
-            .scanner
-            .transcript_page(key, anchor.clone(), direction, request)
-            .unwrap();
+        let page = support::world::try_transcript(
+            &mut f.scanner,
+            key,
+            anchor.clone(),
+            direction,
+            request,
+            BIG,
+            support::world::STEPS,
+        )
+        .unwrap();
         assert!(page.events.len() <= request.max_events);
         let more = page.has_more;
         anchor = page.next.clone();
@@ -437,7 +465,7 @@ fn chain(
 #[test]
 fn forward_and_backward_pages_do_not_duplicate_or_split_tool_pairs() {
     let (mut f, s) = open(&mixed_session(60));
-    let whole = first(&mut f, &s.key);
+    let whole = first(&mut f, &s.meta.key);
     assert!(!whole.has_more);
     let all_ids = ids(&whole.events);
     assert_eq!(all_ids.iter().collect::<HashSet<_>>().len(), all_ids.len());
@@ -453,8 +481,8 @@ fn forward_and_backward_pages_do_not_duplicate_or_split_tool_pairs() {
             max_events: size,
             max_bytes: 10_000_000,
         };
-        let forward = chain(&mut f, &s.key, PageDirection::Forward, request);
-        let backward = chain(&mut f, &s.key, PageDirection::Backward, request);
+        let forward = chain(&mut f, &s.meta.key, PageDirection::Forward, request);
+        let backward = chain(&mut f, &s.meta.key, PageDirection::Backward, request);
         let fwd: Vec<_> = forward.iter().flat_map(|p| ids(&p.events)).collect();
         let mut bwd_pages: Vec<_> = backward.iter().map(|p| ids(&p.events)).collect();
         bwd_pages.reverse();
@@ -479,18 +507,19 @@ fn forward_and_backward_pages_do_not_duplicate_or_split_tool_pairs() {
 
     // Backward from an interior anchor returns exactly the events before it.
     let mid = &whole.events[10];
-    let before = f
-        .scanner
-        .transcript_page(
-            &s.key,
-            Some(anchor_of(mid)),
-            PageDirection::Backward,
-            PageRequest {
-                max_events: 4,
-                max_bytes: 10_000_000,
-            },
-        )
-        .unwrap();
+    let before = support::world::try_transcript(
+        &mut f.scanner,
+        &s.meta.key,
+        Some(anchor_of(mid)),
+        PageDirection::Backward,
+        PageRequest {
+            max_events: 4,
+            max_bytes: 10_000_000,
+        },
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert_eq!(ids(&before.events), all_ids[6..10].to_vec());
     assert!(before.has_more);
     assert_eq!(before.next.as_ref().unwrap().stable_id, all_ids[6]);
@@ -500,7 +529,7 @@ fn forward_and_backward_pages_do_not_duplicate_or_split_tool_pairs() {
         max_events: 1000,
         max_bytes: 40,
     };
-    let pages = chain(&mut f, &s.key, PageDirection::Forward, tiny);
+    let pages = chain(&mut f, &s.meta.key, PageDirection::Forward, tiny);
     assert!(pages.len() > 5);
     assert!(pages.iter().all(|p| !p.events.is_empty()));
     let combined: Vec<_> = pages.iter().flat_map(|p| ids(&p.events)).collect();
@@ -510,9 +539,19 @@ fn forward_and_backward_pages_do_not_duplicate_or_split_tool_pairs() {
 #[test]
 fn count_events_after_counts_displayed_work_only() {
     let (mut f, s) = open(&mixed_session(30));
-    let whole = first(&mut f, &s.key);
+    let whole = first(&mut f, &s.meta.key);
     let anchor = anchor_of(&whole.events[whole.events.len() - 4]);
-    assert_eq!(f.scanner.count_events_after(&s.key, &anchor).unwrap(), 3);
+    assert_eq!(
+        support::world::try_count(
+            &mut f.scanner,
+            &s.meta.key,
+            &anchor,
+            BIG,
+            support::world::STEPS
+        )
+        .unwrap(),
+        3
+    );
     append(
         &f.path,
         format!(
@@ -524,9 +563,29 @@ fn count_events_after_counts_displayed_work_only() {
         .as_bytes(),
     );
     // Not visible until the roster scan has consumed it.
-    assert_eq!(f.scanner.count_events_after(&s.key, &anchor).unwrap(), 3);
+    assert_eq!(
+        support::world::try_count(
+            &mut f.scanner,
+            &s.meta.key,
+            &anchor,
+            BIG,
+            support::world::STEPS
+        )
+        .unwrap(),
+        3
+    );
     scan(&mut f.scanner);
-    assert_eq!(f.scanner.count_events_after(&s.key, &anchor).unwrap(), 5);
+    assert_eq!(
+        support::world::try_count(
+            &mut f.scanner,
+            &s.meta.key,
+            &anchor,
+            BIG,
+            support::world::STEPS
+        )
+        .unwrap(),
+        5
+    );
 }
 
 #[test]
@@ -540,18 +599,26 @@ fn partial_append_rotation_and_oversized_records_are_safe() {
         ],
         |c| c.max_record_bytes = 2048,
     );
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 2);
     let big = diag(&page, "oversized");
     assert_eq!(big.len(), 1);
     assert!(big[0].hidden);
-    let raw = f.scanner.source_record(&big[0].locator).unwrap();
+    let raw =
+        support::world::try_source(&mut f.scanner, &big[0].locator, BIG, support::world::STEPS)
+            .unwrap();
     assert!(raw.raw.is_empty() && raw.unavailable.is_some());
     // Backward reads classify the same oversized record.
-    let back = f
-        .scanner
-        .transcript_page(&s.key, None, PageDirection::Backward, ALL)
-        .unwrap();
+    let back = support::world::try_transcript(
+        &mut f.scanner,
+        &s.meta.key,
+        None,
+        PageDirection::Backward,
+        ALL,
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert_eq!(ids(&back.events), ids(&page.events));
     assert_eq!(diag(&back, "oversized").len(), 1);
 
@@ -560,22 +627,32 @@ fn partial_append_rotation_and_oversized_records_are_safe() {
     let (head, rest) = tail.split_at(20);
     append(&f.path, head.as_bytes());
     scan(&mut f.scanner);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 2);
     assert_eq!(
-        f.scanner
-            .transcript_page(&s.key, None, PageDirection::Backward, ALL)
-            .unwrap()
-            .events
-            .len(),
+        support::world::try_transcript(
+            &mut f.scanner,
+            &s.meta.key,
+            None,
+            PageDirection::Backward,
+            ALL,
+            BIG,
+            support::world::STEPS
+        )
+        .unwrap()
+        .events
+        .len(),
         2
     );
     append(&f.path, format!("{rest}\n").as_bytes());
     scan(&mut f.scanner);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 3);
     let old_locator = page.events[0].provenance.locator.clone();
-    assert!(f.scanner.source_record(&old_locator).is_ok());
+    assert!(
+        support::world::try_source(&mut f.scanner, &old_locator, BIG, support::world::STEPS)
+            .is_ok()
+    );
     let old_anchor = anchor_of(&page.events[2]);
 
     // Rotation: a shorter replacement restarts the transcript; stale anchors yield nothing.
@@ -587,20 +664,33 @@ fn partial_append_rotation_and_oversized_records_are_safe() {
         ],
     );
     let summaries = scan(&mut f.scanner);
-    assert!(summaries.iter().any(|x| x.key == s.key));
-    let page = first(&mut f, &s.key);
+    assert!(summaries.iter().any(|x| x.meta.key == s.meta.key));
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 1);
-    assert!(f.scanner.source_record(&old_locator).is_err());
     assert!(
-        f.scanner
-            .source_record(&page.events[0].provenance.locator)
-            .is_ok()
+        support::world::try_source(&mut f.scanner, &old_locator, BIG, support::world::STEPS)
+            .is_err()
+    );
+    assert!(
+        support::world::try_source(
+            &mut f.scanner,
+            &page.events[0].provenance.locator,
+            BIG,
+            support::world::STEPS
+        )
+        .is_ok()
     );
     assert_eq!(page.events[0].text.as_ref().unwrap().preview, "fresh");
-    let stale = f
-        .scanner
-        .transcript_page(&s.key, Some(old_anchor), PageDirection::Forward, ALL)
-        .unwrap();
+    let stale = support::world::try_transcript(
+        &mut f.scanner,
+        &s.meta.key,
+        Some(old_anchor),
+        PageDirection::Forward,
+        ALL,
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert!(stale.events.is_empty() && !stale.has_more);
 }
 
@@ -614,18 +704,19 @@ fn previews_are_bounded_redacted_and_marked_truncated() {
             command_item("i", "curl", &format!("{secret}\n{}", "z".repeat(50_000)), 0),
         ),
     ]);
-    let page = f
-        .scanner
-        .transcript_page(
-            &s.key,
-            None,
-            PageDirection::Forward,
-            PageRequest {
-                max_events: 10,
-                max_bytes: 4096,
-            },
-        )
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut f.scanner,
+        &s.meta.key,
+        None,
+        PageDirection::Forward,
+        PageRequest {
+            max_events: 10,
+            max_bytes: 4096,
+        },
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     let out = page.events[0]
         .tool
         .as_ref()
@@ -660,7 +751,7 @@ fn backward_reads_cross_block_boundaries_and_oversized_records() {
         }
     }
     let (mut f, s) = open_with(&lines, |c| c.max_record_bytes = 150_000);
-    let whole = first(&mut f, &s.key);
+    let whole = first(&mut f, &s.meta.key);
     let oversized = diag(&whole, "oversized").len();
     assert_eq!(oversized, 3);
     assert_eq!(whole.events.len(), 24);
@@ -668,8 +759,8 @@ fn backward_reads_cross_block_boundaries_and_oversized_records() {
         max_events: 5,
         max_bytes: 10_000_000,
     };
-    let forward = chain(&mut f, &s.key, PageDirection::Forward, request);
-    let backward = chain(&mut f, &s.key, PageDirection::Backward, request);
+    let forward = chain(&mut f, &s.meta.key, PageDirection::Forward, request);
+    let backward = chain(&mut f, &s.meta.key, PageDirection::Backward, request);
     let mut bwd: Vec<_> = backward.iter().map(|p| ids(&p.events)).collect();
     bwd.reverse();
     assert_eq!(
@@ -691,7 +782,9 @@ fn backward_reads_cross_block_boundaries_and_oversized_records() {
     assert_eq!(offsets(&forward).len(), whole.diagnostics.len());
     // Every diagnostic locator resolves to the record it names.
     for d in &whole.diagnostics {
-        let rec = f.scanner.source_record(&d.locator).unwrap();
+        let rec =
+            support::world::try_source(&mut f.scanner, &d.locator, BIG, support::world::STEPS)
+                .unwrap();
         if d.label.contains("oversized") {
             assert!(rec.unavailable.is_some());
         } else {
@@ -719,18 +812,19 @@ fn long_credential_values_are_redacted_before_the_preview_is_cut() {
         ),
         user("2026-10-29T10:00:02Z", &format!("api_key = \"{value}\"")),
     ]);
-    let page = f
-        .scanner
-        .transcript_page(
-            &s.key,
-            None,
-            PageDirection::Forward,
-            PageRequest {
-                max_events: 10,
-                max_bytes: 4096,
-            },
-        )
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut f.scanner,
+        &s.meta.key,
+        None,
+        PageDirection::Forward,
+        PageRequest {
+            max_events: 10,
+            max_bytes: 4096,
+        },
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     let out = page.events[0]
         .tool
         .as_ref()
@@ -757,18 +851,19 @@ fn page_byte_budget_applies_to_the_whole_first_tool_row() {
         user("2026-10-29T10:00:02Z", "next"),
     ]);
     for budget in [1000usize, 300, 20] {
-        let page = f
-            .scanner
-            .transcript_page(
-                &s.key,
-                None,
-                PageDirection::Forward,
-                PageRequest {
-                    max_events: 10,
-                    max_bytes: budget,
-                },
-            )
-            .unwrap();
+        let page = support::world::try_transcript(
+            &mut f.scanner,
+            &s.meta.key,
+            None,
+            PageDirection::Forward,
+            PageRequest {
+                max_events: 10,
+                max_bytes: budget,
+            },
+            BIG,
+            support::world::STEPS,
+        )
+        .unwrap();
         assert_eq!(page.events.len(), 1, "budget {budget}: oversized row alone");
         assert!(page.has_more && page.truncated);
         let tool = page.events[0].tool.as_ref().unwrap();
@@ -779,18 +874,19 @@ fn page_byte_budget_applies_to_the_whole_first_tool_row() {
         assert!(tool.input.as_ref().unwrap().truncated);
         assert!(tool.output.as_ref().unwrap().truncated);
         // Progress is still made: the next page starts at the following row.
-        let next = f
-            .scanner
-            .transcript_page(
-                &s.key,
-                page.next.clone(),
-                PageDirection::Forward,
-                PageRequest {
-                    max_events: 10,
-                    max_bytes: budget,
-                },
-            )
-            .unwrap();
+        let next = support::world::try_transcript(
+            &mut f.scanner,
+            &s.meta.key,
+            page.next.clone(),
+            PageDirection::Forward,
+            PageRequest {
+                max_events: 10,
+                max_bytes: budget,
+            },
+            BIG,
+            support::world::STEPS,
+        )
+        .unwrap();
         assert_eq!(next.events.len(), 1);
         assert_eq!(next.events[0].kind, EventKind::UserPrompt);
     }
@@ -806,7 +902,7 @@ fn completion_without_raw_output_replaces_the_pending_call() {
             command_item("item-1", "cargo test", "ok", 0),
         ),
     ]);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 1, "no pending row beside the completion");
     let tool = page.events[0].tool.as_ref().unwrap();
     assert_eq!(tool.status, ToolStatus::Completed);
@@ -825,7 +921,7 @@ fn completion_without_raw_output_replaces_the_pending_call() {
             .any(|w| w.key.source.ends_with("#orphan-tool"))
     );
     assert_eq!(s.displayed_event_count, 1);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 1);
     assert_eq!(diag(&page, "custom_tool_call").len(), 2);
 
@@ -844,7 +940,7 @@ fn completion_without_raw_output_replaces_the_pending_call() {
         .as_bytes(),
     );
     let s = last_summary(&mut f.scanner);
-    assert_eq!(first(&mut f, &s.key).events.len(), 3);
+    assert_eq!(first(&mut f, &s.meta.key).events.len(), 3);
 }
 
 #[test]
@@ -855,7 +951,7 @@ fn replaced_source_is_not_served_through_old_offsets() {
         custom_call("2026-10-29T10:00:02Z", "c", "shell", "x"),
         custom_output("2026-10-29T10:00:03Z", "c", "y"),
     ]);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     let locator = diag(&page, "custom_tool_call")[0].locator.clone();
     let anchor = anchor_of(&page.events[0]);
     let original = std::fs::read_to_string(&f.path).unwrap();
@@ -865,17 +961,43 @@ fn replaced_source_is_not_served_through_old_offsets() {
     // Longer replacement.
     let check = |f: &mut Fixture| {
         assert!(
-            f.scanner
-                .transcript_page(&s.key, None, PageDirection::Forward, ALL)
-                .is_err()
+            support::world::try_transcript(
+                &mut f.scanner,
+                &s.meta.key,
+                None,
+                PageDirection::Forward,
+                ALL,
+                BIG,
+                support::world::STEPS
+            )
+            .is_err()
         );
         assert!(
-            f.scanner
-                .transcript_page(&s.key, None, PageDirection::Backward, ALL)
+            support::world::try_transcript(
+                &mut f.scanner,
+                &s.meta.key,
+                None,
+                PageDirection::Backward,
+                ALL,
+                BIG,
+                support::world::STEPS
+            )
+            .is_err()
+        );
+        assert!(
+            support::world::try_count(
+                &mut f.scanner,
+                &s.meta.key,
+                &anchor,
+                BIG,
+                support::world::STEPS
+            )
+            .is_err()
+        );
+        assert!(
+            support::world::try_source(&mut f.scanner, &locator, BIG, support::world::STEPS)
                 .is_err()
         );
-        assert!(f.scanner.count_events_after(&s.key, &anchor).is_err());
-        assert!(f.scanner.source_record(&locator).is_err());
     };
     check(&mut f);
     std::fs::write(
@@ -899,7 +1021,7 @@ fn replaced_source_is_not_served_through_old_offsets() {
         ],
     );
     scan(&mut f.scanner);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 1);
     assert_eq!(page.events[0].text.as_ref().unwrap().preview, "new");
 }
@@ -922,16 +1044,21 @@ fn record_cap_is_applied_after_the_line_terminator_for_pages_and_source() {
         ],
         |c| c.max_record_bytes = cap,
     );
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 1, "only the in-cap record is a row");
     let over = diag(&page, "oversized");
     assert_eq!(over.len(), 1);
-    let rec = f.scanner.source_record(&over[0].locator).unwrap();
+    let rec =
+        support::world::try_source(&mut f.scanner, &over[0].locator, BIG, support::world::STEPS)
+            .unwrap();
     assert!(rec.raw.is_empty() && rec.unavailable.is_some());
-    let ok = f
-        .scanner
-        .source_record(&page.events[0].provenance.locator)
-        .unwrap();
+    let ok = support::world::try_source(
+        &mut f.scanner,
+        &page.events[0].provenance.locator,
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert!(ok.unavailable.is_none() && ok.raw.len() == cap);
 }
 
@@ -952,7 +1079,7 @@ fn pages_follow_the_anchor_total_order_with_missing_and_decreasing_timestamps() 
         item_completed("2026-10-29T10:00:04Z", command_item("i", "ls", "out", 0)),
         record("2026-10-29T10:00:06Z", "mystery", json!({})),
     ]);
-    let whole = first(&mut f, &s.key);
+    let whole = first(&mut f, &s.meta.key);
     let label = |e: &Event| match (&e.text, &e.tool) {
         (Some(t), _) => t.preview.clone(),
         (_, Some(_)) => "tool".to_owned(),
@@ -977,8 +1104,8 @@ fn pages_follow_the_anchor_total_order_with_missing_and_decreasing_timestamps() 
             max_events: size,
             max_bytes: 10_000_000,
         };
-        let forward = chain(&mut f, &s.key, PageDirection::Forward, request);
-        let backward = chain(&mut f, &s.key, PageDirection::Backward, request);
+        let forward = chain(&mut f, &s.meta.key, PageDirection::Forward, request);
+        let backward = chain(&mut f, &s.meta.key, PageDirection::Backward, request);
         let fwd: Vec<_> = forward.iter().flat_map(|p| ids(&p.events)).collect();
         let mut bwd_pages: Vec<_> = backward.iter().map(|p| ids(&p.events)).collect();
         bwd_pages.reverse();
@@ -1002,26 +1129,48 @@ fn pages_follow_the_anchor_total_order_with_missing_and_decreasing_timestamps() 
 
     // Interior anchors split the order exactly, including across a decreasing step.
     let t3 = &whole.events[2];
-    let after = f
-        .scanner
-        .transcript_page(&s.key, Some(anchor_of(t3)), PageDirection::Forward, ALL)
-        .unwrap();
+    let after = support::world::try_transcript(
+        &mut f.scanner,
+        &s.meta.key,
+        Some(anchor_of(t3)),
+        PageDirection::Forward,
+        ALL,
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert_eq!(ids(&after.events), all_ids[3..].to_vec());
-    let before = f
-        .scanner
-        .transcript_page(&s.key, Some(anchor_of(t3)), PageDirection::Backward, ALL)
-        .unwrap();
+    let before = support::world::try_transcript(
+        &mut f.scanner,
+        &s.meta.key,
+        Some(anchor_of(t3)),
+        PageDirection::Backward,
+        ALL,
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert_eq!(ids(&before.events), all_ids[..2].to_vec());
     assert_eq!(
-        f.scanner
-            .count_events_after(&s.key, &anchor_of(t3))
-            .unwrap(),
+        support::world::try_count(
+            &mut f.scanner,
+            &s.meta.key,
+            &anchor_of(t3),
+            BIG,
+            support::world::STEPS
+        )
+        .unwrap(),
         3
     );
     assert_eq!(
-        f.scanner
-            .count_events_after(&s.key, &anchor_of(&whole.events[0]))
-            .unwrap(),
+        support::world::try_count(
+            &mut f.scanner,
+            &s.meta.key,
+            &anchor_of(&whole.events[0]),
+            BIG,
+            support::world::STEPS
+        )
+        .unwrap(),
         5
     );
 }
@@ -1041,18 +1190,30 @@ fn tool_names_are_cut_to_the_page_budget_and_mark_the_page_truncated() {
         max_events: 10,
         max_bytes,
     };
-    let page = f
-        .scanner
-        .transcript_page(&s.key, None, PageDirection::Forward, request(10))
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut f.scanner,
+        &s.meta.key,
+        None,
+        PageDirection::Forward,
+        request(10),
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert_eq!(page.events.len(), 1);
     assert!(page.events[0].tool.as_ref().unwrap().name.len() <= 10);
     assert!(page.truncated && page.has_more);
     // A budget that fits the whole name leaves it intact and unmarked.
-    let page = f
-        .scanner
-        .transcript_page(&s.key, None, PageDirection::Forward, request(1000))
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut f.scanner,
+        &s.meta.key,
+        None,
+        PageDirection::Forward,
+        request(1000),
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     assert_eq!(page.events[0].tool.as_ref().unwrap().name.len(), 61);
     assert!(!page.truncated);
 }
@@ -1069,7 +1230,7 @@ fn a_completion_claims_its_own_call_not_a_different_open_one() {
             command_item("item-a", "first", "done A", 0),
         ),
     ]);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(
         page.events.len(),
         2,
@@ -1098,7 +1259,7 @@ fn a_completion_claims_its_own_call_not_a_different_open_one() {
         .as_bytes(),
     );
     let s = last_summary(&mut f.scanner);
-    assert_eq!(first(&mut f, &s.key).events.len(), 2);
+    assert_eq!(first(&mut f, &s.meta.key).events.len(), 2);
     assert!(
         !s.warnings
             .iter()
@@ -1129,7 +1290,7 @@ fn preview_of(e: &Event) -> &str {
 #[test]
 fn same_length_replacement_outside_any_sample_is_rejected() {
     let (mut f, s) = open(&wide_session());
-    let page = first(&mut f, &s.key); // builds and caches the index
+    let page = first(&mut f, &s.meta.key); // builds and caches the index
     assert_eq!(page.events.len(), 7);
     let original = std::fs::read_to_string(&f.path).unwrap();
     let at = original.find("marker-two").unwrap();
@@ -1144,16 +1305,30 @@ fn same_length_replacement_outside_any_sample_is_rejected() {
     set_modified(&f.path, 1_000_000_000);
     for direction in [PageDirection::Forward, PageDirection::Backward] {
         assert!(
-            f.scanner
-                .transcript_page(&s.key, None, direction, ALL)
-                .is_err()
+            support::world::try_transcript(
+                &mut f.scanner,
+                &s.meta.key,
+                None,
+                direction,
+                ALL,
+                BIG,
+                support::world::STEPS
+            )
+            .is_err()
         );
     }
-    assert!(f.scanner.source_record(&locator).is_err());
     assert!(
-        f.scanner
-            .count_events_after(&s.key, &anchor_of(&page.events[0]))
-            .is_err()
+        support::world::try_source(&mut f.scanner, &locator, BIG, support::world::STEPS).is_err()
+    );
+    assert!(
+        support::world::try_count(
+            &mut f.scanner,
+            &s.meta.key,
+            &anchor_of(&page.events[0]),
+            BIG,
+            support::world::STEPS
+        )
+        .is_err()
     );
 
     // A refresh restarts the parse and the new bytes are served.
@@ -1164,7 +1339,7 @@ fn same_length_replacement_outside_any_sample_is_rejected() {
             .iter()
             .any(|w| w.key.source.ends_with("#rotation"))
     );
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 7);
     assert!(preview_of(&page.events[1]).starts_with("MARKER-TWO"));
 }
@@ -1172,7 +1347,7 @@ fn same_length_replacement_outside_any_sample_is_rejected() {
 #[test]
 fn rewritten_prefix_followed_by_growth_restarts_the_parse() {
     let (mut f, s) = open(&wide_session());
-    assert_eq!(first(&mut f, &s.key).events.len(), 7);
+    assert_eq!(first(&mut f, &s.meta.key).events.len(), 7);
     let original = std::fs::read_to_string(&f.path).unwrap();
     let grown = format!(
         "{}{}\n",
@@ -1191,7 +1366,7 @@ fn rewritten_prefix_followed_by_growth_restarts_the_parse() {
             .any(|w| w.key.source.ends_with("#rotation"))
     );
     assert_eq!(s2.displayed_event_count, 8);
-    let page = first(&mut f, &s.key);
+    let page = first(&mut f, &s.meta.key);
     assert_eq!(page.events.len(), 8);
     assert!(preview_of(&page.events[1]).starts_with("MARKER-TWO"));
     assert_eq!(preview_of(&page.events[7]), "appended after the rewrite");
@@ -1209,7 +1384,7 @@ fn rewritten_prefix_followed_by_growth_restarts_the_parse() {
             .map(|w| w.count),
         Some(1)
     );
-    assert_eq!(first(&mut f, &s.key).events.len(), 9);
+    assert_eq!(first(&mut f, &s.meta.key).events.len(), 9);
 }
 
 fn numbered(n: usize) -> Vec<String> {
@@ -1228,35 +1403,44 @@ fn index_construction_is_bounded_resumable_and_capped() {
     // Resumable: each request indexes at most `step` records, then succeeds.
     let (mut f, s) = open(&numbered(300));
     f.scanner.set_index_limits(100, 10_000);
-    let mut building = 0;
-    let page = loop {
-        match f
-            .scanner
-            .transcript_page(&s.key, None, PageDirection::Forward, ALL)
-        {
-            Ok(page) => break page,
-            Err(ProviderError::Unavailable(message)) => {
-                assert!(message.contains("index is building"), "{message}");
-                building += 1;
-                assert!(building < 10, "index never finished");
-            }
-            Err(other) => panic!("unexpected {other}"),
-        }
-    };
+    let (page, building) = support::world::transcript_steps(
+        &mut f.scanner,
+        &s.meta.key,
+        None,
+        PageDirection::Forward,
+        ALL,
+        BIG,
+        support::world::STEPS,
+    );
     assert_eq!(building, 3, "301 records at 100 per request");
     assert_eq!(page.events.len(), 300);
     assert_eq!(preview_of(&page.events[299]), "row 299");
     let anchor = anchor_of(&page.events[289]);
-    assert_eq!(f.scanner.count_events_after(&s.key, &anchor).unwrap(), 10);
+    assert_eq!(
+        support::world::try_count(
+            &mut f.scanner,
+            &s.meta.key,
+            &anchor,
+            BIG,
+            support::world::STEPS
+        )
+        .unwrap(),
+        10
+    );
 
     // Hard cap: a clear error, repeated cheaply, never a silent unbounded index.
     let (mut f, s) = open(&numbered(300));
     f.scanner.set_index_limits(100, 200);
     for _ in 0..6 {
-        match f
-            .scanner
-            .transcript_page(&s.key, None, PageDirection::Backward, ALL)
-        {
+        match support::world::try_transcript(
+            &mut f.scanner,
+            &s.meta.key,
+            None,
+            PageDirection::Backward,
+            ALL,
+            BIG,
+            support::world::STEPS,
+        ) {
             Err(ProviderError::Unavailable(_)) => {}
             Err(ProviderError::Unsupported(message)) => {
                 assert!(message.contains("200-record index limit"), "{message}");
@@ -1267,13 +1451,25 @@ fn index_construction_is_bounded_resumable_and_capped() {
     }
     for _ in 0..3 {
         assert!(matches!(
-            f.scanner
-                .transcript_page(&s.key, None, PageDirection::Forward, ALL),
+            support::world::try_transcript(
+                &mut f.scanner,
+                &s.meta.key,
+                None,
+                PageDirection::Forward,
+                ALL,
+                BIG,
+                support::world::STEPS
+            ),
             Err(ProviderError::Unsupported(_))
         ));
         assert!(matches!(
-            f.scanner
-                .count_events_after(&s.key, &anchor_of(&page.events[0])),
+            support::world::try_count(
+                &mut f.scanner,
+                &s.meta.key,
+                &anchor_of(&page.events[0]),
+                BIG,
+                support::world::STEPS
+            ),
             Err(ProviderError::Unsupported(_))
         ));
     }

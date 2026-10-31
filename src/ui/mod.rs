@@ -6,29 +6,39 @@
 mod details;
 mod inspector;
 mod panels;
+mod preview;
 mod roster;
 mod session;
 pub mod widgets;
 
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread::ThreadId;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 
 use crate::app::{App, Panel, Screen};
 use crate::domain::Timestamp;
-use crate::worker::{WorkerEvent, WorkerHandle, WorkerRequest};
+use crate::worker::{WorkerEvent, WorkerHandle};
 
 pub use inspector::{REASONING_LABEL, render_inspector};
-pub use roster::{MIN_HEIGHT, MIN_WIDTH, render_roster};
+pub use preview::render_preview;
+pub use roster::{
+    Column, ColumnBox, MIN_HEIGHT, MIN_WIDTH, PREVIEW_WIDTH, RosterLayout, handle_mouse,
+    render_roster,
+};
 
 /// Draw whichever screen is active, then any panel on top of it.
 pub fn render(frame: &mut ratatui::Frame, app: &App, ctx: &RosterContext) {
@@ -65,25 +75,84 @@ const MAX_KEYS_PER_FRAME: usize = 64;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
-fn restore_terminal() {
-    // Best effort and idempotent: every step is attempted.
-    let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+/// Mouse capture was enabled by the live guard and still has to be disabled.
+static MOUSE_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+/// The terminal mode changes a session makes, so the order of entering, rolling
+/// back and leaving can be exercised without a real terminal.
+trait ScreenModes {
+    fn enter_alternate_screen(&mut self) -> io::Result<()>;
+    fn leave_alternate_screen(&mut self) -> io::Result<()>;
+    fn set_mouse_capture(&mut self, on: bool) -> io::Result<()>;
 }
 
-/// Owns raw mode and the alternate screen. Dropping restores both, and a panic
-/// hook restores them before the panic message prints.
+/// The process's real standard output.
+struct StdoutModes;
+
+impl ScreenModes for StdoutModes {
+    fn enter_alternate_screen(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), EnterAlternateScreen)
+    }
+
+    fn leave_alternate_screen(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show)
+    }
+
+    fn set_mouse_capture(&mut self, on: bool) -> io::Result<()> {
+        if on {
+            execute!(io::stdout(), EnableMouseCapture)
+        } else {
+            execute!(io::stdout(), DisableMouseCapture)
+        }
+    }
+}
+
+/// Best effort and idempotent: every step is attempted.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let mouse = MOUSE_CAPTURE.swap(false, Ordering::SeqCst);
+    leave_screen(&mut StdoutModes, mouse);
+}
+
+/// Alternate screen, then (only when asked) mouse capture.
+fn enter_screen(modes: &mut impl ScreenModes, mouse: bool) -> io::Result<()> {
+    modes.enter_alternate_screen()?;
+    if mouse {
+        modes.set_mouse_capture(true)?;
+    }
+    Ok(())
+}
+
+/// Undo [`enter_screen`]; every step is attempted. Capture is released before
+/// the screen so the shell never sees stray mouse reports.
+fn leave_screen(modes: &mut impl ScreenModes, mouse: bool) {
+    if mouse {
+        let _ = modes.set_mouse_capture(false);
+    }
+    let _ = modes.leave_alternate_screen();
+}
+
+/// Enter the screen; a failure part-way leaves it again before returning.
+fn setup_screen(modes: &mut impl ScreenModes, mouse: bool) -> io::Result<()> {
+    enter_screen(modes, mouse).inspect_err(|_| leave_screen(modes, mouse))
+}
+
+/// Owns raw mode, the alternate screen and (optionally) mouse capture.
+/// Dropping restores all of them, and a panic hook restores them before the
+/// panic message prints.
 pub struct TerminalGuard {
     terminal: Term,
 }
 
 impl TerminalGuard {
-    /// Enter raw mode and the alternate screen. The caller must have checked
-    /// that stdin and stdout are terminals.
-    pub fn enter() -> io::Result<Self> {
+    /// Enter raw mode and the alternate screen, with mouse capture when
+    /// `mouse_enabled`. The caller must have checked that stdin and stdout are
+    /// terminals. Any failure restores what was already changed.
+    pub fn enter(mouse_enabled: bool) -> io::Result<Self> {
         install_panic_hook(std::thread::current().id(), restore_terminal);
         enable_raw_mode()?;
-        let setup = execute!(io::stdout(), EnterAlternateScreen).and_then(|()| {
+        MOUSE_CAPTURE.store(mouse_enabled, Ordering::SeqCst);
+        let setup = setup_screen(&mut StdoutModes, mouse_enabled).and_then(|()| {
             let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
             terminal.hide_cursor()?;
             Ok(terminal)
@@ -194,17 +263,48 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
     }
 }
 
+/// Keys while a narrow terminal shows the preview instead of the list. `None`
+/// leaves the key to the ordinary roster handler.
+fn handle_preview_key(app: &mut App, code: KeyCode) -> Option<KeyAction> {
+    match code {
+        KeyCode::Char('q') => return Some(KeyAction::Quit),
+        KeyCode::Char('j') | KeyCode::Down => app.scroll_preview(1),
+        KeyCode::Char('k') | KeyCode::Up => app.scroll_preview(-1),
+        KeyCode::PageDown => app.scroll_preview(10),
+        KeyCode::PageUp => app.scroll_preview(-10),
+        KeyCode::Char('g') | KeyCode::Home => app.scroll_preview(isize::MIN),
+        KeyCode::Char('G') | KeyCode::End => app.scroll_preview(isize::MAX),
+        KeyCode::Enter => {
+            app.open_inspector();
+        }
+        KeyCode::Esc => app.focus_prev(),
+        _ => return None,
+    }
+    Some(KeyAction::None)
+}
+
 fn handle_roster_key(app: &mut App, code: KeyCode) -> KeyAction {
+    if app.preview_replaces_list()
+        && let Some(action) = handle_preview_key(app, code)
+    {
+        return action;
+    }
     match code {
         KeyCode::Char('q') => return KeyAction::Quit,
-        KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
-        KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
+        KeyCode::Char('j') | KeyCode::Down => app.move_focus(1),
+        KeyCode::Char('k') | KeyCode::Up => app.move_focus(-1),
+        KeyCode::Left | KeyCode::Char('h') => app.scroll_columns(-1),
+        KeyCode::Right | KeyCode::Char('l') => app.scroll_columns(1),
+        KeyCode::Char('J') => app.scroll_preview(1),
+        KeyCode::Char('K') => app.scroll_preview(-1),
         KeyCode::PageDown => app.move_selection(10),
         KeyCode::PageUp => app.move_selection(-10),
         KeyCode::Char('g') | KeyCode::Home => app.move_selection(isize::MIN),
         KeyCode::Char('G') | KeyCode::End => app.move_selection(isize::MAX),
         KeyCode::Enter => {
-            app.open_inspector();
+            if !app.activate_load_focus() {
+                app.open_inspector();
+            }
         }
         KeyCode::Char('/') => {
             app.begin_search();
@@ -215,6 +315,15 @@ fn handle_roster_key(app: &mut App, code: KeyCode) -> KeyAction {
         KeyCode::Char('s') => app.cycle_sort(),
         KeyCode::Char('S') => app.sort(app.sort_mode()),
         KeyCode::Char('r') => return KeyAction::Refresh,
+        KeyCode::Char('m') => {
+            app.load_more_roots();
+        }
+        KeyCode::Char(' ') if app.load_focus().is_none() => {
+            if let Some(key) = app.selected_key() {
+                app.select_session(&key);
+            }
+            app.toggle_children();
+        }
         _ => {}
     }
     KeyAction::None
@@ -324,8 +433,17 @@ fn handle_scroll_overlay_key(app: &mut App, code: KeyCode) -> KeyAction {
         KeyCode::Home => app.overlay_scroll(isize::MIN),
         KeyCode::End => app.overlay_scroll(isize::MAX),
         KeyCode::Char('x') => app.toggle_redaction(),
+        KeyCode::Char('m') if app.screen == Screen::Session => {
+            app.load_more_details();
+        }
+        KeyCode::Char(' ') | KeyCode::Enter if app.screen == Screen::Session => {
+            app.toggle_summaries();
+        }
         KeyCode::Char('v') if app.screen == Screen::Details => {
             app.open_selected_source();
+        }
+        KeyCode::Char('o') if app.screen == Screen::Details => {
+            app.open_tool_child_session();
         }
         KeyCode::Char('D') if app.screen == Screen::Details => {
             app.open_diagnostics();
@@ -370,16 +488,48 @@ pub fn flush_requests(app: &mut App, worker: &WorkerHandle) {
 /// Apply one worker event to the app and presentation context.
 pub fn apply_worker_event(app: &mut App, ctx: &mut RosterContext, event: WorkerEvent) {
     match event {
-        WorkerEvent::Roster {
-            generation,
-            sessions,
-            warnings,
-            scan,
+        WorkerEvent::Roster { snapshot, warnings } => {
+            app.apply_roster_snapshot(snapshot, warnings);
+        }
+        WorkerEvent::Children {
+            request_id,
+            parent,
+            metadata,
+            next,
         } => {
-            app.apply_roster_generation(generation, sessions, warnings, scan);
+            app.apply_children(request_id, &parent, metadata, next);
+        }
+        // Cached and completed preview facts, paged details, and slice progress.
+        WorkerEvent::Preview {
+            request_id,
+            key,
+            summary,
+            done,
+        } => {
+            app.apply_preview(request_id, key, summary, done);
+        }
+        WorkerEvent::Details {
+            request_id,
+            key,
+            page,
+        } => {
+            app.apply_details(request_id, key, page);
+        }
+        WorkerEvent::LoadProgress {
+            request_id,
+            records,
+            expanded_bytes,
+        } => {
+            app.apply_load_progress(
+                request_id,
+                crate::providers::WorkProgress {
+                    records,
+                    expanded_bytes,
+                },
+            );
         }
         WorkerEvent::Warning { warning } => app.apply_warning(warning),
-        WorkerEvent::LoadFailed { request_id } => app.transcript_load_failed(request_id),
+        WorkerEvent::LoadFailed { request_id } => app.load_failed(request_id),
         WorkerEvent::EventsAfter { request_id, count } => {
             app.apply_events_after(request_id, count);
         }
@@ -419,16 +569,41 @@ pub struct Respawned {
     pub notes: Receiver<Vec<String>>,
 }
 
-/// Run the roster until the user quits. `respawn` restarts a stopped worker
-/// when the user presses `r`; it must not block on provider I/O.
+/// Apply one terminal event: a key, a mouse event hit-tested against the
+/// geometry of `area` as it is now, or a resize. Pure state change: no I/O.
+pub fn handle_event(app: &mut App, event: Event, area: Rect) -> KeyAction {
+    match event {
+        Event::Key(key) => handle_key(app, key),
+        Event::Mouse(mouse) => {
+            // Pointer motion carries no action; skip building the geometry for it.
+            if mouse.kind != MouseEventKind::Moved {
+                let layout = RosterLayout::for_area(area, app.horizontal_column());
+                handle_mouse(app, mouse, &layout);
+            }
+            KeyAction::None
+        }
+        Event::Resize(width, _) => {
+            app.set_viewport_width(width);
+            KeyAction::None
+        }
+        _ => KeyAction::None,
+    }
+}
+
+/// Run the roster until the user quits. `start` is the first worker, whose readers
+/// are built on its own thread; `respawn` restarts a stopped worker when the user
+/// presses `r`; it must not block on provider I/O. `mouse_enabled` turns mouse
+/// capture on; keyboard operation never depends on it.
 pub fn run(
     app: &mut App,
     ctx: &mut RosterContext,
-    mut worker: WorkerHandle,
+    start: Respawned,
     respawn: &dyn Fn() -> Respawned,
+    mouse_enabled: bool,
 ) -> io::Result<()> {
-    let mut guard = TerminalGuard::enter()?;
-    let mut notes_rx: Option<Receiver<Vec<String>>> = None;
+    let mut guard = TerminalGuard::enter(mouse_enabled)?;
+    let Respawned { mut worker, notes } = start;
+    let mut notes_rx: Option<Receiver<Vec<String>>> = Some(notes);
     let mut last_clock = now_millis();
     app.set_now(last_clock);
     loop {
@@ -446,32 +621,34 @@ pub fn run(
             last_clock = now;
             app.set_now(now);
         }
+        let size = guard.terminal().size()?;
+        app.set_viewport_width(size.width);
         guard.terminal().draw(|frame| render(frame, app, ctx))?;
 
         if !event::poll(TICK)? {
             continue;
         }
-        // Handle this key and any already queued, then redraw once.
+        // Handle this event and any already queued, then redraw once.
         let mut quit = false;
         let mut handled = 0;
         loop {
-            if let Event::Key(key) = event::read()? {
-                match handle_key(app, key) {
-                    KeyAction::Quit => {
-                        quit = true;
-                        break;
-                    }
-                    KeyAction::Refresh if ctx.error.is_some() => {
-                        let replacement = respawn();
-                        worker = replacement.worker;
-                        notes_rx = Some(replacement.notes);
-                        reset_for_new_worker(app, ctx);
-                    }
-                    KeyAction::Refresh => {
-                        let _ = worker.tx.send(WorkerRequest::Refresh);
-                    }
-                    KeyAction::None => {}
+            let size = guard.terminal().size()?;
+            let area = Rect::new(0, 0, size.width, size.height);
+            match handle_event(app, event::read()?, area) {
+                KeyAction::Quit => {
+                    quit = true;
+                    break;
                 }
+                KeyAction::Refresh if ctx.error.is_some() => {
+                    let replacement = respawn();
+                    worker = replacement.worker;
+                    notes_rx = Some(replacement.notes);
+                    reset_for_new_worker(app, ctx);
+                }
+                KeyAction::Refresh => {
+                    app.refresh_roster();
+                }
+                KeyAction::None => {}
             }
             handled += 1;
             if handled >= MAX_KEYS_PER_FRAME || !event::poll(Duration::ZERO)? {
@@ -538,5 +715,100 @@ mod tests {
         assert_eq!(RESTORES.load(Ordering::SeqCst), 1);
 
         std::panic::set_hook(original);
+    }
+
+    /// Records the mode changes in order and can fail one step.
+    #[derive(Default)]
+    struct Recorder {
+        log: Vec<&'static str>,
+        fail: Option<&'static str>,
+    }
+
+    impl Recorder {
+        fn step(&mut self, name: &'static str) -> io::Result<()> {
+            self.log.push(name);
+            if self.fail == Some(name) {
+                Err(io::Error::other("injected"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ScreenModes for Recorder {
+        fn enter_alternate_screen(&mut self) -> io::Result<()> {
+            self.step("screen on")
+        }
+
+        fn leave_alternate_screen(&mut self) -> io::Result<()> {
+            self.step("screen off")
+        }
+
+        fn set_mouse_capture(&mut self, on: bool) -> io::Result<()> {
+            self.step(if on { "capture on" } else { "capture off" })
+        }
+    }
+
+    #[test]
+    fn mouse_capture_is_entered_only_when_enabled() {
+        let mut on = Recorder::default();
+        setup_screen(&mut on, true).unwrap();
+        assert_eq!(on.log, ["screen on", "capture on"]);
+
+        let mut off = Recorder::default();
+        setup_screen(&mut off, false).unwrap();
+        assert_eq!(off.log, ["screen on"], "--no-mouse never captures");
+        leave_screen(&mut off, false);
+        assert_eq!(
+            off.log,
+            ["screen on", "screen off"],
+            "and never releases what it did not take"
+        );
+    }
+
+    #[test]
+    fn leaving_releases_capture_first_and_attempts_every_step() {
+        let mut ok = Recorder::default();
+        leave_screen(&mut ok, true);
+        assert_eq!(ok.log, ["capture off", "screen off"]);
+
+        let mut broken = Recorder {
+            fail: Some("capture off"),
+            ..Recorder::default()
+        };
+        leave_screen(&mut broken, true);
+        assert_eq!(
+            broken.log,
+            ["capture off", "screen off"],
+            "a failed release still leaves the alternate screen"
+        );
+    }
+
+    #[test]
+    fn a_failed_setup_rolls_back_whatever_was_entered_and_reports_the_error() {
+        let mut capture_fails = Recorder {
+            fail: Some("capture on"),
+            ..Recorder::default()
+        };
+        let error = setup_screen(&mut capture_fails, true).unwrap_err();
+        assert_eq!(error.to_string(), "injected");
+        assert_eq!(
+            capture_fails.log,
+            ["screen on", "capture on", "capture off", "screen off"]
+        );
+
+        let mut screen_fails = Recorder {
+            fail: Some("screen on"),
+            ..Recorder::default()
+        };
+        assert!(setup_screen(&mut screen_fails, true).is_err());
+        assert_eq!(screen_fails.log, ["screen on", "capture off", "screen off"]);
+
+        let mut no_mouse = Recorder {
+            fail: Some("screen on"),
+            ..Recorder::default()
+        };
+        assert!(setup_screen(&mut no_mouse, false).is_err());
+        assert_eq!(no_mouse.log, ["screen on", "screen off"]);
     }
 }

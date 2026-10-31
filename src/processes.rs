@@ -12,12 +12,12 @@ use std::path::PathBuf;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use thiserror::Error;
 
-use crate::domain::{ProcessAssociation, Provider, SessionSummary, Timestamp};
+use crate::domain::{Harness, ProcessAssociation, SessionSummary, Timestamp};
 use crate::ingest::text;
 
 const HINT_MAX_BYTES: usize = 160;
 const HINT_MAX_COLS: usize = 120;
-/// Runtimes that may host a provider CLI script (`node …/opencode`).
+/// Runtimes that may host a harness CLI script (`node …/opencode`).
 const RUNTIMES: [&str; 3] = ["node", "bun", "deno"];
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -107,11 +107,14 @@ fn stem(path: &str) -> String {
     base
 }
 
-fn provider_name(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Codex => "codex",
-        Provider::Claude => "claude",
-        Provider::OpenCode => "opencode",
+fn harness_name(harness: Harness) -> &'static str {
+    match harness {
+        Harness::Codex => "codex",
+        Harness::Claude => "claude",
+        Harness::OpenCode => "opencode",
+        Harness::Omp => "omp",
+        Harness::Hermes => "hermes",
+        Harness::Pi => "pi",
     }
 }
 
@@ -164,11 +167,11 @@ fn runtime_script(argv: &[&str]) -> Option<usize> {
     None
 }
 
-/// Index of the provider program in `argv`: argv[0], or the script actually
+/// Index of the harness program in `argv`: argv[0], or the script actually
 /// executed by a script runtime (`node /path/opencode …`). Script arguments
 /// are never treated as the program.
-fn locate(provider: Provider, argv: &[&str]) -> Option<usize> {
-    let name = provider_name(provider);
+fn locate(harness: Harness, argv: &[&str]) -> Option<usize> {
+    let name = harness_name(harness);
     if stem(argv.first()?) == name {
         return Some(0);
     }
@@ -178,26 +181,27 @@ fn locate(provider: Provider, argv: &[&str]) -> Option<usize> {
     None
 }
 
-/// True when `argv` (including argv[0]) names the provider program and carries
+/// True when `argv` (including argv[0]) names the harness program and carries
 /// `id` in an identity-bearing position. Prompt text and other subcommands never match.
-pub fn identity_matches(provider: Provider, argv: &[&str], id: &str) -> bool {
+pub fn identity_matches(harness: Harness, argv: &[&str], id: &str) -> bool {
     if id.is_empty() {
         return false;
     }
-    let Some(at) = locate(provider, argv) else {
+    let Some(at) = locate(harness, argv) else {
         return false;
     };
     let args = &argv[at + 1..];
-    match provider {
-        Provider::Codex => match args {
+    match harness {
+        Harness::Codex => match args {
             ["resume", got, ..] => *got == id,
             ["exec", "resume", got, ..] => *got == id,
             _ => false,
         },
-        Provider::Claude => {
-            flag_value(args, &["-r", "--resume"], "--resume=", "--fork-session", id)
-        }
-        Provider::OpenCode => flag_value(args, &["-s", "--session"], "--session=", "--fork", id),
+        Harness::Claude => flag_value(args, &["-r", "--resume"], "--resume=", "--fork-session", id),
+        Harness::OpenCode => flag_value(args, &["-s", "--session"], "--session=", "--fork", id),
+        // No supported resume/session argument is verified for these yet, so a
+        // process can only ever be a candidate.
+        Harness::Omp | Harness::Hermes | Harness::Pi => false,
     }
 }
 
@@ -297,25 +301,25 @@ fn argv_refs(p: &ProcessInfo) -> Option<Vec<&str>> {
         .map(|a| a.iter().map(String::as_str).collect())
 }
 
-fn is_candidate(provider: Provider, p: &ProcessInfo) -> bool {
-    if stem(&p.executable) == provider_name(provider) {
+fn is_candidate(harness: Harness, p: &ProcessInfo) -> bool {
+    if stem(&p.executable) == harness_name(harness) {
         return true;
     }
     argv_refs(p).is_some_and(|a| {
-        locate(provider, &a).is_some()
-            // A runtime running some other script that mentions the provider is
+        locate(harness, &a).is_some()
+            // A runtime running some other script that mentions the harness is
             // only a candidate, never a strong match.
             || (RUNTIMES.contains(&stem(a[0]).as_str())
-                && a[1..].iter().any(|x| stem(x) == provider_name(provider)))
+                && a[1..].iter().any(|x| stem(x) == harness_name(harness)))
     })
 }
 
-/// Processes that look like the provider's CLI. Candidates are not matches.
-pub fn candidates(provider: Provider, snapshot: &ProcessSnapshot) -> Vec<&ProcessInfo> {
+/// Processes that look like the harness's CLI. Candidates are not matches.
+pub fn candidates(harness: Harness, snapshot: &ProcessSnapshot) -> Vec<&ProcessInfo> {
     snapshot
         .processes
         .iter()
-        .filter(|p| is_candidate(provider, p))
+        .filter(|p| is_candidate(harness, p))
         .collect()
 }
 
@@ -395,16 +399,16 @@ pub fn association_from_observation(
 }
 
 /// Strong match only through an identity-bearing argument. Otherwise
-/// same-provider processes are counted as candidates; if the OS withheld the
-/// arguments of a runtime that could be hosting the provider, the answer is
+/// same-harness processes are counted as candidates; if the OS withheld the
+/// arguments of a runtime that could be hosting the harness, the answer is
 /// `Unavailable` rather than a false `Unmatched`.
 pub fn associate(session: &SessionSummary, snapshot: &ProcessSnapshot) -> ProcessAssociation {
-    let provider = session.key.provider;
-    let id = session.key.provider_session_id.as_str();
+    let harness = session.meta.key.harness;
+    let id = session.meta.key.native_id.as_str();
     let matched = snapshot
         .processes
         .iter()
-        .filter(|p| argv_refs(p).is_some_and(|a| identity_matches(provider, &a, id)))
+        .filter(|p| argv_refs(p).is_some_and(|a| identity_matches(harness, &a, id)))
         .min_by_key(|p| (p.started_at.unwrap_or(Timestamp::MAX), p.pid));
     if let Some(p) = matched {
         return ProcessAssociation::Matched {
@@ -415,7 +419,7 @@ pub fn associate(session: &SessionSummary, snapshot: &ProcessSnapshot) -> Proces
     let count = snapshot
         .processes
         .iter()
-        .filter(|p| is_candidate(provider, p))
+        .filter(|p| is_candidate(harness, p))
         .count();
     if count > 0 {
         return ProcessAssociation::Candidates { count };

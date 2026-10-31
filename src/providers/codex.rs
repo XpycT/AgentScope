@@ -14,24 +14,46 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::DateTime;
 use serde_json::Value;
 
-use super::{ProviderDelta, ProviderError, ProviderReader, SourceRecord};
+use super::probe::{HEAD_RECORDS, probe_file, probe_value};
+
+mod metadata;
+use super::{
+    Admit, DiscoveryDelta, FORGOTTEN_CAP, Forgotten, HydrationDelta, JobLedger, ProviderError,
+    ProviderReader, ReadJobId, ReadProgress, Retention, SourceRecord, WorkProgress,
+};
 use crate::config::Config;
-use crate::discovery::{SourceFile, discover_codex};
+use crate::discovery::{SourceFile, Walk, is_rollout_name};
 use crate::domain::{
-    Actor, AggregationClass, BoundedText, CostEstimate, DiagnosticEntry, Event, EventKind,
-    Lifecycle, Lineage, LocatorKind, PageAnchor, PageDirection, PageRequest, ProcessAssociation,
-    Provenance, Provider, RefreshBudget, ScanProgress, SessionKey, SessionLink, SessionSummary,
-    SourceKey, SourceLocator, Timestamp, TokenCategories, ToolInteraction, ToolStatus,
-    TranscriptPage, UsageSummary, Warning, WarningKey, WarningKind,
+    ActivityStamp, Actor, AggregationClass, BoundedText, CompactionObservation, CompactionScope,
+    CostEstimate, DiagnosticEntry, Event, EventKind, Harness, InputAccounting, Lifecycle, Lineage,
+    LocatorKind, ModelDetail, OutputAccounting, PageAnchor, PageDirection, PageRequest,
+    ProcessAssociation, Provenance, RecordedMoney, RefreshBudget, ReleaseState, ScanProgress,
+    SessionDetailPage, SessionKey, SessionLink, SessionMetadata, SessionMetrics, SessionSummary,
+    SourceKey, SourceLocator, SpeedSummary, Timestamp, TokenAccounting, TokenCategories,
+    ToolInteraction, ToolStatus, TranscriptPage, UsageCoverage, UsageSummary, Warning, WarningKey,
+    WarningKind,
 };
 use crate::ingest::jsonl::{ContentHash, JsonlCursor, Record};
+use crate::ingest::source::{SourceItem, SourceReader, SourceRecordProgress};
 use crate::ingest::text::{display_safe, preview, sanitize};
-use crate::usage::{codex_total, estimate_cost};
+use crate::metrics::{TurnTracker, compaction_summary, context_usage, current_context};
+use crate::usage::{Attribution, aggregate_cost, aggregate_summary, codex_total};
+use metadata::{
+    CodexOwnership, CodexParentEvidence, OwnedUsage, add_origin, codex_origin, codex_parent,
+    parse_usage, probe_archive_head,
+};
+
+/// Transcript indexes kept at once: every in-progress one is retained so two large live
+/// sessions never restart each other; completed ones are dropped first when full.
+const MAX_INDEXES: usize = 8;
+
+/// Compaction markers retained per session; more mark the history incomplete.
+const MAX_COMPACTIONS: usize = 256;
 
 /// Unpaired calls and orphan outputs tracked per session (each).
 const MAX_TRACKED: usize = 256;
@@ -94,21 +116,6 @@ fn path_field(v: &Value, key: &str) -> Option<PathBuf> {
 fn parse_ts(v: &Value) -> Option<Timestamp> {
     let parsed = DateTime::parse_from_rfc3339(v.as_str()?).ok()?;
     Some(parsed.timestamp_millis())
-}
-
-fn parse_usage(v: &Value) -> Option<TokenCategories> {
-    let o = v.as_object()?;
-    let get = |k: &str| o.get(k).and_then(Value::as_u64);
-    let c = TokenCategories {
-        input: get("input_tokens"),
-        cached_input: get("cached_input_tokens"),
-        cache_write: get("cache_write_input_tokens"),
-        output: get("output_tokens"),
-        reasoning: get("reasoning_output_tokens"),
-        total: get("total_tokens"),
-        ..TokenCategories::default()
-    };
-    (c.input.is_some() || c.output.is_some() || c.total.is_some()).then_some(c)
 }
 
 fn is_injected(text: &str) -> bool {
@@ -225,11 +232,30 @@ struct Parsed {
     parent: Option<String>,
     nickname: Option<String>,
     created_at: Option<Timestamp>,
+    /// Recorded launch-surface evidence of the identity header.
+    origins: Vec<crate::domain::OriginObservation>,
+    /// Full header relationship evidence (immediate parent, root thread, role).
+    evidence: CodexParentEvidence,
+    /// Child-owned usage boundary and the inherited baseline it subtracts.
+    ownership: CodexOwnership,
+    /// Part of the copied prefix carried a counter we could not attribute.
+    usage_unproven: bool,
+    /// Zero-based ordinal of the record `apply` is processing.
+    ordinal: u64,
+    /// Records consumed from this source (including malformed/oversized lines).
+    records: u64,
     models: Vec<String>,
     prompt_title: Option<String>,
     record_usage: Option<TokenCategories>,
     count_usage: Option<TokenCategories>,
     context_window: Option<u64>,
+    /// Latest request's prompt occupancy (`last_token_usage.input_tokens`) with its
+    /// record time and the compaction epoch it was recorded in.
+    last_prompt: Option<(u64, Option<Timestamp>, u64)>,
+    turns: TurnTracker,
+    /// `(offset, time)` of the newest [`MAX_COMPACTIONS`] `compacted` records.
+    compactions: Vec<(u64, Option<Timestamp>)>,
+    compaction_total: u64,
     /// `Some(true)` after `task_started`, `Some(false)` after `task_complete`.
     turn_open: Option<bool>,
     last_completion: Option<Timestamp>,
@@ -296,6 +322,9 @@ impl Parsed {
     fn reopen_turn(&mut self) {
         if self.turn_open == Some(false) {
             self.turn_open = Some(true);
+            // The new turn began before (or without) a `task_started`, so its span is
+            // not fully recorded: active coverage can no longer be complete.
+            self.turns.mark_incomplete();
         }
     }
 
@@ -323,16 +352,27 @@ impl Parsed {
                 }
                 self.display(ts);
             }
-            Class::Reasoning(_) | Class::Compaction(_) => self.display(ts),
+            Class::Reasoning(_) => self.display(ts),
+            Class::Compaction(_) => {
+                self.display(ts);
+                self.compaction_total += 1;
+                // Keep the newest markers: `latest` must describe the newest event.
+                if self.compactions.len() >= MAX_COMPACTIONS {
+                    self.compactions.remove(0);
+                }
+                self.compactions.push((offset, ts));
+            }
             Class::Tool(item) => self.tool_completed(item, ts),
             Class::Turn { started } => {
                 self.display(ts);
                 if started {
                     self.turn_open = Some(true);
                     self.window(payload);
+                    self.turns.start(ts);
                 } else {
                     self.turn_open = Some(false);
                     self.last_completion = ts;
+                    self.turns.end(ts);
                 }
             }
             Class::Call(p) => self.call(offset, p, ts),
@@ -362,10 +402,23 @@ impl Parsed {
             Some("event_msg") => match field(payload, "type").as_str() {
                 Some("token_count") => {
                     let info = field(payload, "info");
-                    if let Some(total) = parse_usage(field(info, "total_token_usage")) {
-                        self.count_usage = Some(total);
+                    let raw_total = field(info, "total_token_usage");
+                    if let Some(total) = parse_usage(raw_total) {
+                        let owned = if self.is_child() {
+                            self.owned_categories(self.ordinal, raw_total)
+                        } else {
+                            Some(total)
+                        };
+                        if let Some(total) = owned {
+                            self.count_usage = Some(total);
+                        }
                     }
                     self.window(info);
+                    if let Some(prompt) =
+                        field(field(info, "last_token_usage"), "input_tokens").as_u64()
+                    {
+                        self.last_prompt = Some((prompt, ts, self.compaction_total));
+                    }
                 }
                 Some("token_usage_record") => self.usage_record(payload),
                 _ => {}
@@ -385,15 +438,58 @@ impl Parsed {
         }
         self.version = text_field(p, "cli_version");
         self.created_at = parse_ts(field(p, "timestamp")).or(ts);
-        let source = field(p, "source");
-        let spawn = field(field(source, "subagent"), "thread_spawn");
-        let subagent = field(source, "subagent");
-        self.parent = [p, spawn, subagent, source]
-            .iter()
-            .find_map(|v| text_field(v, "parent_thread_id"));
-        self.nickname = [p, spawn, subagent]
-            .iter()
-            .find_map(|v| text_field(v, "agent_nickname"));
+        let evidence = codex_parent(p);
+        self.parent = evidence.parent_thread.clone();
+        self.nickname = evidence.agent_nickname.clone();
+        self.ownership =
+            CodexOwnership::new(evidence.history_boundary, evidence.boundary_supported);
+        self.evidence = evidence;
+        if let Some(origin) = codex_origin(p, ts) {
+            add_origin(&mut self.origins, origin);
+        }
+    }
+
+    /// A spawned child or a guardian review, including a header that proves the
+    /// spawn only through `source.subagent.thread_spawn`.
+    fn is_child(&self) -> bool {
+        self.evidence.is_child
+    }
+
+    /// A spawned child thread (not a review), the only shape marked as a sidechain.
+    fn is_spawned(&self) -> bool {
+        self.evidence.is_spawned
+    }
+
+    /// A usage record naming a thread other than this rollout is copied evidence, not
+    /// this session's spend. Before the declared boundary it may still supply the
+    /// inherited baseline; after it, it is ignored.
+    fn names_other_thread(&self, body: &Value) -> bool {
+        match (text_field(body, "thread_id"), self.id.as_deref()) {
+            (Some(named), Some(own)) => named != own,
+            _ => false,
+        }
+    }
+
+    /// The owned cumulative categories of one usage body, when the header proves how
+    /// to separate them from inherited copies.
+    fn owned_categories(&mut self, ordinal: u64, body: &Value) -> Option<TokenCategories> {
+        if self.names_other_thread(body)
+            && self
+                .ownership
+                .first_owned_ordinal
+                .is_some_and(|first| ordinal >= first)
+        {
+            return None;
+        }
+        match metadata::apply_owned_usage(&mut self.ownership, ordinal, body) {
+            OwnedUsage::Delta(delta) => Some(delta.categories),
+            OwnedUsage::Snapshot(categories) => Some(categories),
+            OwnedUsage::Inherited => None,
+            OwnedUsage::Unknown => {
+                self.usage_unproven = true;
+                None
+            }
+        }
     }
 
     /// A call is source-only once its output arrives; until then it renders as a
@@ -476,58 +572,81 @@ impl Parsed {
         self.prefix = hash.map(|h| (end, h));
     }
 
+    /// An archived source is addressed by record ordinal; its generation is the
+    /// decoder's, so replacement is detected by the streaming reader itself.
+    fn set_archive_end(&mut self, records: u64, generation: u64) {
+        self.end = records;
+        self.generation = generation;
+    }
+
     fn usage_record(&mut self, body: &Value) {
-        if let Some(thread) = parse_usage(field(body, "thread_token_usage")) {
+        self.window(body);
+        let ordinal = self.ordinal;
+        let current = if self.is_child() {
+            self.owned_categories(ordinal, body)
+        } else {
+            parse_usage(field(body, "thread_token_usage"))
+        };
+        if let Some(thread) = current {
             self.record_usage = Some(thread);
         }
-        self.window(body);
     }
 }
 
 struct FileState {
     source: SourceFile,
+    /// Canonical, uncompressed identity the published session key uses.
+    canonical: PathBuf,
+    /// The source was discovered under the native archived store (user-visible
+    /// location state, independent of how its bytes are addressed).
+    archived: bool,
+    /// Address the source as a compressed stream: expanded ordinals, not byte offsets.
+    compressed: bool,
     cursor: Option<JsonlCursor>,
+    /// Streaming decoder of a compressed rollout; its continuation is per session.
+    archive: Option<SourceReader>,
     parsed: Parsed,
     rotations_seen: u64,
     rotation_warnings: u32,
     reached_eof: bool,
     available: bool,
-    /// Unavailable at the end of a completed pass; expires after the next one.
-    retained: bool,
-    dirty: bool,
-    /// Already-parsed content was rewritten or rotated; consumed by the next delta.
+    /// Already-parsed content was rewritten or rotated; reported by the next `discover`.
     invalidated: bool,
-    /// Key last sent to consumers, so an ID change can retire the old row.
-    emitted: Option<SessionKey>,
-    /// Duplicate-ID count and parent link as last emitted.
-    context: (usize, Option<SessionLink>),
+    /// Session ID this state was requested under. Discovery fixes a source's key from
+    /// its bounded header probe; hydration must answer to the same key.
+    pinned: Option<String>,
+    /// Recency tick for bounded eviction.
+    used: u64,
 }
 
 impl FileState {
-    fn new(source: SourceFile) -> Self {
+    fn new(source: SourceFile, canonical: PathBuf, archived: bool) -> Self {
+        let compressed = CodexScanner::compressed(&source.path);
         Self {
             source,
+            canonical,
+            archived,
+            compressed,
             cursor: None,
+            archive: None,
             parsed: Parsed::default(),
             rotations_seen: 0,
             rotation_warnings: 0,
             reached_eof: false,
             available: true,
-            retained: false,
-            dirty: true,
             invalidated: false,
-            emitted: None,
-            context: (1, None),
+            pinned: None,
+            used: 0,
         }
     }
 
     fn restart(&mut self, source: SourceFile) {
         self.source = source;
         self.cursor = None;
+        self.archive = None;
         self.parsed = Parsed::default();
         self.rotations_seen = 0;
         self.reached_eof = false;
-        self.dirty = true;
     }
 
     /// Records what the scan consumed (metadata, identity, and for very large files
@@ -574,22 +693,24 @@ impl FileState {
     }
 
     fn stem(&self) -> String {
-        self.source
-            .path
+        self.canonical
             .file_stem()
             .map(|s| sanitize(&s.to_string_lossy()))
             .unwrap_or_default()
     }
 
     fn id(&self) -> String {
-        self.parsed.id.clone().unwrap_or_else(|| self.stem())
+        self.pinned
+            .clone()
+            .or_else(|| self.parsed.id.clone())
+            .unwrap_or_else(|| self.stem())
     }
 
     fn key(&self) -> SessionKey {
         SessionKey {
-            provider: Provider::Codex,
-            provider_session_id: self.id(),
-            source: SourceKey::File(self.source.path.clone()),
+            harness: Harness::Codex,
+            native_id: self.id(),
+            source: SourceKey::File(self.canonical.clone()),
         }
     }
 
@@ -600,11 +721,23 @@ impl FileState {
             i64::try_from(since.as_millis()).ok()
         })
     }
-}
 
-struct Pass {
-    sources: Vec<SourceFile>,
-    next: usize,
+    /// Latest persisted activity: a record timestamp is Reported; the file's
+    /// modified time is only a Derived stand-in.
+    fn activity(&self) -> ActivityStamp {
+        let class = if self.parsed.last_persisted.is_some() {
+            AggregationClass::Reported
+        } else {
+            AggregationClass::Derived
+        };
+        match self.persisted_at() {
+            Some(at) => ActivityStamp {
+                at: Some(at),
+                class,
+            },
+            None => ActivityStamp::default(),
+        }
+    }
 }
 
 enum Advance {
@@ -630,7 +763,7 @@ impl Meter {
 fn warn(path: &Path, label: &str, kind: WarningKind, message: String, count: u32) -> Warning {
     Warning {
         key: WarningKey {
-            provider: Provider::Codex,
+            harness: Harness::Codex,
             source: format!("{}{label}", path.display()),
             kind,
         },
@@ -639,29 +772,246 @@ fn warn(path: &Path, label: &str, kind: WarningKind, message: String, count: u32
     }
 }
 
+impl Meter {
+    fn new(budget: RefreshBudget) -> Self {
+        Self {
+            started: Instant::now(),
+            records: 0,
+            bytes: 0,
+            budget,
+        }
+    }
+
+    fn progress(&self) -> WorkProgress {
+        WorkProgress {
+            records: self.records,
+            expanded_bytes: self.bytes,
+        }
+    }
+}
+
+/// Lightweight facts about one discovered source. The full parse lives in `states`.
+struct Known {
+    key: SessionKey,
+    len: u64,
+    modified: SystemTime,
+    /// Discovery pass that last saw this source.
+    pass: u64,
+    /// Latest activity as probed (a tail record time, else the modified time).
+    activity: Option<Timestamp>,
+    /// The source could be opened; an unreadable one is probed again every pass.
+    available: bool,
+    /// Native store this physical source belongs to.
+    store: usize,
+    /// The source sits in the native archived store.
+    archived: bool,
+    /// Immediate parent thread the header declares, when any.
+    parent: Option<String>,
+}
+
+/// File names and ID fallback for sources whose header the probe could not read.
+fn stem_of(path: &Path) -> String {
+    crate::ingest::source::canonical_rollout_identity(path)
+        .file_stem()
+        .map(|s| sanitize(&s.to_string_lossy()))
+        .unwrap_or_default()
+}
+
+fn modified_ms(modified: SystemTime) -> Option<Timestamp> {
+    let since = modified.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_millis()).ok()
+}
+
+/// The session facts shared by discovery probes and hydrated summaries.
+fn build_meta(
+    p: &Parsed,
+    id: String,
+    canonical: &Path,
+    activity: ActivityStamp,
+    available: bool,
+    parent: Option<SessionLink>,
+    archived: bool,
+) -> SessionMetadata {
+    let (title, title_derived) = match (&p.nickname, &p.prompt_title) {
+        (Some(nick), _) => (title_from(nick).unwrap_or_else(|| id.clone()), false),
+        (None, Some(prompt)) => (prompt.clone(), true),
+        (None, None) => (id.clone(), false),
+    };
+    let child = p.is_spawned();
+    let fork = p
+        .evidence
+        .forked_from
+        .clone()
+        .filter(|_| !child)
+        .map(SessionLink::Unresolved);
+    SessionMetadata {
+        key: SessionKey {
+            harness: Harness::Codex,
+            native_id: id,
+            source: SourceKey::File(canonical.to_path_buf()),
+        },
+        title,
+        title_derived,
+        project: p
+            .cwd
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned()),
+        cwd: p.cwd.clone(),
+        model: p.models.last().map(|id| ModelDetail {
+            id: id.clone(),
+            provider: None,
+            variant: None,
+            effort: None,
+            configured_effort: None,
+        }),
+        origins: p.origins.clone(),
+        created_at: p.created_at,
+        activity,
+        lineage: Lineage {
+            parent,
+            fork,
+            sidechain: child,
+            agent_type: p.evidence.agent_role.clone(),
+            spawn_depth: p.evidence.spawn_depth,
+            ..Lineage::default()
+        },
+        members: vec![],
+        archived,
+        released: ReleaseState::Unknown,
+        source_available: available,
+        harness_version: p.version.clone(),
+    }
+}
+
+fn limit_warning(cap: usize) -> Warning {
+    Warning {
+        key: WarningKey {
+            harness: Harness::Codex,
+            source: "metadata-limit".into(),
+            kind: WarningKind::Unsupported,
+        },
+        message: format!(
+            "Discovery limited: only the newest {cap} Codex sources are tracked; \
+             raise max_metadata_sources to see more"
+        ),
+        count: 1,
+    }
+}
+
+/// A Codex rollout root: the native sessions store, an explicit extra store, or the
+/// native archived store. Roots of one native store share a `store` ID, so identical
+/// session IDs across stores are never folded together.
+#[derive(Clone, Debug)]
+struct RootSpec {
+    path: PathBuf,
+    archived: bool,
+    store: usize,
+    /// The user named it, so a missing root is reported.
+    explicit: bool,
+}
+
+/// Discovery output accumulated across one call.
+#[derive(Default)]
+struct Found {
+    sessions: Vec<SessionMetadata>,
+    removed: Vec<SessionKey>,
+    warnings: Vec<Warning>,
+}
+
 pub struct CodexScanner {
     config: Config,
+    /// Hydrated (or hydrating) sessions, bounded by `max_cached_sessions`.
     states: HashMap<PathBuf, FileState>,
-    /// Sources that stayed unreadable for a full refresh; probed silently until readable.
-    expired: HashSet<PathBuf>,
-    pass: Option<Pass>,
+    walk: Option<Walk>,
+    /// Root currently being walked, carried across discovery slices.
+    walk_root: Option<RootSpec>,
+    /// Rollout roots known to this scanner, in preference order.
+    roots: Vec<RootSpec>,
+    /// Roots still to be walked in this pass.
+    queue: VecDeque<usize>,
+    pass_id: u64,
+    pass_sources: usize,
+    /// Every source the last passes discovered.
+    known: HashMap<PathBuf, Known>,
+    /// Logical sessions per native ID inside one store, for duplicate detection.
+    by_id: HashMap<String, Vec<SessionKey>>,
+    /// Published logical key → the physical source currently read for it.
+    current: HashMap<SessionKey, PathBuf>,
+    /// Logical keys some physical source represented in the running pass.
+    seen_keys: HashSet<SessionKey>,
+    /// Latest discovery metadata per logical key, so a representation switch can
+    /// republish the row without re-reading the source.
+    last_meta: HashMap<SessionKey, SessionMetadata>,
+    invalidated: Vec<SessionKey>,
+    ledger: JobLedger,
+    /// Newest-first retention that bounds `known`/`by_id` to the metadata ceiling.
+    retention: Retention<PathBuf>,
+    /// Evicted sources that may still be frozen into a roster or read by a job.
+    forgotten: Forgotten<PathBuf, SessionKey>,
+    /// Decoders for archived records, one per `(session, job)`.
+    archives: HashMap<(SessionKey, ReadJobId), ArchiveJob>,
     /// Page index of the one session being inspected.
-    index: Option<Index>,
+    indexes: HashMap<PathBuf, Option<Index>>,
     index_limits: IndexLimits,
+    tick: u64,
 }
 
 impl CodexScanner {
+    /// Cheap: no filesystem access until the first `discover`.
     pub fn new(config: &Config) -> Result<Self, ProviderError> {
+        let mut roots = Vec::new();
+        let store = 0usize;
+        if let Some(root) = config.harnesses.codex.root.clone() {
+            roots.push(RootSpec {
+                path: root,
+                archived: false,
+                store,
+                explicit: true,
+            });
+        }
+        // The archived store belongs to the same native store as the primary root.
+        if let Some(archived) = config.harnesses.codex.archived.clone() {
+            roots.push(RootSpec {
+                path: archived,
+                archived: true,
+                store,
+                explicit: config.harnesses.codex.archived_explicit,
+            });
+        }
+        for (store, extra) in config.harnesses.codex.extra_roots.iter().enumerate() {
+            roots.push(RootSpec {
+                path: extra.clone(),
+                archived: false,
+                store: store + 1,
+                explicit: true,
+            });
+        }
         Ok(Self {
             config: config.clone(),
             states: HashMap::new(),
-            expired: HashSet::new(),
-            pass: None,
-            index: None,
+            walk: None,
+            walk_root: None,
+            roots,
+            queue: VecDeque::new(),
+            pass_id: 0,
+            pass_sources: 0,
+            known: HashMap::new(),
+            by_id: HashMap::new(),
+            current: HashMap::new(),
+            seen_keys: HashSet::new(),
+            last_meta: HashMap::new(),
+            invalidated: Vec::new(),
+            ledger: JobLedger::default(),
+            retention: Retention::new(config.max_metadata_sources, config.max_metadata_bytes),
+            forgotten: Forgotten::new(FORGOTTEN_CAP),
+            archives: HashMap::new(),
+            indexes: HashMap::new(),
             index_limits: IndexLimits {
                 step: INDEX_STEP,
                 cap: INDEX_CAP,
             },
+            tick: 0,
         })
     }
 
@@ -679,114 +1029,926 @@ impl CodexScanner {
         self.states.values().filter(|s| s.cursor.is_some()).count()
     }
 
-    /// Reads as many new records as `budget` allows and returns the sessions that
-    /// changed. `scan.done` is false while files remain; call again to continue.
-    pub fn scan_roster(
-        &mut self,
-        _now: Timestamp,
-        budget: RefreshBudget,
-    ) -> Result<ProviderDelta, ProviderError> {
-        let mut warnings = Vec::new();
-        let mut pass = match self.pass.take() {
-            Some(pass) => pass,
-            None => {
-                let found = discover_codex(&self.config)?;
-                warnings = found.warnings;
-                Pass {
-                    sources: found.sources,
-                    next: 0,
-                }
-            }
-        };
-        let mut meter = Meter {
-            started: Instant::now(),
-            records: 0,
-            bytes: 0,
-            budget,
-        };
-        while pass.next < pass.sources.len() {
-            let source = pass.sources[pass.next].clone();
-            let keep = pass.next < KEEP_CURSORS;
-            match self.advance(source, keep, &mut meter) {
-                Advance::Done => pass.next += 1,
-                Advance::Exhausted => break,
-            }
+    /// The index slot of `path`, making room by dropping a completed index first.
+    fn index_slot<'a>(
+        indexes: &'a mut HashMap<PathBuf, Option<Index>>,
+        path: &Path,
+    ) -> Option<&'a mut Option<Index>> {
+        if !indexes.contains_key(path) && indexes.len() >= MAX_INDEXES {
+            // Only completed indexes may be dropped; when every slot is a live
+            // in-progress index the caller leaves the new job pending instead.
+            let victim = indexes
+                .iter()
+                .find(|(_, i)| i.as_ref().is_none_or(|i| !i.building))
+                .map(|(p, _)| p.clone())?;
+            indexes.remove(&victim);
         }
-        let done = pass.next >= pass.sources.len();
-        let mut removed = Vec::new();
-        if done {
-            let live: HashSet<&Path> = pass.sources.iter().map(|s| s.path.as_path()).collect();
-            self.expired.retain(|p| live.contains(p.as_path()));
-            let mut gone: Vec<(PathBuf, &str, &str)> = Vec::new();
-            for (path, state) in &mut self.states {
-                if !live.contains(path.as_path()) {
-                    gone.push((
-                        path.clone(),
-                        "#removed",
-                        "session file is no longer present",
-                    ));
-                } else if !state.available && state.retained {
-                    gone.push((
-                        path.clone(),
-                        "#expired",
-                        "source stayed unreadable; row removed",
-                    ));
-                } else if !state.available {
-                    state.retained = true;
-                }
-            }
-            for (path, label, message) in gone {
-                if let Some(state) = self.states.remove(&path) {
-                    if label == "#expired" {
-                        self.expired.insert(path.clone());
-                    }
-                    removed.extend(state.emitted.clone());
-                    warnings.push(warn(
-                        &path,
-                        label,
-                        WarningKind::Unavailable,
-                        message.into(),
-                        1,
-                    ));
-                }
-            }
-        }
-        let scan = ScanProgress {
-            provider: Provider::Codex,
-            scanned: pass.next,
-            total: Some(pass.sources.len()),
-            done,
-        };
-        if !done {
-            self.pass = Some(pass);
-        }
-        let (sessions, retired, invalidated) = self.emit_changed();
-        removed.extend(retired);
-        Ok(ProviderDelta {
-            sessions,
-            removed,
-            invalidated,
-            warnings,
-            scan,
-        })
+        Some(indexes.entry(path.to_path_buf()).or_insert(None))
     }
 
-    fn advance(&mut self, source: SourceFile, keep: bool, meter: &mut Meter) -> Advance {
-        let max_record_bytes = self.config.max_record_bytes;
-        if self.expired.contains(&source.path) {
-            if std::fs::File::open(&source.path).is_err() {
+    /// Sessions with retained hydration state (bounded by `max_cached_sessions`).
+    pub fn cached_sessions(&self) -> usize {
+        self.states.len()
+    }
+
+    /// `(session, job)` pairs still holding partial work, including archive decoders.
+    pub fn job_state(&self) -> usize {
+        self.ledger.len().max(self.archives.len())
+    }
+
+    /// Records and approximate expanded bytes one compressed page job retains
+    /// between bounded calls. `None` once the job completed or was cancelled.
+    pub fn page_retained(&self, key: &SessionKey, job: ReadJobId) -> Option<(usize, usize)> {
+        match self.archives.get(&(key.clone(), job))? {
+            ArchiveJob::Page(page) => Some((page.mapped.len(), page.retained_bytes)),
+            ArchiveJob::Record(_) => None,
+        }
+    }
+
+    // ---- discovery -------------------------------------------------------
+
+    fn index_id(&mut self, key: &SessionKey) {
+        let id = key.native_id.clone();
+        let keys = self.by_id.entry(id.clone()).or_default();
+        if !keys.iter().any(|k| k == key) {
+            keys.push(key.clone());
+        }
+        if keys.len() == 2 {
+            // The first source now has a duplicate; probe it again so a cached summary
+            // is rehydrated with the warning.
+            self.mark_stale(&id);
+        }
+    }
+
+    fn unindex_id(&mut self, key: &SessionKey) {
+        if let Some(keys) = self.by_id.get_mut(&key.native_id) {
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.by_id.remove(&key.native_id);
+            } else if keys.len() == 1 {
+                self.mark_stale(&key.native_id);
+            }
+        }
+    }
+
+    /// Forces the next pass to probe every source of `id` again.
+    fn mark_stale(&mut self, id: &str) {
+        let paths: Vec<PathBuf> = self
+            .by_id
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.current.get(key))
+            .cloned()
+            .collect();
+        for path in paths {
+            if let Some(known) = self.known.get_mut(&path) {
+                known.len = u64::MAX;
+            }
+        }
+    }
+
+    /// Whether the physical source is a compressed rollout.
+    fn compressed(path: &Path) -> bool {
+        crate::ingest::source::canonical_rollout_identity(path) != path
+    }
+
+    /// Whether the physical source sits in the native archived store.
+    fn in_archived_root(&self, path: &Path) -> bool {
+        self.roots
+            .iter()
+            .any(|root| root.archived && path.starts_with(&root.path))
+    }
+
+    /// Lower is preferred when two physical sources represent one logical session:
+    /// a live store before its archived store, and a plain file before its archive.
+    fn rank(&self, path: &Path) -> (u8, u8) {
+        (
+            u8::from(self.in_archived_root(path)),
+            u8::from(Self::compressed(path)),
+        )
+    }
+
+    /// Native rollout file name without the compression suffix. Two copies of one
+    /// rollout (live/archived, plain/zstd) keep this name.
+    fn rollout_name(path: &Path) -> Option<std::ffi::OsString> {
+        crate::ingest::source::canonical_rollout_identity(path)
+            .file_name()
+            .map(|n| n.to_os_string())
+    }
+
+    /// The canonical identity of a newly discovered physical source. Compression only
+    /// strips the native zstd suffix; a live/archived move is folded onto the already
+    /// confirmed key of the same native store when the native rollout name and header
+    /// ID prove they are one representation.
+    fn canonical_for(&self, id: &str, physical: &Path, store: usize, archived: bool) -> PathBuf {
+        let plain = crate::ingest::source::canonical_rollout_identity(physical);
+        let name = Self::rollout_name(physical);
+        let candidates: Vec<&SessionKey> = self
+            .by_id
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|key| {
+                self.current
+                    .get(*key)
+                    .and_then(|path| self.known.get(path))
+                    .is_some_and(|known| known.store == store)
+            })
+            .collect();
+        // In-place compression: the same path without `.zst` was already published,
+        // either as the canonical key or as the key's current physical source.
+        if let Some(key) = candidates.iter().find(|key| {
+            matches!(&key.source, SourceKey::File(path) if path == &plain)
+                || self.current.get(*key).is_some_and(|path| path == &plain)
+        }) {
+            return match &key.source {
+                SourceKey::File(path) => path.clone(),
+                SourceKey::DbRow { .. } => plain,
+            };
+        }
+        // An archive move keeps the native rollout file name in the same store.
+        if let Some(key) = candidates.iter().find(|key| {
+            let Some(other) = self.current.get(*key) else {
+                return false;
+            };
+            let Some(known) = self.known.get(other) else {
+                return false;
+            };
+            known.archived != archived && Self::rollout_name(other) == name
+        }) {
+            return match &key.source {
+                SourceKey::File(path) => path.clone(),
+                SourceKey::DbRow { .. } => plain,
+            };
+        }
+        plain
+    }
+
+    /// Points a logical key at the best physical source seen so far. Returns whether
+    /// the key's readable source changed (so retained pages must be rebuilt).
+    fn prefer_source(&mut self, key: &SessionKey, path: &Path) -> bool {
+        match self.current.get(key) {
+            Some(current) if current != path => {
+                let better = self.rank(path) < self.rank(current);
+                if better {
+                    let old = current.clone();
+                    self.current.insert(key.clone(), path.to_path_buf());
+                    self.drop_state(&old, key);
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(_) => false,
+            None => {
+                self.current.insert(key.clone(), path.to_path_buf());
+                true
+            }
+        }
+    }
+
+    /// Drops a state whose physical source no longer represents the key, unless a job
+    /// is still consuming it; an abandoned index and open cursor always go.
+    fn drop_state(&mut self, path: &Path, key: &SessionKey) {
+        if !self.ledger.has_consumer(key) {
+            self.states.remove(path);
+        }
+        self.indexes.remove(path);
+    }
+
+    /// The physical source currently read for `key`.
+    fn current_path(&self, key: &SessionKey) -> Option<PathBuf> {
+        self.current.get(key).cloned()
+    }
+
+    /// Probes one source (bounded header, and a tail only for a plain file) and
+    /// records it under its canonical identity.
+    fn visit(&mut self, source: SourceFile, root: &RootSpec, bytes: &mut usize, found: &mut Found) {
+        if let Some(known) = self.known.get_mut(&source.path)
+            && known.available
+            && known.len == source.len
+            && known.modified == source.modified
+        {
+            known.pass = self.pass_id;
+            let key = known.key.clone();
+            self.seen_keys.insert(key);
+            return;
+        }
+        let archived = root.archived || self.in_archived_root(&source.path);
+        let max = self.config.max_record_bytes;
+        let mut parsed = Parsed::default();
+        let mut probe_bytes = 0usize;
+        let (available, id, activity) = if Self::compressed(&source.path) {
+            match probe_archive_head(&source.path, max) {
+                Ok(probe) => {
+                    if probe.damaged {
+                        found.warnings.push(warn(
+                            &source.path,
+                            "#damaged",
+                            WarningKind::Parse,
+                            "compressed source is damaged after its readable prefix".into(),
+                            1,
+                        ));
+                    }
+                    let mut activity = None;
+                    for (ordinal, value) in probe.records.iter().take(HEAD_RECORDS) {
+                        parsed.ordinal = *ordinal;
+                        parsed.records = *ordinal + 1;
+                        parsed.apply(*ordinal, value);
+                        activity = activity.max(parse_ts(field(value, "timestamp")));
+                    }
+                    probe_bytes = probe.expanded_bytes;
+                    let activity = activity.map_or_else(
+                        || ActivityStamp {
+                            at: modified_ms(source.modified),
+                            class: AggregationClass::Derived,
+                        },
+                        |at| ActivityStamp {
+                            at: Some(at),
+                            class: AggregationClass::Reported,
+                        },
+                    );
+                    let id = parsed.id.clone().unwrap_or_else(|| stem_of(&source.path));
+                    (true, id, activity)
+                }
+                Err(_) => {
+                    found.warnings.push(warn(
+                        &source.path,
+                        "#unavailable",
+                        WarningKind::Unavailable,
+                        "source unavailable".into(),
+                        1,
+                    ));
+                    let id = stem_of(&source.path);
+                    let activity = ActivityStamp {
+                        at: modified_ms(source.modified),
+                        class: AggregationClass::Derived,
+                    };
+                    (false, id, activity)
+                }
+            }
+        } else {
+            match probe_file(&source.path, source.len) {
+                Ok(probe) => {
+                    *bytes = bytes.saturating_add(probe.bytes);
+                    for (offset, line) in probe.head.iter().take(HEAD_RECORDS) {
+                        if let Some(value) = probe_value(line, max) {
+                            parsed.ordinal = parsed.records;
+                            parsed.records += 1;
+                            parsed.apply(*offset, &value);
+                        }
+                    }
+                    let mut tail_at = None;
+                    let mut tail_model = None;
+                    for line in &probe.tail {
+                        if let Some(value) = probe_value(line, max) {
+                            tail_at = tail_at.max(parse_ts(field(&value, "timestamp")));
+                            if field(&value, "type").as_str() == Some("turn_context") {
+                                tail_model = text_field(field(&value, "payload"), "model");
+                            }
+                        }
+                    }
+                    parsed.last_persisted = parsed.last_persisted.max(tail_at);
+                    if let Some(model) = tail_model {
+                        parsed.models.retain(|m| *m != model);
+                        parsed.models.push(model);
+                    }
+                    let id = parsed.id.clone().unwrap_or_else(|| stem_of(&source.path));
+                    let activity = match parsed.last_persisted {
+                        Some(at) => ActivityStamp {
+                            at: Some(at),
+                            class: AggregationClass::Reported,
+                        },
+                        None => ActivityStamp {
+                            at: modified_ms(source.modified),
+                            class: AggregationClass::Derived,
+                        },
+                    };
+                    (true, id, activity)
+                }
+                Err(_) => {
+                    found.warnings.push(warn(
+                        &source.path,
+                        "#unavailable",
+                        WarningKind::Unavailable,
+                        "source unavailable".into(),
+                        1,
+                    ));
+                    let activity = ActivityStamp {
+                        at: modified_ms(source.modified),
+                        class: AggregationClass::Derived,
+                    };
+                    (false, stem_of(&source.path), activity)
+                }
+            }
+        };
+        *bytes = bytes.saturating_add(probe_bytes);
+        let canonical = self.canonical_for(&id, &source.path, root.store, archived);
+        let key = SessionKey {
+            harness: Harness::Codex,
+            native_id: id,
+            source: SourceKey::File(canonical.clone()),
+        };
+        let parent = parsed
+            .parent
+            .as_deref()
+            .map(|id| self.resolve_parent(id, &key));
+        let meta = build_meta(
+            &parsed,
+            key.native_id.clone(),
+            &canonical,
+            activity,
+            available,
+            parent,
+            archived,
+        );
+        let weight = crate::roster::metadata_bytes(&meta) + source.path.as_os_str().len();
+        match self.retention.admit(&source.path, meta.activity.at, weight) {
+            Admit::Dropped | Admit::Displaced => {
+                // Bookkeeping only: a tracked source that no longer fits is forgotten
+                // (and watched for deletion), never reported as removed.
+                self.forget(&source.path);
+                found
+                    .warnings
+                    .push(limit_warning(self.config.max_metadata_sources));
+                return;
+            }
+            Admit::Kept { evicted } => {
+                // Eviction only forgets this adapter's bookkeeping: the files still
+                // exist and stay readable, so no removal is reported.
+                self.forgotten.remove(&source.path);
+                for path in evicted {
+                    self.forget(&path);
+                    found
+                        .warnings
+                        .push(limit_warning(self.config.max_metadata_sources));
+                }
+            }
+        }
+        if let Some(old) = self.known.get(&source.path)
+            && old.key != key
+        {
+            let old_key = old.key.clone();
+            self.unindex_id(&old_key);
+            if self.current.get(&old_key) == Some(&source.path) {
+                self.current.remove(&old_key);
+                found.removed.push(old_key);
+            }
+        }
+        let preferred = self.prefer_source(&key, &source.path);
+        if self
+            .known
+            .get(&source.path)
+            .is_none_or(|known| known.key != key)
+        {
+            self.index_id(&key);
+        }
+        self.seen_keys.insert(key.clone());
+        self.known.insert(
+            source.path.clone(),
+            Known {
+                key: key.clone(),
+                len: source.len,
+                modified: source.modified,
+                pass: self.pass_id,
+                activity: meta.activity.at,
+                available,
+                store: root.store,
+                archived,
+                parent: parsed.parent.clone(),
+            },
+        );
+        // A child probed before its spawner was published resolves on the next pass:
+        // forcing its probe republishes the exact edge instead of a stale null.
+        let id = key.native_id.clone();
+        let waiting: Vec<PathBuf> = self
+            .known
+            .iter()
+            .filter(|(path, known)| {
+                known.parent.as_deref() == Some(id.as_str()) && path.as_path() != source.path
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in waiting {
+            if let Some(known) = self.known.get_mut(&path) {
+                known.len = u64::MAX;
+            }
+        }
+        self.last_meta.insert(key.clone(), meta.clone());
+        // A non-preferred alias of an already published logical session is bookkeeping
+        // only; the row and its selection stay on the preferred physical source.
+        if self.current.get(&key) == Some(&source.path) || preferred {
+            found.sessions.push(meta);
+        }
+    }
+
+    /// A pass finished: sources it did not see are gone.
+    fn finish_pass(&mut self, found: &mut Found) {
+        let gone: Vec<PathBuf> = self
+            .known
+            .iter()
+            .filter(|(_, k)| k.pass != self.pass_id)
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in gone {
+            self.retention.remove(&path);
+            let forgotten = self.forgotten.remove(&path);
+            if let Some(known) = self.known.remove(&path) {
+                let key = known.key.clone();
+                if self.seen_keys.contains(&key) {
+                    // Another representation of the same logical session was seen:
+                    // this physical source is gone, the session is not.
+                    if self.current.get(&key) == Some(&path) {
+                        self.switch_alias(&key, &path, found);
+                    }
+                    self.drop_state(&path, &key);
+                    continue;
+                }
+                self.unindex_id(&key);
+                self.current.remove(&key);
+                found.removed.push(key);
+                found.warnings.push(warn(
+                    &path,
+                    "#removed",
+                    WarningKind::Unavailable,
+                    "session file is no longer present".into(),
+                    1,
+                ));
+            } else if let Some(key) = forgotten
+                && !self.seen_keys.contains(&key)
+            {
+                self.current.remove(&key);
+                found.removed.push(key);
+                found.warnings.push(warn(
+                    &path,
+                    "#removed",
+                    WarningKind::Unavailable,
+                    "session file is no longer present".into(),
+                    1,
+                ));
+            }
+            self.states.remove(&path);
+            self.indexes.remove(&path);
+        }
+        // Forgotten sources are not walked into `known`; a bounded existence check lets a
+        // genuine deletion of a frozen or in-flight row reach the roster.
+        for path in self.forgotten.keys() {
+            match fs::metadata(&path) {
+                Ok(_) => {}
+                // Only a confirmed absence is a deletion; any other error keeps the watch.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(key) = self.forgotten.remove(&path)
+                        && !self.seen_keys.contains(&key)
+                    {
+                        self.current.remove(&key);
+                        found.removed.push(key);
+                        found.warnings.push(warn(
+                            &path,
+                            "#removed",
+                            WarningKind::Unavailable,
+                            "session file is no longer present".into(),
+                            1,
+                        ));
+                    }
+                }
+                Err(_) => found.warnings.push(warn(
+                    &path,
+                    "#unavailable",
+                    WarningKind::Unavailable,
+                    "source unavailable".into(),
+                    1,
+                )),
+            }
+        }
+    }
+
+    /// Repoints a key whose preferred physical source disappeared at the best source
+    /// that represented it in this pass. The row keeps its identity, so no removal is
+    /// published and a loaded selection stays valid; the alias is re-probed on the
+    /// next pass so its own metadata replaces the vanished copy's.
+    fn switch_alias(&mut self, key: &SessionKey, gone: &Path, found: &mut Found) {
+        let mut best: Option<(u8, u8, PathBuf)> = None;
+        for (path, known) in &self.known {
+            if &known.key != key || known.pass != self.pass_id || path == gone {
+                continue;
+            }
+            let rank = self.rank(path);
+            if best.as_ref().is_none_or(|b| rank < (b.0, b.1)) {
+                best = Some((rank.0, rank.1, path.clone()));
+            }
+        }
+        if let Some((_, _, path)) = best {
+            self.current.insert(key.clone(), path.clone());
+            if let Some(known) = self.known.get_mut(&path) {
+                known.len = u64::MAX;
+            }
+            // The row keeps its key; republish it with the new representation's
+            // archived state so the location is honest.
+            if let Some(mut meta) = self.last_meta.get(key).cloned() {
+                meta.archived = self.known.get(&path).is_some_and(|known| known.archived);
+                meta.source_available = self.known.get(&path).is_some_and(|known| known.available);
+                found.sessions.push(meta);
+            }
+        }
+    }
+
+    // ---- hydration -------------------------------------------------------
+
+    fn source_file(&self, path: &Path) -> SourceFile {
+        match fs::metadata(path) {
+            Ok(meta) => SourceFile {
+                path: path.to_path_buf(),
+                modified: meta.modified().unwrap_or(UNIX_EPOCH),
+                len: meta.len(),
+            },
+            // A vanished source never matches the old stamp, so the state restarts
+            // and reports the source unavailable.
+            Err(_) => SourceFile {
+                path: path.to_path_buf(),
+                modified: UNIX_EPOCH,
+                len: 0,
+            },
+        }
+    }
+
+    /// One bounded slice of scanning `path` under `key`.
+    fn step_state(&mut self, path: &Path, key: &SessionKey, meter: &mut Meter) -> Advance {
+        self.tick += 1;
+        let canonical = match &key.source {
+            SourceKey::File(path) => path.clone(),
+            SourceKey::DbRow { .. } => path.to_path_buf(),
+        };
+        let archived =
+            self.known.get(path).is_some_and(|known| known.archived) || self.in_archived_root(path);
+        if self.states.get(path).is_some_and(|s| {
+            s.id() != key.native_id || s.canonical != canonical || s.archived != archived
+        }) {
+            self.states.remove(path);
+        }
+        let source = self.source_file(path);
+        self.states.entry(path.to_path_buf()).or_insert_with(|| {
+            let mut state = FileState::new(source.clone(), canonical, archived);
+            state.pinned = Some(key.native_id.clone());
+            state
+        });
+        let advance = self.advance(source, meter);
+        if let Some(state) = self.states.get_mut(path) {
+            state.used = self.tick;
+            if matches!(advance, Advance::Done) {
+                state.parsed.emitted_end = state.parsed.end;
+                if std::mem::take(&mut state.invalidated) {
+                    self.invalidated.push(state.key());
+                }
+            }
+        }
+        if matches!(advance, Advance::Done) {
+            self.maintain(path);
+        }
+        advance
+    }
+
+    /// Bounds retained states and open cursors after a scan completes.
+    fn maintain(&mut self, current: &Path) {
+        let cap = self.config.max_cached_sessions.max(1);
+        while self.states.len() > cap {
+            let victim = self
+                .states
+                .iter()
+                .filter(|(p, s)| p.as_path() != current && !self.ledger.has_consumer(&s.key()))
+                .min_by_key(|(_, s)| s.used)
+                .map(|(p, _)| p.clone());
+            match victim {
+                Some(path) => {
+                    self.states.remove(&path);
+                }
+                None => break,
+            }
+        }
+        let mut open: Vec<(u64, PathBuf)> = self
+            .states
+            .iter()
+            .filter(|(_, s)| s.cursor.is_some() && s.reached_eof)
+            .map(|(p, s)| (s.used, p.clone()))
+            .collect();
+        let total = self.states.values().filter(|s| s.cursor.is_some()).count();
+        if total > KEEP_CURSORS {
+            open.sort_unstable();
+            for (_, path) in open.into_iter().take(total - KEEP_CURSORS) {
+                if let Some(state) = self.states.get_mut(&path) {
+                    state.cursor = None;
+                }
+            }
+        }
+    }
+
+    fn context(&self, state: &FileState) -> (usize, Option<SessionLink>) {
+        let dup = self.by_id.get(&state.id()).map_or(1, Vec::len);
+        let key = state.key();
+        let parent = state
+            .parsed
+            .parent
+            .as_deref()
+            .map(|id| self.resolve_parent(id, &key));
+        (dup, parent)
+    }
+
+    /// The most recently persisted logical session with that ID; a tie at the top is
+    /// ambiguous. A root-thread ID is never promoted to an immediate parent elsewhere.
+    fn resolve_parent(&self, parent_id: &str, child: &SessionKey) -> SessionLink {
+        let candidates: Vec<&Known> = self
+            .by_id
+            .get(parent_id)
+            .into_iter()
+            .flatten()
+            .filter(|key| *key != child)
+            .filter_map(|key| self.current.get(key))
+            .filter_map(|path| self.known.get(path))
+            .collect();
+        let Some(newest) = candidates.iter().map(|k| k.activity).max() else {
+            return SessionLink::Unresolved(parent_id.to_owned());
+        };
+        let mut top = candidates.iter().filter(|k| k.activity == newest);
+        match (top.next(), top.next()) {
+            (Some(only), None) => SessionLink::Resolved(only.key.clone()),
+            _ => SessionLink::Ambiguous,
+        }
+    }
+
+    /// Drops the bookkeeping of `path` but remembers it, bounded, so a frozen row stays
+    /// readable and a later physical deletion is still noticed. The logical current
+    /// path is kept: a forgotten key must still resolve to the source it names.
+    fn forget(&mut self, path: &Path) {
+        if let Some(known) = self.known.remove(path) {
+            self.unindex_id(&known.key);
+            // State an active job is still consuming is not disposed of: only the
+            // bookkeeping is forgotten, so a read in flight never restarts.
+            if !self.ledger.has_consumer(&known.key) {
+                self.states.remove(path);
+            }
+            self.forgotten.insert(path.to_path_buf(), known.key);
+        }
+    }
+
+    /// The session ID the discovery probe would assign to the file as it is now.
+    fn probed_id(&self, path: &Path) -> Option<String> {
+        if Self::compressed(path) {
+            let probe = probe_archive_head(path, self.config.max_record_bytes).ok()?;
+            let mut parsed = Parsed::default();
+            for (ordinal, value) in probe.records.iter().take(HEAD_RECORDS) {
+                parsed.ordinal = *ordinal;
+                parsed.records = *ordinal + 1;
+                parsed.apply(*ordinal, value);
+            }
+            return Some(parsed.id.unwrap_or_else(|| stem_of(path)));
+        }
+        let meta = fs::metadata(path).ok()?;
+        let probe = probe_file(path, meta.len()).ok()?;
+        let mut parsed = Parsed::default();
+        for (offset, line) in probe.head.iter().take(HEAD_RECORDS) {
+            if let Some(value) = probe_value(line, self.config.max_record_bytes) {
+                parsed.ordinal = parsed.records;
+                parsed.records += 1;
+                parsed.apply(*offset, &value);
+            }
+        }
+        Some(parsed.id.unwrap_or_else(|| stem_of(path)))
+    }
+
+    /// An existing rollout file under one of this scanner's configured roots.
+    fn allowlisted(&self, path: &Path) -> bool {
+        self.roots.iter().any(|root| path.starts_with(&root.path))
+            && path
+                .file_name()
+                .is_some_and(|n| is_rollout_name(&n.to_string_lossy()))
+            && fs::metadata(path).is_ok_and(|m| m.is_file())
+    }
+
+    /// Sources this adapter currently tracks (bounded by the metadata ceiling).
+    pub fn tracked_sources(&self) -> usize {
+        self.retention.len()
+    }
+
+    /// The physical source currently representing `key`, if discovery has published it.
+    /// The canonical key path is never opened as if it had to exist: an archived or
+    /// compressed copy renders under the canonical identity but reads its own file.
+    fn discovered(&self, key: &SessionKey) -> Result<PathBuf, ProviderError> {
+        if key.harness != Harness::Codex {
+            return Err(ProviderError::Unsupported("not a Codex session".into()));
+        }
+        if !matches!(&key.source, SourceKey::File(_)) {
+            return Err(ProviderError::Unsupported(
+                "not a Codex file session".into(),
+            ));
+        }
+        let path = self
+            .current_path(key)
+            .ok_or_else(|| ProviderError::Unavailable("unknown Codex session".into()))?;
+        match self.known.get(&path) {
+            Some(known) if known.key == *key => Ok(path),
+            Some(_) => Err(ProviderError::Unavailable("unknown Codex session".into())),
+            // Retention may have forgotten a source that still exists (a frozen row or an
+            // in-flight read). Only a key this adapter published is honoured, and only
+            // while the file still carries that session's identity.
+            None if self.forgotten.get(&path) == Some(key)
+                && self.allowlisted(&path)
+                && self.probed_id(&path).as_deref() == Some(key.native_id.as_str()) =>
+            {
+                Ok(path)
+            }
+            None => Err(ProviderError::Unavailable("unknown Codex session".into())),
+        }
+    }
+
+    /// Makes the session's scan complete, or reports the work this slice did.
+    fn prepare(
+        &mut self,
+        job: ReadJobId,
+        key: &SessionKey,
+        budget: RefreshBudget,
+    ) -> Result<Option<WorkProgress>, ProviderError> {
+        let path = self.discovered(key)?;
+        if let Some(state) = self.states.get_mut(&path)
+            && state.id() == key.native_id
+            && state.reached_eof
+        {
+            self.tick += 1;
+            state.used = self.tick;
+            return Ok(None);
+        }
+        let mut meter = Meter::new(budget);
+        self.ledger.join(key, job);
+        match self.step_state(&path, key, &mut meter) {
+            Advance::Exhausted => Ok(Some(meter.progress())),
+            Advance::Done => Ok(None),
+        }
+    }
+
+    /// A job that is no longer `Pending` holds nothing.
+    fn settle<T>(
+        &mut self,
+        key: &SessionKey,
+        job: ReadJobId,
+        result: &Result<ReadProgress<T>, ProviderError>,
+    ) {
+        if !matches!(result, Ok(ReadProgress::Pending(_))) {
+            self.ledger.release(key, job);
+        }
+    }
+
+    fn compaction_observations(&self, state: &FileState) -> Vec<CompactionObservation> {
+        let p = &state.parsed;
+        let key = state.key();
+        p.compactions
+            .iter()
+            .map(|(offset, at)| CompactionObservation {
+                id: format!("codex:{offset}"),
+                timestamp: *at,
+                method: None,
+                trigger: None,
+                summary: None,
+                before_tokens: None,
+                after_tokens: None,
+                duration_ms: None,
+                usage: None,
+                scope: CompactionScope::Event,
+                provenance: Provenance {
+                    harness: Harness::Codex,
+                    source: key.source.clone(),
+                    locator: SourceLocator {
+                        session: key.clone(),
+                        kind: if state.compressed {
+                            LocatorKind::CompressedRecord {
+                                path: state.source.path.clone(),
+                                ordinal: *offset,
+                            }
+                        } else {
+                            LocatorKind::FileOffset {
+                                path: state.source.path.clone(),
+                                offset: *offset,
+                            }
+                        },
+                        generation: Some(p.generation),
+                    },
+                    record_type: "compacted".into(),
+                    harness_version: p.version.clone(),
+                },
+            })
+            .collect()
+    }
+
+    /// One bounded slice of a compressed rollout. The streaming decoder owns the
+    /// continuation, so no decompressed history is retained and a replacement
+    /// restarts the parse with a new generation.
+    fn advance_archive(&mut self, source: SourceFile, meter: &mut Meter) -> Advance {
+        let max = self.config.max_record_bytes;
+        let Some(state) = self.states.get_mut(&source.path) else {
+            return Advance::Done;
+        };
+        if state.reached_eof
+            && state.available
+            && state.source.len == source.len
+            && state.source.modified == source.modified
+        {
+            return Advance::Done;
+        }
+        state.source = source.clone();
+        if state.archive.is_none() {
+            match SourceReader::open(&source.path, max) {
+                Ok(reader) => {
+                    // Scanner-owned identity: a rehydrated/cached-away state gets a
+                    // fresh generation, so an old compressed locator can never be
+                    // accepted against a new decoder that starts at zero.
+                    state.parsed.generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+                    state.archive = Some(reader);
+                }
+                Err(_) => {
+                    state.available = false;
+                    return Advance::Done;
+                }
+            }
+        }
+        loop {
+            if meter.spent() {
+                state.stamp();
+                return Advance::Exhausted;
+            }
+            let budget = RefreshBudget {
+                max_records: meter
+                    .budget
+                    .max_records
+                    .saturating_sub(meter.records)
+                    .max(1),
+                max_bytes: meter.budget.max_bytes.saturating_sub(meter.bytes).max(1),
+                max_millis: meter
+                    .budget
+                    .max_millis
+                    .saturating_sub(meter.started.elapsed().as_millis() as u64)
+                    .max(1),
+            };
+            let Some(reader) = state.archive.as_mut() else {
+                return Advance::Done;
+            };
+            let batch = match reader.step(budget) {
+                Ok(batch) => batch,
+                Err(_) => {
+                    state.available = false;
+                    state.archive = None;
+                    state.reached_eof = false;
+                    return Advance::Done;
+                }
+            };
+            if batch.invalidated {
+                // The archive is no longer the one observed: nothing parsed from it
+                // can be trusted, its ordinals start over, and every locator from the
+                // previous generation is stale.
+                let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+                state.parsed = Parsed::default();
+                state.parsed.generation = generation;
+                state.invalidated = true;
+                state.reached_eof = false;
+            }
+            let count = batch.records.len();
+            for record in batch.records {
+                state.parsed.ordinal = record.ordinal;
+                state.parsed.records = record.ordinal + 1;
+                match record.item {
+                    SourceItem::Json(value) => state.parsed.apply(record.ordinal, &value),
+                    SourceItem::Invalid => state.parsed.malformed += 1,
+                    SourceItem::TooLarge => state.parsed.oversized += 1,
+                    // Damage is source-scoped, reported once by the boundary counter.
+                    SourceItem::Damaged(_) => state.rotation_warnings += 1,
+                    SourceItem::Incomplete | SourceItem::Skipping => {}
+                }
+            }
+            state
+                .parsed
+                .set_archive_end(state.parsed.records, state.parsed.generation);
+            meter.records = meter.records.saturating_add(count);
+            meter.bytes = meter.bytes.saturating_add(batch.expanded_bytes);
+            state.available = true;
+            if batch.done {
+                state.reached_eof = true;
+                state.stamp();
                 return Advance::Done;
             }
-            self.expired.remove(&source.path);
         }
+    }
+
+    fn advance(&mut self, source: SourceFile, meter: &mut Meter) -> Advance {
+        let compressed = self
+            .states
+            .get(&source.path)
+            .is_some_and(|state| state.compressed)
+            || Self::compressed(&source.path);
+        if compressed {
+            return self.advance_archive(source, meter);
+        }
+        let max_record_bytes = self.config.max_record_bytes;
         let state = self
             .states
             .entry(source.path.clone())
-            .or_insert_with(|| FileState::new(source.clone()));
-        if !keep && state.reached_eof {
-            // Bound open handles to the newest sources even when nothing changed.
-            state.cursor = None;
-        }
+            .or_insert_with(|| FileState::new(source.clone(), source.path.clone(), false));
         let unchanged = state.source.len == source.len && state.source.modified == source.modified;
         if state.reached_eof && unchanged && state.available {
             return Advance::Done;
@@ -809,14 +1971,12 @@ impl CodexScanner {
             state.rotations_seen = 0;
             state.rotation_warnings += 1;
             state.reached_eof = false;
-            state.dirty = true;
             state.invalidated = true;
         }
         if state.cursor.is_none() {
             match JsonlCursor::open(state.source.path.clone(), max_record_bytes) {
                 Ok(cursor) => state.cursor = Some(cursor),
                 Err(_) => {
-                    state.dirty |= state.available;
                     state.available = false;
                     return Advance::Done;
                 }
@@ -846,7 +2006,6 @@ impl CodexScanner {
                 state.parsed = Parsed::default();
                 state.rotations_seen = rotations;
                 state.rotation_warnings += 1;
-                state.dirty = true;
                 state.invalidated = true;
             }
             let record = match next {
@@ -854,16 +2013,10 @@ impl CodexScanner {
                 Ok(None) => {
                     state.reached_eof = true;
                     state.stamp();
-                    state.dirty |= !state.available;
                     state.available = true;
-                    state.retained = false;
-                    if !keep {
-                        state.cursor = None;
-                    }
                     return Advance::Done;
                 }
                 Err(_) => {
-                    state.dirty |= state.available;
                     state.available = false;
                     // Reopening starts at byte 0, so discard what was parsed so far.
                     state.cursor = None;
@@ -874,9 +2027,7 @@ impl CodexScanner {
                 }
             };
             state.reached_eof = false;
-            state.dirty |= !state.available;
             state.available = true;
-            state.retained = false;
             match record {
                 // A partial trailing line is held by the cursor until it completes.
                 Record::Incomplete { .. } => continue,
@@ -888,17 +2039,24 @@ impl CodexScanner {
                     continue;
                 }
                 Record::Json { offset, ref value } => {
+                    state.parsed.ordinal = state.parsed.records;
+                    state.parsed.records += 1;
                     state.parsed.apply(offset, value);
                     if std::mem::take(&mut state.parsed.shown_changed) {
                         state.invalidated = true;
                     }
                 }
-                Record::Invalid { .. } => state.parsed.malformed += 1,
-                Record::TooLarge { .. } => state.parsed.oversized += 1,
+                Record::Invalid { .. } => {
+                    state.parsed.records += 1;
+                    state.parsed.malformed += 1;
+                }
+                Record::TooLarge { .. } => {
+                    state.parsed.records += 1;
+                    state.parsed.oversized += 1;
+                }
             }
             let hash = state.cursor.as_ref().map(JsonlCursor::content_hash);
             state.parsed.set_end(after, hash);
-            state.dirty = true;
             meter.records += 1;
             if meter.spent() {
                 state.stamp();
@@ -907,98 +2065,10 @@ impl CodexScanner {
         }
     }
 
-    /// Refreshes duplicate-ID and parent-link context, then drains dirty sessions.
-    fn emit_changed(&mut self) -> (Vec<SessionSummary>, Vec<SessionKey>, Vec<SessionKey>) {
-        let mut by_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        for (path, state) in &self.states {
-            by_id.entry(state.id()).or_default().push(path.clone());
-        }
-        let contexts: Vec<(PathBuf, (usize, Option<SessionLink>))> = self
-            .states
-            .iter()
-            .map(|(path, state)| {
-                let dup = by_id.get(&state.id()).map_or(1, Vec::len);
-                let parent = state
-                    .parsed
-                    .parent
-                    .as_deref()
-                    .map(|id| self.resolve_parent(id, path, &by_id));
-                (path.clone(), (dup, parent))
-            })
-            .collect();
-        for (path, context) in contexts {
-            if let Some(state) = self.states.get_mut(&path)
-                && state.context != context
-            {
-                state.context = context;
-                state.dirty = true;
-            }
-        }
-        let mut dirty: Vec<&PathBuf> = self
-            .states
-            .iter()
-            .filter(|(_, s)| s.dirty)
-            .map(|(p, _)| p)
-            .collect();
-        dirty.sort();
-        let summaries: Vec<SessionSummary> = dirty
-            .into_iter()
-            .map(|p| self.summarize(&self.states[p]))
-            .collect();
-        let mut retired = Vec::new();
-        let mut invalidated = Vec::new();
-        for state in self.states.values_mut() {
-            if state.dirty {
-                let key = state.key();
-                if std::mem::take(&mut state.invalidated) {
-                    invalidated.push(key.clone());
-                }
-                if let Some(old) = state.emitted.replace(key.clone())
-                    && old != key
-                {
-                    retired.push(old);
-                }
-                state.dirty = false;
-                state.parsed.emitted_end = state.parsed.end;
-            }
-        }
-        (summaries, retired, invalidated)
-    }
-
-    /// The most recently persisted source with that ID; a tie at the top is ambiguous.
-    fn resolve_parent(
-        &self,
-        parent_id: &str,
-        child: &Path,
-        by_id: &HashMap<String, Vec<PathBuf>>,
-    ) -> SessionLink {
-        let candidates: Vec<&FileState> = by_id
-            .get(parent_id)
-            .into_iter()
-            .flatten()
-            .filter(|p| p.as_path() != child)
-            .filter_map(|p| self.states.get(p))
-            .collect();
-        let Some(newest) = candidates.iter().map(|s| s.persisted_at()).max() else {
-            return SessionLink::Unresolved(parent_id.to_owned());
-        };
-        let mut top = candidates.iter().filter(|s| s.persisted_at() == newest);
-        match (top.next(), top.next()) {
-            (Some(only), None) => SessionLink::Resolved(only.key()),
-            _ => SessionLink::Ambiguous,
-        }
-    }
-
     fn summarize(&self, state: &FileState) -> SessionSummary {
         let p = &state.parsed;
         let path = &state.source.path;
-        let id = state.id();
-        let (title, title_derived) = match (&p.nickname, &p.prompt_title) {
-            (Some(nick), _) => (title_from(nick).unwrap_or_else(|| id.clone()), false),
-            (None, Some(prompt)) => (prompt.clone(), true),
-            (None, None) => (id.clone(), false),
-        };
-        let (dup, parent) = state.context.clone();
+        let (dup, parent) = self.context(state);
         let mut warnings = Vec::new();
         let mut push = |label: &str, kind, message: &str, count: u32| {
             if count > 0 {
@@ -1055,73 +2125,162 @@ impl CodexScanner {
                 u32::try_from(dup).unwrap_or(u32::MAX),
             );
         }
+        if Self::usage_boundary_unproven(p) {
+            push(
+                "#usage-boundary",
+                WarningKind::Unsupported,
+                "child-owned usage boundary is not evidenced; its usage stays partial",
+                1,
+            );
+        }
         SessionSummary {
-            key: state.key(),
-            title,
-            title_derived,
-            project: p
-                .cwd
-                .as_deref()
-                .and_then(Path::file_name)
-                .map(|n| n.to_string_lossy().into_owned()),
-            cwd: p.cwd.clone(),
-            models: p.models.clone(),
-            model_details: vec![],
-            provider_version: p.version.clone(),
-            created_at: p.created_at,
-            last_event_at: p.last_event,
-            last_persisted_at: state.persisted_at(),
-            last_completion: p.last_completion,
-            unfinished_work: p.turn_open == Some(true),
-            displayed_event_count: p.displayed + p.shown.len(),
-            hidden_records: p.hidden.saturating_sub(p.shown.len()),
-            source_available: state.available,
-            archived: false,
-            context_window: p.context_window,
-            server_tools: None,
+            meta: build_meta(
+                p,
+                state.id(),
+                &state.canonical,
+                state.activity(),
+                state.available,
+                parent,
+                state.archived,
+            ),
+            usage: self.usage_summary(p),
+            metrics: self.session_metrics(state),
             lifecycle: match p.turn_open {
                 None => Lifecycle::Unknown,
                 Some(true) => Lifecycle::Ongoing,
                 Some(false) => Lifecycle::Completed,
             },
+            unfinished_work: p.turn_open == Some(true),
+            last_event_at: p.last_event,
+            last_completion: p.last_completion,
+            displayed_event_count: p.displayed + p.shown.len(),
+            hidden_records: p.hidden.saturating_sub(p.shown.len()),
+            server_tools: None,
             process: ProcessAssociation::NotChecked,
-            usage: self.usage_summary(p),
-            lineage: Lineage {
-                parent,
-                fork: None,
-                sidechain: false,
-            },
             warnings,
         }
     }
 
+    /// Measured timing, prompt occupancy and compaction facts. Codex records no
+    /// per-request duration (item durations are tool time), so speed stays Unknown.
+    fn session_metrics(&self, state: &FileState) -> SessionMetrics {
+        let p = &state.parsed;
+        let model = p.models.last().map(|id| ModelDetail {
+            id: id.clone(),
+            provider: None,
+            variant: None,
+            effort: None,
+            configured_effort: None,
+        });
+        let epoch = format!("c{}", p.compaction_total);
+        let snapshot = context_usage(
+            p.last_prompt.map(|(used, _, _)| used),
+            p.context_window,
+            AggregationClass::Reported,
+            p.last_prompt.and_then(|(_, at, _)| at),
+            model,
+            p.last_prompt.map(|(_, _, e)| format!("c{e}")),
+        );
+        let observed = self.compaction_observations(state);
+        SessionMetrics {
+            timing: p.turns.timing(p.created_at),
+            speed: SpeedSummary::default(),
+            context: current_context(&snapshot, Some(&epoch)),
+            compactions: compaction_summary(
+                &observed,
+                p.compaction_total as usize == observed.len(),
+                &self.config.pricing,
+                self.config.reference_policy(Harness::Codex),
+            ),
+        }
+    }
+
+    /// Whether a child rollout's own usage cannot be separated from its copied
+    /// inherited prefix. A boundary at or past the observed end proves no owned
+    /// record, so the copied counters must not be reported as this session's spend.
+    fn usage_boundary_unproven(p: &Parsed) -> bool {
+        p.is_child()
+            && (!p.ownership.complete
+                || p.usage_unproven
+                || p.ownership
+                    .first_owned_ordinal
+                    .is_some_and(|boundary| boundary >= p.records.max(1)))
+    }
+
     /// `token_usage_record.thread_token_usage` wins; `token_count` is only a
-    /// fallback when no record exists. Snapshots are never added together.
+    /// fallback when no record exists. Snapshots are never added together. A child
+    /// without a trustworthy owned boundary reports partial usage instead of the
+    /// copied parent counters.
     fn usage_summary(&self, p: &Parsed) -> Option<UsageSummary> {
+        if Self::usage_boundary_unproven(p) {
+            return Some(UsageSummary {
+                categories: TokenCategories::default(),
+                total: None,
+                class: AggregationClass::Unknown,
+                cost: CostEstimate::default(),
+                reported_cost_usd: None,
+                saved_estimate_usd: None,
+                coverage: UsageCoverage {
+                    observed_requests: 0,
+                    priced_requests: 0,
+                    complete: false,
+                    reason: Some(
+                        "child-owned usage before the history boundary is inherited".into(),
+                    ),
+                },
+                models: Vec::new(),
+            });
+        }
         let categories = p.record_usage.clone().or_else(|| p.count_usage.clone())?;
-        let model = p.models.last().cloned();
+        let model = p.models.last().map(|id| ModelDetail {
+            id: id.clone(),
+            provider: None,
+            variant: None,
+            effort: None,
+            configured_effort: None,
+        });
         let total = codex_total(&categories);
         let class = match (categories.total, total) {
             (Some(_), _) => AggregationClass::Reported,
             (None, Some(_)) => AggregationClass::Derived,
             (None, None) => AggregationClass::Unknown,
         };
-        let cost = match &model {
-            Some(model) => estimate_cost(Provider::Codex, model, &categories, &self.config.pricing),
-            None => CostEstimate {
-                usd: None,
-                class: AggregationClass::Unknown,
-                as_of: None,
-                note: Some("no model recorded".into()),
+        // Codex reports `cached_input_tokens` inside `input_tokens` and reasoning
+        // inside `output_tokens`. Whether cache writes would sit inside input is
+        // unverified, so any nonzero write leaves the input accounting unknown.
+        let accounting = TokenAccounting {
+            input: if categories.cache_write.is_some_and(|w| w > 0) {
+                InputAccounting::Unknown
+            } else {
+                InputAccounting::InclusiveCaches
             },
+            output: OutputAccounting::IncludesReasoning,
         };
-        Some(UsageSummary {
-            model,
-            categories,
+        let money = RecordedMoney::default();
+        // Only a session that saw one model can be priced at that model's rates.
+        let attribution = match (p.models.len(), model.as_ref()) {
+            (1, Some(m)) => Attribution::Model(m),
+            (0, _) | (_, None) => Attribution::Unrecorded,
+            _ => Attribution::Mixed,
+        };
+        let cost = aggregate_cost(
+            Harness::Codex,
+            attribution,
+            &categories,
+            accounting,
+            &money,
+            &self.config.pricing,
+            self.config.reference_policy(Harness::Codex),
+        );
+        Some(aggregate_summary(
+            attribution,
+            &categories,
+            accounting,
             total,
             class,
             cost,
-        })
+            &money,
+        ))
     }
 }
 
@@ -1423,6 +2582,8 @@ fn tool_parts(item: &Value) -> ToolParts {
 struct Mapper<'a> {
     key: &'a SessionKey,
     path: &'a Path,
+    /// The physical source is a compressed stream addressed by expanded ordinal.
+    compressed: bool,
     generation: u64,
     version: Option<&'a str>,
     shown: &'a BTreeSet<u64>,
@@ -1431,7 +2592,7 @@ struct Mapper<'a> {
 
 enum Mapped {
     Event(Box<Event>),
-    Diag(DiagnosticEntry),
+    Diag(Box<DiagnosticEntry>),
 }
 
 impl Mapper<'_> {
@@ -1439,9 +2600,16 @@ impl Mapper<'_> {
         SourceLocator {
             session: self.key.clone(),
             generation: Some(self.generation),
-            kind: LocatorKind::FileOffset {
-                path: self.path.to_path_buf(),
-                offset,
+            kind: if self.compressed {
+                LocatorKind::CompressedRecord {
+                    path: self.path.to_path_buf(),
+                    ordinal: offset,
+                }
+            } else {
+                LocatorKind::FileOffset {
+                    path: self.path.to_path_buf(),
+                    offset,
+                }
             },
         }
     }
@@ -1464,11 +2632,11 @@ impl Mapper<'_> {
         let offset = line.offset;
         let locator = self.locator(offset);
         let diag = |label: String, hidden: bool| {
-            Mapped::Diag(DiagnosticEntry {
+            Mapped::Diag(Box::new(DiagnosticEntry {
                 locator: locator.clone(),
                 label,
                 hidden,
-            })
+            }))
         };
         let value = match &line.body {
             Body::TooLarge => return diag("oversized record".into(), true),
@@ -1496,11 +2664,11 @@ impl Mapper<'_> {
                 tool,
                 usage: None,
                 provenance: Provenance {
-                    provider: Provider::Codex,
-                    source: SourceKey::File(self.path.to_path_buf()),
+                    harness: Harness::Codex,
+                    source: self.key.source.clone(),
                     locator: locator.clone(),
                     record_type,
-                    provider_version: self.version.map(str::to_owned),
+                    harness_version: self.version.map(str::to_owned),
                 },
             }))
         };
@@ -1559,6 +2727,7 @@ impl Mapper<'_> {
                     started_at: ts,
                     completed_at: None,
                     orphan: false,
+                    child_session: None,
                 };
                 event(EventKind::Tool, Actor::Tool, None, Some(tool))
             }
@@ -1573,6 +2742,7 @@ impl Mapper<'_> {
                     started_at: None,
                     completed_at: ts,
                     orphan: true,
+                    child_session: None,
                 };
                 event(EventKind::Tool, Actor::Tool, None, Some(tool))
             }
@@ -1619,6 +2789,7 @@ impl Mapper<'_> {
             started_at,
             completed_at,
             orphan: false,
+            child_session: None,
         }
     }
 }
@@ -1758,10 +2929,107 @@ impl Ix {
 struct Index {
     path: PathBuf,
     generation: u64,
+    /// Plain: consumed bytes. Archived: consumed record count.
     end: u64,
     entries: Vec<Ix>,
     /// The session has more records than the cap allows; no entries are kept.
     over: bool,
+    /// Part of the file is not indexed yet; abandoned partial work may be dropped.
+    building: bool,
+    /// Archive indexing continuation; `None` once the pass completed.
+    feed: Option<ArchiveFeed>,
+}
+
+/// Streaming index continuation for a compressed source. Ordinals are the anchor
+/// order, so no decompressed offset is ever stored.
+struct ArchiveFeed {
+    reader: SourceReader,
+    indexed_until: u64,
+}
+
+/// Work a page job retains between bounded calls.
+enum ArchiveJob {
+    Record(SourceReader),
+    Page(ArchivePage),
+}
+
+/// One compressed page being collected: the decoder is at `next`, and only the
+/// page's own records are retained.
+struct ArchivePage {
+    reader: SourceReader,
+    /// Expanded ordinals to collect, ascending.
+    targets: Vec<u64>,
+    at: usize,
+    mapped: HashMap<u64, Line>,
+    /// Approximate expanded size of `mapped`, for bounded-retention diagnostics.
+    retained_bytes: usize,
+}
+
+enum PageCollect {
+    Pending(WorkProgress),
+    Ready(MappedLines),
+}
+
+impl ArchivePage {
+    fn step(&mut self, budget: RefreshBudget) -> Result<PageCollect, ProviderError> {
+        if self.at >= self.targets.len() {
+            return Ok(PageCollect::Ready(MappedLines {
+                lines: std::mem::take(&mut self.mapped),
+            }));
+        }
+        let batch = self
+            .reader
+            .step(budget)
+            .map_err(|e| ProviderError::Io(format!("{:?}", e.kind())))?;
+        if batch.invalidated {
+            return Err(ProviderError::Unavailable(
+                "source changed since the last refresh".into(),
+            ));
+        }
+        let mut records = 0usize;
+        for record in batch.records {
+            records += 1;
+            while self.at < self.targets.len() && self.targets[self.at] < record.ordinal {
+                self.at += 1;
+            }
+            if self.targets.get(self.at) != Some(&record.ordinal) {
+                continue;
+            }
+            let body = match record.item {
+                SourceItem::Json(value) => Body::Json(value),
+                SourceItem::Invalid => Body::Invalid,
+                SourceItem::TooLarge => Body::TooLarge,
+                SourceItem::Skipping | SourceItem::Incomplete => continue,
+                SourceItem::Damaged(_) => {
+                    return Err(ProviderError::Unavailable(
+                        "compressed source is damaged".into(),
+                    ));
+                }
+            };
+            self.retained_bytes = self.retained_bytes.saturating_add(match &body {
+                Body::Json(value) => serde_json::to_vec(value).map_or(0, |v| v.len()),
+                Body::Invalid | Body::TooLarge => 0,
+            });
+            self.mapped.insert(
+                record.ordinal,
+                Line {
+                    offset: record.ordinal,
+                    body,
+                },
+            );
+            self.at += 1;
+        }
+        let bytes = batch.expanded_bytes;
+        if self.at >= self.targets.len() || batch.done {
+            return Ok(PageCollect::Ready(MappedLines {
+                lines: std::mem::take(&mut self.mapped),
+            }));
+        }
+        Ok(PageCollect::Pending(WorkProgress {
+            records,
+            expanded_bytes: bytes,
+        }))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1772,12 +3040,20 @@ struct IndexLimits {
     cap: usize,
 }
 
+/// Result of one bounded indexing slice.
+enum Indexed<'a> {
+    Ready(&'a Index),
+    /// More of the file remains to index; call again.
+    Building(WorkProgress),
+}
+
 fn ensure_index<'a>(
     slot: &'a mut Option<Index>,
     state: &FileState,
     max: usize,
     limits: IndexLimits,
-) -> Result<&'a Index, ProviderError> {
+    budget: RefreshBudget,
+) -> Result<Indexed<'a>, ProviderError> {
     let parsed = &state.parsed;
     let stale = slot.as_ref().is_none_or(|i| {
         i.path != state.source.path || i.generation != parsed.generation || i.end > parsed.end
@@ -1789,6 +3065,8 @@ fn ensure_index<'a>(
             end: 0,
             entries: Vec::new(),
             over: false,
+            building: false,
+            feed: None,
         });
     }
     let too_large = || {
@@ -1801,12 +3079,22 @@ fn ensure_index<'a>(
     if index.over {
         return Err(too_large());
     }
+    if state.compressed {
+        return ensure_archive_index(index, state, max, limits, budget);
+    }
     if index.end < parsed.end {
+        let started = Instant::now();
+        let step = limits.step.min(budget.max_records.max(1));
+        let allowance = budget.max_bytes.max(1) as u64;
+        let from = index.end;
         let mut lines = ForwardLines::open(&index.path, index.end, parsed.end, max)
             .map_err(|e| io_error(&e))?;
         let mut fresh: Vec<Ix> = Vec::new();
         let mut reached_end = false;
-        for _ in 0..limits.step {
+        while fresh.len() < step
+            && lines.offset.saturating_sub(from) < allowance
+            && (fresh.is_empty() || started.elapsed().as_millis() < u128::from(budget.max_millis))
+        {
             let Some(line) = lines.next_line().map_err(|e| io_error(&e))? else {
                 reached_end = true;
                 break;
@@ -1848,18 +3136,140 @@ fn ensure_index<'a>(
                 .last()
                 .zip(fresh.first())
                 .is_none_or(|(a, b)| a.key() <= b.key());
+        let fresh_count = fresh.len();
         index.entries.extend(fresh);
         if !ordered {
             index.entries.sort_unstable_by_key(Ix::key);
         }
         if index.end < parsed.end {
-            return Err(ProviderError::Unavailable(format!(
-                "transcript index is building ({} of {} bytes); retry",
-                index.end, parsed.end
-            )));
+            index.building = true;
+            return Ok(Indexed::Building(WorkProgress {
+                records: fresh_count,
+                expanded_bytes: usize::try_from(index.end - from).unwrap_or(usize::MAX),
+            }));
         }
     }
-    Ok(index)
+    index.building = false;
+    Ok(Indexed::Ready(index))
+}
+
+/// Builds the anchor index of a compressed source by decoding it in bounded
+/// slices. The reader continuation lives on the index, so a page request never
+/// restarts the whole archive or retains the expanded history.
+fn ensure_archive_index<'a>(
+    index: &'a mut Index,
+    state: &FileState,
+    max_record_bytes: usize,
+    limits: IndexLimits,
+    budget: RefreshBudget,
+) -> Result<Indexed<'a>, ProviderError> {
+    let parsed = &state.parsed;
+    let too_large = || {
+        ProviderError::Unsupported(format!(
+            "session transcript exceeds the {}-record index limit",
+            limits.cap
+        ))
+    };
+    // A completed index already covers the scanned stream and stays reusable until
+    // the generation/end moves; reopening it would append duplicate entries.
+    if index.feed.is_none() && index.end >= parsed.end {
+        index.building = false;
+        index.entries.sort_unstable_by_key(Ix::key);
+        return Ok(Indexed::Ready(index));
+    }
+    if index.feed.is_none() {
+        let reader = SourceReader::open(&state.source.path, max_record_bytes)
+            .map_err(|e| ProviderError::Io(format!("{:?}", e.kind())))?;
+        index.feed = Some(ArchiveFeed {
+            reader,
+            indexed_until: 0,
+        });
+    }
+    let started = Instant::now();
+    let step = limits.step.min(budget.max_records.max(1));
+    let mut fresh = 0usize;
+    let mut bytes = 0usize;
+    let mut done = false;
+    while fresh < step && started.elapsed().as_millis() < u128::from(budget.max_millis) {
+        let Some(feed) = index.feed.as_mut() else {
+            done = true;
+            break;
+        };
+        let slice = RefreshBudget {
+            max_records: (step - fresh).max(1),
+            max_bytes: budget.max_bytes.max(1),
+            max_millis: budget
+                .max_millis
+                .saturating_sub(started.elapsed().as_millis() as u64)
+                .max(1),
+        };
+        let batch = feed
+            .reader
+            .step(slice)
+            .map_err(|e| ProviderError::Io(format!("{:?}", e.kind())))?;
+        if batch.invalidated {
+            index.entries.clear();
+            index.end = 0;
+            feed.indexed_until = 0;
+            continue;
+        }
+        bytes = bytes.saturating_add(batch.expanded_bytes);
+        for record in batch.records {
+            fresh += 1;
+            let (ts, kind) = match &record.item {
+                SourceItem::Json(value) => match classify(value) {
+                    Class::Message(_)
+                    | Class::Reasoning(_)
+                    | Class::Compaction(_)
+                    | Class::Turn { .. }
+                    | Class::Tool(_) => (parse_ts(field(value, "timestamp")), IxKind::Row),
+                    Class::Call(_) | Class::Output(_) => {
+                        (parse_ts(field(value, "timestamp")), IxKind::Pairable)
+                    }
+                    Class::Duplicate(_) | Class::Hidden(_) | Class::Unknown(_) => {
+                        (None, IxKind::Diag)
+                    }
+                },
+                SourceItem::Invalid | SourceItem::TooLarge => (None, IxKind::Diag),
+                SourceItem::Skipping | SourceItem::Incomplete | SourceItem::Damaged(_) => continue,
+            };
+            index.entries.push(Ix {
+                ts,
+                offset: record.ordinal,
+                kind,
+            });
+            feed.indexed_until = record.ordinal + 1;
+            index.end = feed.indexed_until;
+        }
+        if index.entries.len() > limits.cap {
+            index.entries = Vec::new();
+            index.over = true;
+            return Err(too_large());
+        }
+        if batch.done {
+            index.end = parsed.end.max(feed.indexed_until);
+            index.feed = None;
+            index.building = false;
+            done = true;
+            break;
+        }
+        if fresh >= step || bytes >= budget.max_bytes {
+            break;
+        }
+    }
+    if done || index.feed.is_none() {
+        index.end = parsed.end.max(index.end);
+        index.building = false;
+        // Anchors use `(timestamp, ordinal)`; archives are decoded in ordinal order,
+        // which need not match when recorded timestamps decrease.
+        index.entries.sort_unstable_by_key(Ix::key);
+        return Ok(Indexed::Ready(index));
+    }
+    index.building = true;
+    Ok(Indexed::Building(WorkProgress {
+        records: fresh,
+        expanded_bytes: bytes,
+    }))
 }
 
 impl Index {
@@ -1893,10 +3303,87 @@ impl Reader {
 /// rows after the anchor; backward the rows before it, oldest first. A diagnostic
 /// record belongs to the page of the next row after it in that order, or to the
 /// last page, so both directions partition diagnostics identically.
+/// Sequential or pre-collected access to the records a page names.
+trait Lines {
+    /// `None` means a diagnostic this page deliberately did not retain.
+    fn line(&mut self, offset: u64) -> io::Result<Option<Line>>;
+}
+
+impl Lines for Reader {
+    fn line(&mut self, offset: u64) -> io::Result<Option<Line>> {
+        Reader::line(self, offset).map(Some)
+    }
+}
+
+/// Records already decoded from an archive, addressed by expanded ordinal.
+struct MappedLines {
+    lines: HashMap<u64, Line>,
+}
+
+impl Lines for MappedLines {
+    fn line(&mut self, offset: u64) -> io::Result<Option<Line>> {
+        Ok(self.lines.remove(&offset))
+    }
+}
+
+/// Expanded ordinals a page needs, chosen in the same order [`page`] consumes
+/// entries so a compressed source is decoded once for exactly those records.
+fn page_targets(
+    index: &Index,
+    anchor: Option<&PageAnchor>,
+    direction: PageDirection,
+    limits: Limits,
+    shown: &BTreeSet<u64>,
+) -> Vec<u64> {
+    let at = match anchor {
+        Some(anchor) => match index.position(anchor) {
+            Some(at) => Some(at),
+            None => return Vec::new(),
+        },
+        None => None,
+    };
+    let len = index.entries.len();
+    let forward = direction == PageDirection::Forward;
+    let order: Box<dyn Iterator<Item = usize>> = if forward {
+        Box::new(at.map_or(0, |i| i + 1)..len)
+    } else {
+        Box::new((0..at.unwrap_or(len)).rev())
+    };
+    let mut out = Vec::new();
+    let mut events = 0usize;
+    let mut diags = 0usize;
+    for i in order {
+        let entry = index.entries[i];
+        if entry.kind == IxKind::Diag {
+            // Mirror `page`: diagnostics before the first backward row and beyond
+            // the diagnostic cap are never read, so they are not retained either.
+            let keep_diag = forward || anchor.is_none() || events > 0;
+            if !keep_diag || diags >= DIAG_CAP {
+                continue;
+            }
+            diags += 1;
+            out.push(entry.offset);
+            continue;
+        }
+        out.push(entry.offset);
+        if entry.displayed(shown) {
+            // `page` maps one event past its record limit to decide `has_more`;
+            // that lookahead record must be collected too.
+            events += 1;
+            if events > limits.max_events {
+                break;
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 fn page(
     mapper: &Mapper<'_>,
     index: &Index,
-    reader: &mut Reader,
+    reader: &mut impl Lines,
     anchor: Option<&PageAnchor>,
     direction: PageDirection,
     limits: Limits,
@@ -1935,7 +3422,18 @@ fn page(
                 continue;
             }
         }
-        let line = reader.line(entry.offset)?;
+        let Some(line) = reader.line(entry.offset)? else {
+            // Diagnostics beyond the retention cap are not collected; page reports
+            // the truncation without treating them as records.
+            if entry.kind == IxKind::Diag {
+                truncated = true;
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "collected record is unavailable",
+            ));
+        };
         match mapper.map(&line) {
             Mapped::Diag(d) => {
                 if !keep_diag {
@@ -1943,7 +3441,7 @@ fn page(
                 }
                 push_diag(
                     if forward { &mut pending } else { &mut diags },
-                    d,
+                    *d,
                     &mut truncated,
                 );
             }
@@ -2051,16 +3549,20 @@ fn fingerprint(path: &Path, end: u64) -> Option<u64> {
 
 fn find<'a>(
     states: &'a HashMap<PathBuf, FileState>,
+    current: &HashMap<SessionKey, PathBuf>,
     key: &SessionKey,
 ) -> Result<&'a FileState, ProviderError> {
-    let SourceKey::File(path) = &key.source else {
+    if key.harness != Harness::Codex {
+        return Err(ProviderError::Unsupported("not a Codex session".into()));
+    }
+    if !matches!(&key.source, SourceKey::File(_)) {
         return Err(ProviderError::Unsupported(
             "not a Codex file session".into(),
         ));
-    };
-    if key.provider != Provider::Codex {
-        return Err(ProviderError::Unsupported("not a Codex session".into()));
     }
+    let path = current
+        .get(key)
+        .ok_or_else(|| ProviderError::Unavailable("unknown Codex session".into()))?;
     let state = states
         .get(path)
         .filter(|s| s.key() == *key)
@@ -2075,6 +3577,22 @@ fn find<'a>(
 /// bytes that were scanned. A replaced or rewritten file must not be read through
 /// the old offsets.
 fn verified_end(state: &FileState) -> Result<u64, ProviderError> {
+    if state.compressed {
+        // A compressed source is addressed by record count; its stamp must still be the one
+        // the scan observed, because decompressed offsets are never stored.
+        let Ok(meta) = fs::metadata(&state.source.path) else {
+            return Err(ProviderError::Unavailable(
+                "source changed since the last refresh".into(),
+            ));
+        };
+        return if state.parsed.stamp_meta == Some((meta.len(), meta.modified().ok())) {
+            Ok(state.parsed.end)
+        } else {
+            Err(ProviderError::Unavailable(
+                "source changed since the last refresh".into(),
+            ))
+        };
+    }
     if state.source_intact() {
         Ok(state.parsed.end)
     } else {
@@ -2084,41 +3602,132 @@ fn verified_end(state: &FileState) -> Result<u64, ProviderError> {
     }
 }
 
-impl ProviderReader for CodexScanner {
-    fn provider(&self) -> Provider {
-        Provider::Codex
-    }
-
-    fn refresh(
+impl CodexScanner {
+    fn page_ready(
         &mut self,
-        now: Timestamp,
-        budget: RefreshBudget,
-    ) -> Result<ProviderDelta, ProviderError> {
-        self.scan_roster(now, budget)
-    }
-
-    fn transcript_page(
-        &mut self,
+        job: ReadJobId,
         key: &SessionKey,
         anchor: Option<PageAnchor>,
         direction: PageDirection,
         request: PageRequest,
-    ) -> Result<TranscriptPage, ProviderError> {
-        let state = find(&self.states, key)?;
-        let end = verified_end(state)?;
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<TranscriptPage>, ProviderError> {
+        if let Some(progress) = self.prepare(job, key, budget)? {
+            return Ok(ReadProgress::Pending(progress));
+        }
+        let (compressed, physical, generation, shown, version) = {
+            let state = find(&self.states, &self.current, key)?;
+            (
+                state.compressed,
+                state.source.path.clone(),
+                state.parsed.generation,
+                state.parsed.shown.clone(),
+                state.parsed.version.clone(),
+            )
+        };
         let max = self.config.max_record_bytes;
-        let index = ensure_index(&mut self.index, state, max, self.index_limits)?;
+        let limits = Limits {
+            max_events: request.max_events.max(1),
+            max_bytes: request.max_bytes,
+        };
+        if compressed {
+            let Some(slot) = Self::index_slot(&mut self.indexes, &physical) else {
+                self.ledger.join(key, job);
+                return Ok(ReadProgress::Pending(WorkProgress::default()));
+            };
+            let state = find(&self.states, &self.current, key)?;
+            let index = match ensure_index(slot, state, max, self.index_limits, budget)? {
+                Indexed::Building(progress) => {
+                    self.ledger.join(key, job);
+                    return Ok(ReadProgress::Pending(progress));
+                }
+                Indexed::Ready(index) => index,
+            };
+            let targets = page_targets(index, anchor.as_ref(), direction, limits, &shown);
+            let slot = (key.clone(), job);
+            let current = match self.archives.get(&slot) {
+                Some(ArchiveJob::Page(page)) => page.targets == targets,
+                _ => false,
+            };
+            if !current {
+                let reader = SourceReader::open(&physical, max)
+                    .map_err(|e| ProviderError::Io(format!("{:?}", e.kind())))?;
+                self.archives.insert(
+                    slot.clone(),
+                    ArchiveJob::Page(ArchivePage {
+                        reader,
+                        targets,
+                        at: 0,
+                        mapped: HashMap::new(),
+                        retained_bytes: 0,
+                    }),
+                );
+            }
+            let collected = match self.archives.get_mut(&slot) {
+                Some(ArchiveJob::Page(page)) => page.step(budget),
+                _ => Err(ProviderError::Internal("page job vanished".into())),
+            };
+            return match collected {
+                Ok(PageCollect::Pending(progress)) => {
+                    self.ledger.join(key, job);
+                    Ok(ReadProgress::Pending(progress))
+                }
+                Ok(PageCollect::Ready(mut lines)) => {
+                    self.archives.remove(&slot);
+                    self.ledger.release(key, job);
+                    let index = self
+                        .indexes
+                        .get(&physical)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| ProviderError::Internal("archive index vanished".into()))?;
+                    let mapper = Mapper {
+                        key,
+                        path: &physical,
+                        compressed: true,
+                        generation,
+                        version: version.as_deref(),
+                        shown: &shown,
+                        cap: request.max_bytes.clamp(1, PREVIEW_CAP),
+                    };
+                    page(
+                        &mapper,
+                        index,
+                        &mut lines,
+                        anchor.as_ref(),
+                        direction,
+                        limits,
+                    )
+                    .map(ReadProgress::Ready)
+                    .map_err(|e| io_error(&e))
+                }
+                Err(error) => {
+                    self.archives.remove(&slot);
+                    self.ledger.release(key, job);
+                    Err(error)
+                }
+            };
+        }
+        let state = find(&self.states, &self.current, key)?;
+        let end = verified_end(state)?;
+        let Some(slot) = Self::index_slot(&mut self.indexes, &state.source.path) else {
+            self.ledger.join(key, job);
+            return Ok(ReadProgress::Pending(WorkProgress::default()));
+        };
+        let index = match ensure_index(slot, state, max, self.index_limits, budget)? {
+            Indexed::Building(progress) => {
+                self.ledger.join(key, job);
+                return Ok(ReadProgress::Pending(progress));
+            }
+            Indexed::Ready(index) => index,
+        };
         let mapper = Mapper {
             key,
             path: &state.source.path,
+            compressed: false,
             generation: state.parsed.generation,
             version: state.parsed.version.as_deref(),
             shown: &state.parsed.shown,
             cap: request.max_bytes.clamp(1, PREVIEW_CAP),
-        };
-        let limits = Limits {
-            max_events: request.max_events.max(1),
-            max_bytes: request.max_bytes,
         };
         let mut reader = Reader {
             file: File::open(&state.source.path).map_err(|e| io_error(&e))?,
@@ -2133,33 +3742,69 @@ impl ProviderReader for CodexScanner {
             direction,
             limits,
         )
+        .map(ReadProgress::Ready)
         .map_err(|e| io_error(&e))
     }
 
-    fn count_events_after(
+    fn details_ready(
         &mut self,
+        job: ReadJobId,
         key: &SessionKey,
-        anchor: &PageAnchor,
-    ) -> Result<usize, ProviderError> {
-        let state = find(&self.states, key)?;
-        verified_end(state)?;
-        let max = self.config.max_record_bytes;
-        let index = ensure_index(&mut self.index, state, max, self.index_limits)?;
-        let key = (anchor.timestamp, anchor.source_order);
-        let from = index.entries.partition_point(|e| e.key() <= key);
-        Ok(index.entries[from..]
-            .iter()
-            .filter(|e| e.displayed(&state.parsed.shown))
-            .count())
+        anchor: Option<PageAnchor>,
+        request: PageRequest,
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<SessionDetailPage>, ProviderError> {
+        let first = anchor.is_none();
+        // Compactions and events share one record/byte allowance.
+        let mut compactions = Vec::new();
+        let mut request = request;
+        let mut cut = false;
+        if first {
+            if let Some(progress) = self.prepare(job, key, budget)? {
+                return Ok(ReadProgress::Pending(progress));
+            }
+            let state = find(&self.states, &self.current, key)?;
+            compactions = self.compaction_observations(state);
+            let (keep, events) = super::share_details_budget(request, compactions.len(), false);
+            if compactions.len() > keep {
+                compactions.drain(..compactions.len() - keep);
+                cut = true;
+            }
+            request = events;
+        }
+        let page =
+            match self.page_ready(job, key, anchor, PageDirection::Backward, request, budget)? {
+                ReadProgress::Pending(progress) => return Ok(ReadProgress::Pending(progress)),
+                ReadProgress::Ready(page) => page,
+            };
+        let truncated = page.truncated || cut;
+        // Codex records cumulative usage snapshots, never per-request ledgers, so no
+        // request rows exist to report.
+        Ok(ReadProgress::Ready(SessionDetailPage {
+            requests: Vec::new(),
+            compactions,
+            recent: page.events,
+            next: page.next,
+            has_more: page.has_more,
+            truncated,
+        }))
     }
 
-    fn source_record(&mut self, locator: &SourceLocator) -> Result<SourceRecord, ProviderError> {
+    fn file_record(
+        &mut self,
+        job: ReadJobId,
+        locator: &SourceLocator,
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<SourceRecord>, ProviderError> {
         let LocatorKind::FileOffset { path, offset } = &locator.kind else {
             return Err(ProviderError::Unsupported(
                 "not a Codex file locator".into(),
             ));
         };
-        let state = find(&self.states, &locator.session)?;
+        if let Some(progress) = self.prepare(job, &locator.session, budget)? {
+            return Ok(ReadProgress::Pending(progress));
+        }
+        let state = find(&self.states, &self.current, &locator.session)?;
         if locator.generation != Some(state.parsed.generation) {
             return Err(ProviderError::Unavailable("stale source locator".into()));
         }
@@ -2202,18 +3847,352 @@ impl ProviderReader for CodexScanner {
             b
         });
         let Some(bytes) = bytes.filter(|b| b.len() <= max) else {
-            return Ok(SourceRecord {
+            return Ok(ReadProgress::Ready(SourceRecord {
                 raw: String::new(),
                 display: String::new(),
                 unavailable: Some(format!("record exceeds the {max}-byte limit")),
-            });
+            }));
         };
         let raw = String::from_utf8_lossy(&bytes).into_owned();
         let display = display_safe(&raw);
-        Ok(SourceRecord {
+        Ok(ReadProgress::Ready(SourceRecord {
             raw,
             display,
             unavailable: None,
+        }))
+    }
+
+    /// A record inside an archived (`.zst`) copy of a rollout under the configured
+    /// root. The decoder is per `(session, job)`, so one job's indexing can never
+    /// move another's position, and it is dropped the moment the job ends.
+    fn archived_record(
+        &mut self,
+        job: ReadJobId,
+        locator: &SourceLocator,
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<SourceRecord>, ProviderError> {
+        let LocatorKind::CompressedRecord { path, .. } = &locator.kind else {
+            return Err(ProviderError::Unsupported(
+                "not a Codex archive locator".into(),
+            ));
+        };
+        let allowed = locator.session.harness == Harness::Codex
+            && self.roots.iter().any(|root| path.starts_with(&root.path))
+            && path
+                .file_name()
+                .is_some_and(|n| is_rollout_name(&n.to_string_lossy()))
+            && path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("zst"))
+            && !path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+        if !allowed {
+            return Err(ProviderError::Unsupported(
+                "archive locator is outside the configured Codex roots".into(),
+            ));
+        }
+        // A discovered session's locator names the physical source and generation
+        // that produced it. A replaced archive (a new generation) is stale even
+        // though a fresh decoder would start at generation zero.
+        let discovered = self
+            .current
+            .get(&locator.session)
+            .and_then(|p| self.known.get(p))
+            .is_some_and(|known| known.key == locator.session);
+        if discovered {
+            if let Some(progress) = self.prepare(job, &locator.session, budget)? {
+                return Ok(ReadProgress::Pending(progress));
+            }
+            let state = find(&self.states, &self.current, &locator.session)?;
+            if locator.generation != Some(state.parsed.generation) || *path != state.source.path {
+                return Err(ProviderError::Unavailable("stale source locator".into()));
+            }
+            match fs::metadata(path) {
+                Ok(meta) if state.parsed.stamp_meta != Some((meta.len(), meta.modified().ok())) => {
+                    return Err(ProviderError::Unavailable("stale source locator".into()));
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    return Err(ProviderError::Unavailable("stale source locator".into()));
+                }
+            }
+        }
+        let slot = (locator.session.clone(), job);
+        if !self.archives.contains_key(&slot) {
+            let reader = SourceReader::open(path, self.config.max_record_bytes)
+                .map_err(|e| ProviderError::Io(format!("{:?}", e.kind())))?;
+            self.archives
+                .insert(slot.clone(), ArchiveJob::Record(reader));
+        }
+        let outcome = match self.archives.get_mut(&slot) {
+            Some(ArchiveJob::Record(reader)) => {
+                // Any generation the archive already passed was validated against the
+                // discovered state above; this decoder starts by observing the same
+                // physical file, so its own generation is the baseline.
+                let mut physical = locator.clone();
+                // The logical key may be a confirmed live identity whose copy moved to
+                // the archived store; this decoder addresses the current physical file.
+                physical.session.source =
+                    SourceKey::File(crate::ingest::source::canonical_rollout_identity(path));
+                physical.generation = Some(reader.generation());
+                reader.record(&physical, budget)
+            }
+            Some(ArchiveJob::Page(_)) => {
+                return Err(ProviderError::Internal(
+                    "archive job is serving a page".into(),
+                ));
+            }
+            None => return Err(ProviderError::Internal("archive reader vanished".into())),
+        };
+        match outcome {
+            Ok(SourceRecordProgress::Pending) => {
+                self.ledger.join(&locator.session, job);
+                Ok(ReadProgress::Pending(WorkProgress::default()))
+            }
+            Ok(SourceRecordProgress::Ready(record)) => {
+                self.archives.remove(&slot);
+                self.ledger.release(&locator.session, job);
+                Ok(ReadProgress::Ready(record))
+            }
+            Ok(SourceRecordProgress::Stale) => {
+                self.archives.remove(&slot);
+                self.ledger.release(&locator.session, job);
+                Err(ProviderError::Unavailable("stale source locator".into()))
+            }
+            Err(e) => {
+                self.archives.remove(&slot);
+                self.ledger.release(&locator.session, job);
+                Err(ProviderError::Io(format!("{:?}", e.kind())))
+            }
+        }
+    }
+}
+
+impl ProviderReader for CodexScanner {
+    fn harness(&self) -> Harness {
+        Harness::Codex
+    }
+
+    fn discover(
+        &mut self,
+        _now: Timestamp,
+        budget: RefreshBudget,
+    ) -> Result<DiscoveryDelta, ProviderError> {
+        let deadline = Instant::now() + Duration::from_millis(budget.max_millis);
+        if self.walk.is_none() && self.queue.is_empty() {
+            self.pass_id += 1;
+            self.pass_sources = 0;
+            self.seen_keys.clear();
+            self.queue = (0..self.roots.len()).collect();
+        }
+        let mut found = Found::default();
+        let (mut records, mut bytes) = (0usize, 0usize);
+        let mut finished = false;
+        let mut root: Option<RootSpec> = self.walk_root.clone();
+        loop {
+            if self.walk.is_none() {
+                let Some(index) = self.queue.pop_front() else {
+                    finished = true;
+                    break;
+                };
+                let spec = self.roots[index].clone();
+                self.walk = Some(Walk::new_in(
+                    Harness::Codex,
+                    Some(&spec.path),
+                    spec.explicit,
+                ));
+                self.walk_root = Some(spec.clone());
+                root = Some(spec);
+            }
+            let Some(walk) = self.walk.as_mut() else {
+                break;
+            };
+            let batch = walk.step(1, deadline);
+            found.warnings.extend(walk.take_warnings());
+            let done = walk.is_done();
+            if done {
+                self.walk = None;
+                self.walk_root = None;
+                finished = self.queue.is_empty();
+            }
+            for source in batch {
+                self.pass_sources += 1;
+                records += 1;
+                if let Some(root) = root.as_ref() {
+                    self.visit(source, root, &mut bytes, &mut found);
+                }
+            }
+            if finished
+                || records >= budget.max_records
+                || bytes >= budget.max_bytes
+                || Instant::now() >= deadline
+            {
+                break;
+            }
+        }
+        if finished {
+            self.finish_pass(&mut found);
+        }
+        Ok(DiscoveryDelta {
+            sessions: found.sessions,
+            removed: found.removed,
+            invalidated: std::mem::take(&mut self.invalidated),
+            warnings: found.warnings,
+            scan: ScanProgress {
+                harness: Harness::Codex,
+                scanned: self.pass_sources,
+                total: finished.then_some(self.pass_sources),
+                done: finished,
+            },
         })
+    }
+
+    fn hydrate(
+        &mut self,
+        job: ReadJobId,
+        key: &SessionKey,
+        _now: Timestamp,
+        budget: RefreshBudget,
+    ) -> Result<HydrationDelta, ProviderError> {
+        let path = self.discovered(key)?;
+        let mut meter = Meter::new(budget);
+        self.ledger.join(key, job);
+        let advance = self.step_state(&path, key, &mut meter);
+        let Some(state) = self.states.get(&path) else {
+            self.ledger.release(key, job);
+            return Err(ProviderError::Internal("hydration state vanished".into()));
+        };
+        match advance {
+            Advance::Exhausted => {
+                let p = &state.parsed;
+                let meta = build_meta(
+                    p,
+                    state.id(),
+                    &state.canonical,
+                    state.activity(),
+                    state.available,
+                    p.parent.clone().map(SessionLink::Unresolved),
+                    state.archived,
+                );
+                Ok(HydrationDelta {
+                    summary: SessionSummary::unhydrated(meta),
+                    done: false,
+                })
+            }
+            Advance::Done => {
+                let summary = self.summarize(state);
+                self.ledger.release(key, job);
+                Ok(HydrationDelta {
+                    summary,
+                    done: true,
+                })
+            }
+        }
+    }
+
+    fn cancel_read(&mut self, key: &SessionKey, job: ReadJobId) {
+        self.archives.remove(&(key.clone(), job));
+        if !self.ledger.release(key, job) {
+            return;
+        }
+        // The last consumer is gone: abandoned partial work goes, healthy state stays.
+        let Some(path) = self.current_path(key) else {
+            return;
+        };
+        if self
+            .states
+            .get(&path)
+            .is_some_and(|s| !s.reached_eof && s.id() == key.native_id)
+        {
+            self.states.remove(&path);
+        }
+        if self
+            .indexes
+            .get(&path)
+            .and_then(Option::as_ref)
+            .is_some_and(|i| i.building)
+        {
+            self.indexes.remove(&path);
+        }
+    }
+
+    fn details_page(
+        &mut self,
+        job: ReadJobId,
+        key: &SessionKey,
+        anchor: Option<PageAnchor>,
+        request: PageRequest,
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<SessionDetailPage>, ProviderError> {
+        let result = self.details_ready(job, key, anchor, request, budget);
+        self.settle(key, job, &result);
+        result
+    }
+
+    fn transcript_page(
+        &mut self,
+        job: ReadJobId,
+        key: &SessionKey,
+        anchor: Option<PageAnchor>,
+        direction: PageDirection,
+        request: PageRequest,
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<TranscriptPage>, ProviderError> {
+        let result = self.page_ready(job, key, anchor, direction, request, budget);
+        self.settle(key, job, &result);
+        result
+    }
+
+    fn count_events_after(
+        &mut self,
+        job: ReadJobId,
+        key: &SessionKey,
+        anchor: &PageAnchor,
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<usize>, ProviderError> {
+        let result = (|| {
+            if let Some(progress) = self.prepare(job, key, budget)? {
+                return Ok(ReadProgress::Pending(progress));
+            }
+            let state = find(&self.states, &self.current, key)?;
+            verified_end(state)?;
+            let max = self.config.max_record_bytes;
+            let Some(slot) = Self::index_slot(&mut self.indexes, &state.source.path) else {
+                self.ledger.join(key, job);
+                return Ok(ReadProgress::Pending(WorkProgress::default()));
+            };
+            let index = match ensure_index(slot, state, max, self.index_limits, budget)? {
+                Indexed::Building(progress) => {
+                    self.ledger.join(key, job);
+                    return Ok(ReadProgress::Pending(progress));
+                }
+                Indexed::Ready(index) => index,
+            };
+            let at = (anchor.timestamp, anchor.source_order);
+            let from = index.entries.partition_point(|e| e.key() <= at);
+            Ok(ReadProgress::Ready(
+                index.entries[from..]
+                    .iter()
+                    .filter(|e| e.displayed(&state.parsed.shown))
+                    .count(),
+            ))
+        })();
+        self.settle(key, job, &result);
+        result
+    }
+
+    fn source_record(
+        &mut self,
+        job: ReadJobId,
+        locator: &SourceLocator,
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<SourceRecord>, ProviderError> {
+        let result = match &locator.kind {
+            LocatorKind::CompressedRecord { .. } => self.archived_record(job, locator, budget),
+            _ => self.file_record(job, locator, budget),
+        };
+        self.settle(&locator.session, job, &result);
+        result
     }
 }

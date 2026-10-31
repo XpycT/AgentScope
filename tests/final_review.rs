@@ -94,7 +94,7 @@ fn user_message(conn: &rusqlite::Connection, id: &str, at: i64, text: &str) {
 }
 
 #[test]
-fn opencode_open_failure_at_startup_is_retried_by_refresh() {
+fn opencode_open_failure_at_startup_is_retried_by_discovery() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("opencode.db");
     let config = config_for_db(&db);
@@ -106,16 +106,14 @@ fn opencode_open_failure_at_startup_is_retried_by_refresh() {
         max_bytes: 1_000_000,
         max_millis: 60_000,
     };
-    assert!(reader.refresh(NOW, budget).is_err(), "still missing");
+    assert!(reader.discover(NOW, budget).is_err(), "still missing");
 
     let conn = create_v2(&db);
     insert_session(&conn, &Session::new("ses_1", 1_000, 1_000));
     user_message(&conn, "m1", 1_100, "hello");
 
     // The same reader instance recovers once the database exists.
-    let delta = reader
-        .refresh(NOW, budget)
-        .expect("retry opens the database");
+    let delta = support::world::rescan(&mut reader, NOW, budget);
     assert_eq!(delta.sessions.len(), 1);
 }
 
@@ -170,7 +168,8 @@ fn opencode_arrivals_stay_unread_across_a_background_invalidation_reload() {
     pump_until(&mut app, &mut ctx, &worker, |a| {
         a.transcript().is_some_and(|t| t.events().len() == 4)
     });
-    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('k'));
+    press(&mut app, KeyCode::Char('k'));
     assert_eq!(app.transcript().unwrap().selected(), 1);
 
     user_message(&conn, "m4", 2_000, "arrived one");
@@ -322,7 +321,7 @@ fn real_codex_adapter_lineage_reaches_the_session_info_screen() {
     };
     let mut sessions = Vec::new();
     loop {
-        let d = scanner.refresh(NOW, budget).unwrap();
+        let d = support::world::rescan(&mut scanner, NOW, budget);
         sessions.extend(d.sessions);
         if d.scan.done {
             break;
@@ -333,7 +332,7 @@ fn real_codex_adapter_lineage_reaches_the_session_info_screen() {
     let ctx = ctx();
     let draw_session = |app: &App, ctx: &RosterContext| {
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 50)).unwrap();
         terminal
             .draw(|f| agentscope::ui::render(f, app, ctx))
             .unwrap();
@@ -353,8 +352,8 @@ fn real_codex_adapter_lineage_reaches_the_session_info_screen() {
         let target = app
             .visible_rows()
             .iter()
-            .find(|r| r.session.key.provider_session_id == child)
-            .map(|r| r.session.key.clone())
+            .find(|r| r.session.meta.key.native_id == child)
+            .map(|r| r.session.meta.key.clone())
             .expect("child in roster");
         app.move_selection(isize::MIN);
         for _ in 0..4 {
@@ -366,7 +365,10 @@ fn real_codex_adapter_lineage_reaches_the_session_info_screen() {
         assert_eq!(app.selected_key(), Some(target));
         assert!(app.open_inspector());
         let requests = app.take_requests();
-        let Some(WorkerRequest::Select { request_id, .. }) = requests.first() else {
+        let Some(WorkerRequest::Select { request_id, .. }) = requests
+            .iter()
+            .find(|r| matches!(r, WorkerRequest::Select { .. }))
+        else {
             panic!("expected Select");
         };
         let page = agentscope::domain::TranscriptPage {
@@ -387,8 +389,6 @@ fn real_codex_adapter_lineage_reaches_the_session_info_screen() {
 
 #[test]
 fn real_claude_usage_with_server_tools_shows_categories_pricing_date_and_fee_note() {
-    use agentscope::config::{PriceEntry, PriceSchedule};
-    use agentscope::domain::Provider;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("projects");
     let record = json!({"type":"assistant","uuid":"a","sessionId":"s","timestamp":"2026-10-29T10:00:00Z",
@@ -397,32 +397,25 @@ fn real_claude_usage_with_server_tools_shows_categories_pricing_date_and_fee_not
         "cache_read_input_tokens":2,"server_tool_use":{"web_search_requests":2,"web_fetch_requests":0}}}});
     support::write_lines(&root.join("p/s.jsonl"), &[record.to_string()]);
     let mut config = claude_config(&root);
-    config.pricing = PriceSchedule::new(vec![PriceEntry {
-        provider: Provider::Claude,
-        model: "claude-test".into(),
-        as_of: Some("2026-09-15".into()),
-        input_per_mtok: 3.0,
-        cached_input_per_mtok: None,
-        cache_write_per_mtok: Some(4.0),
-        cache_write_5m_per_mtok: None,
-        cache_write_1h_per_mtok: None,
-        cache_read_per_mtok: Some(1.0),
-        output_per_mtok: 5.0,
-        reasoning_per_mtok: None,
-    }])
-    .unwrap();
+    config.pricing = support::facts::price_schedule(
+        r#"[{"billing_provider":"anthropic","model":"claude-test","as_of":"2026-09-15",
+            "rates":{"input":3.0,"output":5.0,"cache_read":1.0,"cache_write":4.0}}]"#,
+    );
     let mut scanner = ClaudeScanner::new(&config).unwrap();
     let budget = agentscope::domain::RefreshBudget {
         max_records: 1000,
         max_bytes: 1_000_000,
         max_millis: 60_000,
     };
-    let sessions = scanner.refresh(NOW, budget).unwrap().sessions;
+    let sessions = support::world::rescan(&mut scanner, NOW, budget).sessions;
     let mut app = new_app();
     app.apply_roster(sessions, vec![]);
     assert!(app.open_inspector());
     let requests = app.take_requests();
-    let Some(WorkerRequest::Select { request_id, .. }) = requests.first() else {
+    let Some(WorkerRequest::Select { request_id, .. }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
         panic!("expected Select");
     };
     assert!(app.apply_transcript(

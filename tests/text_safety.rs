@@ -241,3 +241,22 @@ fn credential_arguments_with_separators_are_still_masked() {
         assert!(!out.contains("hunter2") && !out.contains("value"), "{out}");
     }
 }
+
+#[test]
+fn one_line_cells_never_start_a_new_screen_row() {
+    use agentscope::ui::widgets::{fit, one_line};
+    let hostile = "evil\x1b[31m title\u{202e}\nsecond\r\nline\x07 \x1b]0;owned\x07end";
+    let cell = one_line(hostile);
+    assert!(
+        !cell.contains(['\n', '\r', '\x1b', '\x07', '\u{202e}']),
+        "{cell:?}"
+    );
+    assert!(cell.contains("evil") && cell.contains("second") && cell.contains("end"));
+    assert!(
+        !cell.contains("owned"),
+        "an OSC title payload is dropped, not shown"
+    );
+    // A fitted cell is exactly as wide as its column, whatever it held.
+    assert_eq!(fit(&cell, 12).chars().count(), 12);
+    assert_eq!(fit(&cell, 40).chars().count(), 40);
+}

@@ -1,13 +1,14 @@
 mod support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use agentscope::config::Config;
 use agentscope::domain::{
-    Actor, Event, EventKind, LocatorKind, PageAnchor, PageDirection, PageRequest, Provider,
+    Actor, Event, EventKind, Harness, LocatorKind, PageAnchor, PageDirection, PageRequest,
     RefreshBudget, SessionKey, SourceKey, SourceLocator, ToolStatus, TranscriptPage,
 };
+use agentscope::providers::ProviderError;
 use agentscope::providers::opencode::OpenCodeScanner;
-use agentscope::providers::{ProviderError, ProviderReader};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use support::NOW;
@@ -30,17 +31,28 @@ fn tmp() -> tempfile::TempDir {
 
 fn key(id: &str) -> SessionKey {
     SessionKey {
-        provider: Provider::OpenCode,
-        provider_session_id: id.to_owned(),
+        harness: Harness::OpenCode,
+        native_id: id.to_owned(),
         source: SourceKey::DbRow {
+            database: DATABASE.with(|d| d.borrow().clone()),
             table: "session_v2".into(),
             id: id.to_owned(),
         },
     }
 }
 
+thread_local! {
+    /// Database of the scanner this test thread opened last; keys are built from it.
+    static DATABASE: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
+}
+
 fn scanner_for(db: &Path) -> OpenCodeScanner {
-    OpenCodeScanner::new(&config_for_db(db)).expect("scanner")
+    scanner_with(db, &config_for_db(db))
+}
+
+fn scanner_with(db: &Path, config: &Config) -> OpenCodeScanner {
+    DATABASE.with(|d| *d.borrow_mut() = db.to_path_buf());
+    OpenCodeScanner::new(config).expect("scanner")
 }
 
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, Connection) {
@@ -66,9 +78,16 @@ fn page(
     direction: PageDirection,
     request: PageRequest,
 ) -> TranscriptPage {
-    scanner
-        .transcript_page(&key("ses_1"), anchor, direction, request)
-        .expect("page")
+    support::world::try_transcript(
+        scanner,
+        &key("ses_1"),
+        anchor,
+        direction,
+        request,
+        BIG,
+        support::world::STEPS,
+    )
+    .expect("page")
 }
 
 fn all(scanner: &mut OpenCodeScanner) -> TranscriptPage {
@@ -157,7 +176,7 @@ fn maps_user_assistant_system_compaction_idle_and_synthetic() {
     assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
     // The record type is carried in provenance.
     assert_eq!(p.events[4].provenance.record_type, "system");
-    assert_eq!(p.events[4].provenance.provider, Provider::OpenCode);
+    assert_eq!(p.events[4].provenance.harness, Harness::OpenCode);
 }
 
 #[test]
@@ -374,7 +393,8 @@ fn forward_and_backward_pages_are_equivalent_at_equal_timestamps() {
     assert!(!back.has_more);
     // count_events_after the same anchor.
     assert_eq!(
-        s.count_events_after(&key("ses_1"), &anchor).expect("count"),
+        support::world::try_count(&mut s, &key("ses_1"), &anchor, BIG, support::world::STEPS)
+            .expect("count"),
         8
     );
 }
@@ -445,12 +465,13 @@ fn updated_row_invalidates_page_content_and_advances_activity() {
     );
     msg(&conn, "m2", "user", 20, 20, r#"{"text":"next"}"#);
     let mut s = scanner_for(&db);
-    let first = s.refresh(NOW, BIG).expect("refresh");
-    let before = first.sessions[0].last_persisted_at;
+    let first = support::world::rescan(&mut s, NOW, BIG);
+    let before = first.sessions[0].meta.activity.at;
     let p = all(&mut s);
     assert_eq!(text(&p.events[0]), "draft");
     let old_locator = p.events[0].text.as_ref().unwrap().locator.clone().unwrap();
-    let rec = s.source_record(&old_locator).expect("source");
+    let rec = support::world::try_source(&mut s, &old_locator, BIG, support::world::STEPS)
+        .expect("source");
     assert!(rec.raw.contains("draft"));
 
     // The provider updates the row in place (same id, same created, later updated).
@@ -470,22 +491,22 @@ fn updated_row_invalidates_page_content_and_advances_activity() {
     );
     // The previous locator now names a superseded generation.
     assert!(matches!(
-        s.source_record(&old_locator),
+        support::world::try_source(&mut s, &old_locator, BIG, support::world::STEPS),
         Err(ProviderError::Unavailable(_))
     ));
     let new_locator = p2.events[0].text.as_ref().unwrap().locator.clone().unwrap();
     assert_ne!(new_locator.generation, old_locator.generation);
     assert!(
-        s.source_record(&new_locator)
+        support::world::try_source(&mut s, &new_locator, BIG, support::world::STEPS)
             .expect("fresh")
             .raw
             .contains("final answer")
     );
     // Roster activity advances.
-    let second = s.refresh(NOW, BIG).expect("refresh");
+    let second = support::world::rescan(&mut s, NOW, BIG);
     assert_eq!(second.sessions.len(), 1);
-    assert!(second.sessions[0].last_persisted_at > before);
-    assert_eq!(second.sessions[0].last_persisted_at, Some(9000));
+    assert!(second.sessions[0].meta.activity.at > before);
+    assert_eq!(second.sessions[0].meta.activity.at, Some(9000));
 }
 
 #[test]
@@ -513,7 +534,7 @@ fn source_only_and_unknown_records_appear_in_diagnostics() {
     );
     let mut config = config_for_db(&db);
     config.max_record_bytes = 1_000;
-    let mut s = OpenCodeScanner::new(&config).expect("scanner");
+    let mut s = scanner_with(&db, &config);
     let p = all(&mut s);
     let ids: Vec<_> = p.events.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(ids, ["m1#0", "m5#0"]);
@@ -544,7 +565,8 @@ fn source_only_and_unknown_records_appear_in_diagnostics() {
     assert!(diags.iter().all(|d| d.3));
     // The oversized body never reaches memory as a preview.
     let m6 = p.diagnostics.last().unwrap();
-    let rec = s.source_record(&m6.locator).expect("source record");
+    let rec = support::world::try_source(&mut s, &m6.locator, BIG, support::world::STEPS)
+        .expect("source record");
     assert!(rec.unavailable.is_some() && rec.raw.is_empty());
 }
 
@@ -570,7 +592,8 @@ fn source_locator_round_trips_and_rejects_foreign_or_stale_locators() {
     let p = all(&mut s);
     let locator = p.events[0].text.as_ref().unwrap().locator.clone().unwrap();
     assert_eq!(locator, p.events[0].provenance.locator);
-    let rec = s.source_record(&locator).expect("source");
+    let rec =
+        support::world::try_source(&mut s, &locator, BIG, support::world::STEPS).expect("source");
     assert!(rec.raw.contains("mine"));
     assert!(rec.unavailable.is_none());
     assert!(
@@ -578,7 +601,9 @@ fn source_locator_round_trips_and_rejects_foreign_or_stale_locators() {
         "display is redacted"
     );
 
-    let reject = |s: &mut OpenCodeScanner, l: SourceLocator| s.source_record(&l);
+    let reject = |s: &mut OpenCodeScanner, l: SourceLocator| {
+        support::world::try_source(s, &l, BIG, support::world::STEPS)
+    };
     // Another session's row.
     let mut foreign = locator.clone();
     foreign.kind = LocatorKind::DbRow {
@@ -641,7 +666,7 @@ fn source_locator_round_trips_and_rejects_foreign_or_stale_locators() {
     ));
     let mut wrong = locator.clone();
     wrong.session = SessionKey {
-        provider: Provider::Codex,
+        harness: Harness::Codex,
         ..key("ses_1")
     };
     assert!(matches!(
@@ -651,15 +676,32 @@ fn source_locator_round_trips_and_rejects_foreign_or_stale_locators() {
     // Forged session key sources are rejected by the page API too.
     let mut forged = key("ses_1");
     forged.source = SourceKey::DbRow {
+        database: DATABASE.with(|d| d.borrow().clone()),
         table: "account".into(),
         id: "ses_1".into(),
     };
     assert!(matches!(
-        s.transcript_page(&forged, None, PageDirection::Forward, ALL),
+        support::world::try_transcript(
+            &mut s,
+            &forged,
+            None,
+            PageDirection::Forward,
+            ALL,
+            BIG,
+            support::world::STEPS
+        ),
         Err(ProviderError::Unsupported(_))
     ));
     assert!(matches!(
-        s.transcript_page(&key("nope"), None, PageDirection::Forward, ALL),
+        support::world::try_transcript(
+            &mut s,
+            &key("nope"),
+            None,
+            PageDirection::Forward,
+            ALL,
+            BIG,
+            support::world::STEPS
+        ),
         Err(ProviderError::Unavailable(_))
     ));
 }
@@ -672,9 +714,16 @@ fn legacy_schema_has_no_transcript_yet() {
     insert_legacy_session(&conn, &Session::new("ses_1", 1, 1));
     insert_legacy_message(&conn, "m1", "ses_1", 1, 1);
     let mut s = scanner_for(&db);
-    let err = s
-        .transcript_page(&key("ses_1"), None, PageDirection::Forward, ALL)
-        .unwrap_err();
+    let err = support::world::try_transcript(
+        &mut s,
+        &key("ses_1"),
+        None,
+        PageDirection::Forward,
+        ALL,
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap_err();
     assert!(matches!(err, ProviderError::Unsupported(_)), "{err:?}");
 }
 
@@ -791,7 +840,7 @@ fn record_cap_is_enforced_in_bytes_for_multibyte_and_nul_text() {
     msg(&conn, "m3", "user", 30, 30, r#"{"text":"small"}"#);
     let mut config = config_for_db(&db);
     config.max_record_bytes = 1_000;
-    let mut s = OpenCodeScanner::new(&config).expect("scanner");
+    let mut s = scanner_with(&db, &config);
     let p = all(&mut s);
     let ids: Vec<_> = p.events.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(ids, ["m3#0"]);
@@ -802,13 +851,14 @@ fn record_cap_is_enforced_in_bytes_for_multibyte_and_nul_text() {
         p.diagnostics
     );
     for d in &p.diagnostics {
-        let rec = s.source_record(&d.locator).expect("record");
+        let rec = support::world::try_source(&mut s, &d.locator, BIG, support::world::STEPS)
+            .expect("record");
         assert!(rec.raw.is_empty());
         assert!(rec.unavailable.as_deref().unwrap().contains("1000-byte"));
     }
     // Exactly at the cap is accepted (bytes, not code points).
     config.max_record_bytes = 1_200 + r#"{"text":""}"#.len();
-    let mut s = OpenCodeScanner::new(&config).expect("scanner");
+    let mut s = scanner_with(&db, &config);
     let p = all(&mut s);
     assert_eq!(p.events[0].id, "m1#0");
 }
@@ -825,16 +875,106 @@ fn in_place_row_update_is_reported_as_invalidated_in_the_delta() {
         r#"{"content":[{"type":"text","text":"draft"}]}"#,
     );
     let mut s = scanner_for(&db);
-    let first = s.refresh(NOW, BIG).expect("refresh");
+    let first = support::world::rescan(&mut s, NOW, BIG);
     assert!(first.invalidated.is_empty(), "first sight is not a change");
-    let again = s.refresh(NOW, BIG).expect("refresh");
+    let again = support::world::rescan(&mut s, NOW, BIG);
     assert!(again.invalidated.is_empty());
     conn.execute(
         "UPDATE session_message SET data = ?1, time_updated = 9000 WHERE id = 'm1'",
         [r#"{"content":[{"type":"text","text":"final"}]}"#],
     )
     .expect("update");
-    let after = s.refresh(NOW, BIG).expect("refresh");
-    assert_eq!(after.invalidated.len(), 1);
-    assert_eq!(after.invalidated[0], after.sessions[0].key);
+    let after = support::world::rescan(&mut s, NOW, BIG);
+    // Only a hydrated session can have its evidence invalidated, and it is reported once.
+    assert!(!after.invalidated.is_empty());
+    assert!(
+        after
+            .invalidated
+            .iter()
+            .all(|k| *k == after.sessions[0].meta.key)
+    );
+}
+
+#[test]
+fn v2_subagent_metadata_links_the_child_only_from_the_supported_shape() {
+    use agentscope::domain::SessionLink;
+    let (_d, db, conn) = fixture();
+    let tool = |id: &str, name: &str, metadata: Value, output: Option<&str>| {
+        let mut state = json!({"status": "completed", "input": {}, "metadata": metadata});
+        if let Some(text) = output {
+            state["output"] = json!(text);
+        }
+        json!({"type": "tool", "id": id, "name": name, "state": state})
+    };
+    let parts = [
+        tool("c1", "subagent", json!({"sessionID": "ses_child"}), None),
+        // Case-sensitive tool name and key: neither may be normalized into a link.
+        tool(
+            "c2",
+            "Subagent",
+            json!({"sessionID": "ses_wrong_name"}),
+            None,
+        ),
+        tool(
+            "c3",
+            "subagent",
+            json!({"sessionid": "ses_wrong_key"}),
+            None,
+        ),
+        tool("c4", "task", json!({"sessionId": "ses_legacy_shape"}), None),
+        // Output text mentioning a session is never authority.
+        tool(
+            "c5",
+            "subagent",
+            json!({}),
+            Some("sessionID: ses_from_output"),
+        ),
+        // Control characters or absurd lengths are not plausible identifiers.
+        tool(
+            "c6",
+            "subagent",
+            json!({"sessionID": "ses_\u{1b}[31m"}),
+            None,
+        ),
+        tool("c7", "subagent", json!({"sessionID": 17}), None),
+    ];
+    msg(
+        &conn,
+        "m1",
+        "assistant",
+        10,
+        10,
+        &json!({"content": [parts[0].clone()], "model": {"id": "m", "providerID": "p"}})
+            .to_string(),
+    );
+    for (i, part) in parts.iter().enumerate().skip(1) {
+        msg(
+            &conn,
+            &format!("m{}", i + 1),
+            "assistant",
+            10 + i as i64,
+            10 + i as i64,
+            &json!({"content": [part], "model": {"id": "m", "providerID": "p"}}).to_string(),
+        );
+    }
+
+    let page = all(&mut scanner_for(&db));
+    let tools: Vec<&Event> = page
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::Tool)
+        .collect();
+    assert_eq!(tools.len(), 7);
+    assert_eq!(
+        tools[0].tool.as_ref().unwrap().child_session,
+        Some(SessionLink::Unresolved("ses_child".into()))
+    );
+    for event in &tools[1..] {
+        assert_eq!(
+            event.tool.as_ref().unwrap().child_session,
+            None,
+            "no guessed jump from {:?}",
+            event.tool.as_ref().unwrap().name
+        );
+    }
 }

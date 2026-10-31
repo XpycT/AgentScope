@@ -1,24 +1,40 @@
 //! Claude project discovery, roster scanning and persisted content mapping.
 //! Usage aggregation is independent from transcript paging.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::DateTime;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::discovery::SourceFile;
-pub use crate::discovery::discover_claude;
+use crate::discovery::{SourceFile, Walk, classify_claude, desktop_stores};
 use crate::domain::*;
 use crate::ingest::jsonl::{ContentHash, JsonlCursor, Record};
 use crate::ingest::text::{display_safe, preview};
-use crate::providers::{ProviderDelta, ProviderError, ProviderReader, SourceRecord};
+use crate::metrics::{TurnTracker, compaction_summary, context_usage, current_context};
+use crate::providers::probe::HEAD_RECORDS;
+use crate::providers::{
+    Admit, DiscoveryDelta, FORGOTTEN_CAP, Forgotten, HydrationDelta, JobLedger, ProviderError,
+    ProviderReader, ReadJobId, ReadProgress, Retention, SourceRecord, WorkProgress,
+};
 use crate::usage::ClaudeLedger;
+
+mod children;
+mod metadata;
+use children::{ChildState, ClaudeChildId, main_path};
+use metadata::{
+    COWORK_ORIGIN, DesktopManifest, Overlay, add_origin, bare_state, probe_claude_metadata,
+    probe_metadata, read_manifest, record_origin,
+};
+
+/// Records a discovery probe parses per source: the leading records and as many
+/// trailing ones as fit (the newest matter most).
+const PROBE_RECORDS: usize = HEAD_RECORDS * 2;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn safe(s: &str) -> BoundedText {
@@ -55,12 +71,23 @@ fn string(v: &Value, key: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
         .map(str::to_owned)
 }
-fn usage(message: &Value, provenance: &Provenance) -> Option<UsageObservation> {
+fn usage(
+    message: &Value,
+    provenance: &Provenance,
+    at: Option<Timestamp>,
+) -> Option<UsageObservation> {
     let u = message.get("usage")?.as_object()?;
     let get = |name: &str| u.get(name).and_then(Value::as_u64);
     let split = u.get("cache_creation");
+    let model = string(message, "model").map(|v| safe(&v).preview);
     Some(UsageObservation {
-        model: string(message, "model").map(|v| safe(&v).preview),
+        model: model.map(|id| ModelDetail {
+            id,
+            provider: None,
+            variant: None,
+            effort: None,
+            configured_effort: None,
+        }),
         scope: UsageScope::Message,
         categories: TokenCategories {
             input: get("input_tokens"),
@@ -79,6 +106,22 @@ fn usage(message: &Value, provenance: &Provenance) -> Option<UsageObservation> {
                 .and_then(Value::as_u64),
             ..Default::default()
         },
+        // Claude Messages usage reports cache counters next to `input_tokens`,
+        // and thinking inside `output_tokens`.
+        accounting: TokenAccounting {
+            input: InputAccounting::AdditiveCaches,
+            output: OutputAccounting::IncludesReasoning,
+        },
+        request: Some(RequestMetadata {
+            id: string(message, "id"),
+            completed_at: at,
+            service_tier: u
+                .get("service_tier")
+                .and_then(Value::as_str)
+                .map(|t| safe(t).preview),
+            ..RequestMetadata::default()
+        }),
+        money: RecordedMoney::default(),
         provenance: provenance.clone(),
     })
 }
@@ -155,11 +198,11 @@ fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript 
         let kind = record.get("type").and_then(Value::as_str).unwrap_or("");
         let loc = locator(key, *offset);
         let prov = Provenance {
-            provider: Provider::Claude,
+            harness: Harness::Claude,
             source: key.source.clone(),
             locator: loc.clone(),
             record_type: kind.into(),
-            provider_version: string(record, "version").map(|v| safe(&v).preview),
+            harness_version: string(record, "version").map(|v| safe(&v).preview),
         };
         let ts = record.get("timestamp").and_then(timestamp);
         let message = &record["message"];
@@ -285,6 +328,7 @@ fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript 
                         started_at: ts,
                         completed_at: None,
                         orphan: false,
+                        child_session: None,
                     };
                     if let Some(id) = id {
                         calls.insert(id, events.len());
@@ -324,6 +368,7 @@ fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript 
                             started_at: None,
                             completed_at: ts,
                             orphan: true,
+                            child_session: None,
                         };
                         emit(
                             &mut events,
@@ -344,7 +389,8 @@ fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript 
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty());
             if id.is_none_or(|id| !observed_usage.contains(id))
-                && let Some(observation) = usage(message, &prov)
+                && let Some(observation) =
+                    usage(message, &prov, record.get("timestamp").and_then(timestamp))
             {
                 events[first_event].usage = Some(observation);
                 if let Some(id) = id {
@@ -391,6 +437,34 @@ fn block_key(uuid: Option<&str>, offset: u64, index: usize) -> BlockKey {
     )
 }
 
+/// Compaction markers retained per session; more mark the history incomplete.
+const MAX_COMPACTIONS: usize = 256;
+
+/// Record-level facts behind `SessionSummary::metrics`, from the parent transcript only.
+struct Facts {
+    turns: TurnTracker,
+    /// Prompt occupancy of the latest parent assistant record, its time and epoch.
+    last_prompt: Option<(u64, Option<Timestamp>, u64)>,
+    prompt_model: Option<ModelDetail>,
+    compactions: Vec<CompactionObservation>,
+    compaction_total: u64,
+}
+
+impl Facts {
+    fn new() -> Self {
+        let mut turns = TurnTracker::default();
+        // Turn spans are recorded only by some versions and not for every turn.
+        turns.mark_incomplete();
+        Self {
+            turns,
+            last_prompt: None,
+            prompt_model: None,
+            compactions: Vec::new(),
+            compaction_total: 0,
+        }
+    }
+}
+
 struct State {
     cursor: Option<JsonlCursor>,
     generation: u64,
@@ -401,13 +475,24 @@ struct State {
     calls: HashSet<String>,
     tool_rows: HashMap<BlockKey, ToolRow>,
     tool_count: usize,
-    emitted: Option<SessionKey>,
+    /// A summary of this state was handed to a consumer, so later in-place changes
+    /// to already-readable content invalidate loaded pages.
+    published: bool,
+    /// Session ID this state was requested under. Discovery fixes a source's key from
+    /// its bounded probe; hydration answers to the same key.
+    pinned: Option<String>,
+    /// A record named a different session ID than the pinned (approximate) key.
+    id_conflict: bool,
     reopen: bool,
-    dirty: bool,
+    /// The scan reached the end of the file; the next hydration starts a new visit.
+    done: bool,
+    /// Recency tick for bounded eviction.
+    used: u64,
     /// Content already readable changed; consumed (and cleared) by the next delta.
     invalidated: bool,
     ledger: ClaudeLedger,
     side_ledger: Option<ClaudeLedger>,
+    facts: Facts,
     parent_seen: bool,
     block_counts: HashMap<(String, usize), (usize, usize)>,
     metadata_entries: usize,
@@ -422,6 +507,10 @@ struct State {
     /// Exact consumed-prefix verification in progress (files up to
     /// [`PREFIX_VERIFY_MAX`]); advanced under the refresh byte budget.
     verify: Option<PrefixVerify>,
+    /// Child identity and lineage, for a `subagents/**/agent-*.jsonl` source.
+    child: Option<ChildState>,
+    /// Path and Desktop facts that no record states.
+    overlay: Overlay,
 }
 
 struct PrefixVerify {
@@ -444,42 +533,42 @@ impl State {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let key = SessionKey {
-            provider: Provider::Claude,
-            provider_session_id: id.clone(),
+            harness: Harness::Claude,
+            native_id: id.clone(),
             source: SourceKey::File(source.path.clone()),
         };
         let summary = SessionSummary {
-            key,
-            title: id,
-            title_derived: false,
-            project: source
-                .path
-                .parent()
-                .and_then(Path::file_name)
-                .map(|s| safe(&s.to_string_lossy()).preview),
-            cwd: None,
-            models: vec![],
-            model_details: vec![],
-            provider_version: None,
-            created_at: None,
-            last_event_at: None,
-            last_persisted_at: None,
-            last_completion: None,
+            meta: SessionMetadata {
+                key,
+                title: id,
+                title_derived: false,
+                project: source
+                    .path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .map(|s| safe(&s.to_string_lossy()).preview),
+                cwd: None,
+                model: None,
+                origins: vec![],
+                created_at: None,
+                activity: ActivityStamp::default(),
+                lineage: Lineage::default(),
+                members: vec![],
+                archived: false,
+                released: ReleaseState::Unknown,
+                source_available: false,
+                harness_version: None,
+            },
+            usage: None,
+            metrics: SessionMetrics::default(),
+            lifecycle: Lifecycle::Unknown,
             unfinished_work: false,
+            last_event_at: None,
+            last_completion: None,
             displayed_event_count: 0,
             hidden_records: 0,
-            source_available: false,
-            archived: false,
-            context_window: None,
             server_tools: None,
-            lifecycle: Lifecycle::Unknown,
             process: ProcessAssociation::NotChecked,
-            usage: None,
-            lineage: Lineage {
-                parent: None,
-                fork: None,
-                sidechain: false,
-            },
             warnings: vec![],
         };
         Self {
@@ -492,9 +581,12 @@ impl State {
             calls: HashSet::new(),
             tool_rows: HashMap::new(),
             tool_count: 0,
-            emitted: None,
+            published: false,
+            pinned: None,
+            id_conflict: false,
             reopen: false,
-            dirty: true,
+            done: false,
+            used: 0,
             invalidated: false,
             ledger: ClaudeLedger::new(entries, bytes),
             side_ledger: Some(ClaudeLedger::new(entries, bytes)),
@@ -507,7 +599,10 @@ impl State {
             counts_approximate: false,
             checked_pass: 0,
             stamp: None,
+            facts: Facts::new(),
             verify: None,
+            child: None,
+            overlay: Overlay::default(),
         }
     }
     /// Starts checking that the file still holds the bytes this cursor consumed. A
@@ -581,14 +676,25 @@ impl State {
         }
     }
     fn reset(&mut self, source: SourceFile, entries: usize, bytes: usize) {
-        let emitted = self.emitted.take();
+        let published = self.published;
+        let pinned = self.pinned.take();
         let cursor = self.cursor.take();
+        let child = self.child.take();
+        let overlay = std::mem::take(&mut self.overlay);
         *self = Self::new(source, entries, bytes);
-        self.emitted = emitted;
+        self.published = published;
+        if let Some(id) = &pinned {
+            self.summary.meta.key.native_id = id.clone();
+        }
+        self.pinned = pinned;
         self.cursor = cursor;
+        if let Some(child) = child {
+            self.restore_child(child);
+        }
+        self.set_overlay(overlay);
     }
     fn warning(&mut self, label: &str, kind: WarningKind, message: &str) {
-        let source = match &self.summary.key.source {
+        let source = match &self.summary.meta.key.source {
             SourceKey::File(p) => format!("{}#{label}", p.display()),
             _ => label.into(),
         };
@@ -602,7 +708,7 @@ impl State {
         } else {
             self.summary.warnings.push(Warning {
                 key: WarningKey {
-                    provider: Provider::Claude,
+                    harness: Harness::Claude,
                     source,
                     kind,
                 },
@@ -610,13 +716,12 @@ impl State {
                 count: 1,
             });
         }
-        self.dirty = true;
     }
     /// Turn lifecycle from persisted evidence: an `end_turn` stop completes the turn,
     /// a `tool_use` stop or later genuine user/tool work leaves it open. Sidechains
     /// belong to subagents and never move the parent's lifecycle.
-    fn track_turn(&mut self, kind: &str, v: &Value) {
-        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+    fn track_turn(&mut self, kind: &str, v: &Value, sidechain: bool) {
+        if sidechain {
             return;
         }
         let msg = &v["message"];
@@ -626,7 +731,7 @@ impl State {
                     self.summary.last_completion = v
                         .get("timestamp")
                         .and_then(timestamp)
-                        .or(self.summary.last_persisted_at)
+                        .or(self.summary.meta.activity.at)
                         .or(self.summary.last_completion);
                     self.summary.unfinished_work = false;
                     self.summary.lifecycle = Lifecycle::Completed;
@@ -674,37 +779,181 @@ impl State {
         self.summary.unfinished_work = true;
         self.summary.lifecycle = Lifecycle::Ongoing;
     }
-    fn ingest(&mut self, offset: u64, v: &Value, prices: &crate::config::PriceSchedule) {
-        if let Some(id) = string(v, "sessionId") {
-            self.summary.key.provider_session_id = id;
+    /// Parent-transcript record facts: turn spans from `turn_duration` records,
+    /// `compact_boundary` markers, and the latest assistant record's prompt occupancy
+    /// (`input + cache_creation + cache_read`, never output or lifetime totals).
+    fn track_metrics(
+        &mut self,
+        offset: u64,
+        kind: &str,
+        v: &Value,
+        prices: &crate::pricing::PriceSchedule,
+        policy: crate::pricing::ReferencePolicy,
+    ) {
+        let at = v.get("timestamp").and_then(timestamp);
+        match kind {
+            "system" => match v.get("subtype").and_then(Value::as_str) {
+                Some("turn_duration") => {
+                    let span = at.zip(v.get("durationMs").and_then(Value::as_u64));
+                    if let Some((end, ms)) = span
+                        && let Some(start) = i64::try_from(ms).ok().and_then(|m| end.checked_sub(m))
+                    {
+                        self.facts.turns.start(Some(start));
+                        self.facts.turns.end(Some(end));
+                    }
+                }
+                Some("compact_boundary") => {
+                    self.facts.compaction_total += 1;
+                    // Keep the newest markers: `latest` must describe the newest event.
+                    if self.facts.compactions.len() >= MAX_COMPACTIONS {
+                        self.facts.compactions.remove(0);
+                    }
+                    let meta = v.get("compactMetadata");
+                    let observation = CompactionObservation {
+                        id: format!("claude:{offset}"),
+                        timestamp: at,
+                        method: None,
+                        trigger: meta
+                            .and_then(|m| string(m, "trigger"))
+                            .map(|t| safe(&t).preview),
+                        summary: None,
+                        before_tokens: meta
+                            .and_then(|m| m.get("preTokens"))
+                            .and_then(Value::as_u64),
+                        after_tokens: None,
+                        duration_ms: None,
+                        usage: None,
+                        scope: CompactionScope::Event,
+                        provenance: Provenance {
+                            harness: Harness::Claude,
+                            source: self.summary.meta.key.source.clone(),
+                            locator: SourceLocator {
+                                generation: Some(self.generation),
+                                ..locator(&self.summary.meta.key, offset)
+                            },
+                            record_type: "system/compact_boundary".into(),
+                            harness_version: self.summary.meta.harness_version.clone(),
+                        },
+                    };
+                    self.facts.compactions.push(observation);
+                }
+                _ => return,
+            },
+            "assistant" => {
+                let usage = &v["message"]["usage"];
+                let get = |name: &str| usage.get(name).and_then(Value::as_u64);
+                let used = get("input_tokens")
+                    .zip(get("cache_creation_input_tokens"))
+                    .zip(get("cache_read_input_tokens"))
+                    .and_then(|((i, w), r)| i.checked_add(w)?.checked_add(r))
+                    .filter(|used| *used > 0);
+                match used {
+                    Some(used) => {
+                        self.facts.last_prompt = Some((used, at, self.facts.compaction_total));
+                        self.facts.prompt_model =
+                            string(&v["message"], "model").map(|id| ModelDetail {
+                                id: safe(&id).preview,
+                                provider: None,
+                                variant: None,
+                                effort: None,
+                                configured_effort: None,
+                            });
+                    }
+                    None => return,
+                }
+            }
+            _ => return,
+        }
+        let facts = &self.facts;
+        let epoch = format!("c{}", facts.compaction_total);
+        let snapshot = context_usage(
+            facts.last_prompt.map(|(used, _, _)| used),
+            None,
+            AggregationClass::Reported,
+            facts.last_prompt.and_then(|(_, at, _)| at),
+            facts.prompt_model.clone(),
+            facts.last_prompt.map(|(_, _, e)| format!("c{e}")),
+        );
+        self.summary.metrics = SessionMetrics {
+            timing: facts.turns.timing(self.summary.meta.created_at),
+            speed: SpeedSummary::default(),
+            context: current_context(&snapshot, Some(&epoch)),
+            compactions: compaction_summary(
+                &facts.compactions,
+                facts.compaction_total as usize == facts.compactions.len(),
+                prices,
+                policy,
+            ),
+        };
+    }
+    fn ingest(
+        &mut self,
+        offset: u64,
+        v: &Value,
+        prices: &crate::pricing::PriceSchedule,
+        policy: crate::pricing::ReferencePolicy,
+    ) {
+        let sidechain = match &self.child {
+            Some(child) => !child.id.owns(v),
+            None => v.get("isSidechain").and_then(Value::as_bool) == Some(true),
+        };
+        if let SourceKey::File(path) = &self.summary.meta.key.source
+            && let Some(child) = self.child.as_mut()
+            && child.absorb(path, v)
+        {
+            self.summary.meta.lineage = child.lineage.clone();
+        }
+        if self.child.is_none()
+            && let Some(id) = string(v, "sessionId")
+        {
+            if self.pinned.is_none() {
+                self.summary.meta.key.native_id = id;
+            } else if self.pinned.as_deref() != Some(id.as_str()) {
+                self.id_conflict = true;
+            }
         }
         if let Some(cwd) = string(v, "cwd") {
             let p = PathBuf::from(cwd);
-            self.summary.project = p.file_name().map(|n| safe(&n.to_string_lossy()).preview);
-            self.summary.cwd = Some(p);
+            // A child's records repeat the parent's working directory; its project
+            // stays the session directory it sits under.
+            if self.child.is_none() {
+                self.summary.meta.project =
+                    p.file_name().map(|n| safe(&n.to_string_lossy()).preview);
+            }
+            self.summary.meta.cwd = Some(p);
         }
         if let Some(version) = string(v, "version") {
-            self.summary.provider_version = Some(safe(&version).preview);
+            self.summary.meta.harness_version = Some(safe(&version).preview);
         }
-        self.summary.lineage.sidechain |=
-            v.get("isSidechain").and_then(Value::as_bool) == Some(true);
-        if let Some(parent) =
-            string(v, "parentSessionId").or_else(|| string(v, "parent_session_id"))
-        {
-            self.summary.lineage.parent = Some(SessionLink::Unresolved(parent));
-        } else if self.summary.lineage.sidechain
-            && self.summary.lineage.parent.is_none()
-            && let Some(parent) = string(v, "parentUuid")
-        {
-            self.summary.lineage.parent = Some(SessionLink::Unresolved(parent));
+        if self.child.is_none() {
+            self.summary.meta.lineage.sidechain |= sidechain;
+            // `parentUuid` is a message UUID, never a session; only an explicit
+            // session ID names a parent.
+            if let Some(parent) =
+                string(v, "parentSessionId").or_else(|| string(v, "parent_session_id"))
+            {
+                self.summary.meta.lineage.parent = Some(SessionLink::Unresolved(parent));
+            }
         }
         if let Some(t) = v.get("timestamp").and_then(timestamp) {
-            self.summary.created_at = Some(self.summary.created_at.map_or(t, |old| old.min(t)));
-            self.summary.last_persisted_at =
-                Some(self.summary.last_persisted_at.map_or(t, |old| old.max(t)));
+            self.summary.meta.created_at =
+                Some(self.summary.meta.created_at.map_or(t, |old| old.min(t)));
+            self.summary.meta.activity = ActivityStamp {
+                at: Some(self.summary.meta.activity.at.map_or(t, |old| old.max(t))),
+                class: AggregationClass::Reported,
+            };
+        }
+        // Origin evidence follows the same ownership rule as usage and lifecycle:
+        // an inherited or inline sidechain record does not label this session.
+        if !sidechain && let Some(origin) = record_origin(v, v.get("timestamp").and_then(timestamp))
+        {
+            add_origin(&mut self.summary.meta.origins, origin);
         }
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
-        self.track_turn(kind, v);
+        self.track_turn(kind, v, sidechain);
+        if !sidechain {
+            self.track_metrics(offset, kind, v, prices, policy);
+        }
         if kind == "ai-title" {
             self.generated = v
                 .get("aiTitle")
@@ -713,7 +962,6 @@ impl State {
                 .or(self.generated.take());
         }
         let msg = &v["message"];
-        let sidechain = v.get("isSidechain").and_then(Value::as_bool) == Some(true);
         if !sidechain && (kind == "user" || kind == "assistant") {
             if !self.parent_seen {
                 self.summary.usage = None;
@@ -724,16 +972,16 @@ impl State {
         }
         if kind == "assistant" {
             let prov = Provenance {
-                provider: Provider::Claude,
-                source: self.summary.key.source.clone(),
+                harness: Harness::Claude,
+                source: self.summary.meta.key.source.clone(),
                 locator: SourceLocator {
                     generation: Some(self.generation),
-                    ..locator(&self.summary.key, offset)
+                    ..locator(&self.summary.meta.key, offset)
                 },
                 record_type: kind.into(),
-                provider_version: self.summary.provider_version.clone(),
+                harness_version: self.summary.meta.harness_version.clone(),
             };
-            let observation = usage(msg, &prov);
+            let observation = usage(msg, &prov, v.get("timestamp").and_then(timestamp));
             let tools = msg
                 .get("usage")
                 .and_then(|u| u.get("server_tool_use"))
@@ -758,18 +1006,34 @@ impl State {
                     msg.get("id").and_then(Value::as_str),
                     observation.as_ref(),
                     tools,
+                    prices,
+                    policy,
                 );
             }
         }
         if self.parent_seen && kind == "assistant" && !sidechain {
-            self.summary.usage = self.ledger.summary(prices);
+            self.summary.usage = self.ledger.summary();
             self.summary.server_tools = self.ledger.server_tools();
         }
+        // Parent records own the parent model; sidechain evidence only fills a
+        // source that has no parent record yet.
         if kind == "assistant"
+            && (!sidechain || !self.parent_seen)
             && let Some(model) = string(msg, "model").map(|s| safe(&s).preview)
-            && !self.summary.models.contains(&model)
+            && self
+                .summary
+                .meta
+                .model
+                .as_ref()
+                .is_none_or(|m| m.id != model)
         {
-            self.summary.models.push(model);
+            self.summary.meta.model = Some(ModelDetail {
+                id: model,
+                provider: None,
+                variant: None,
+                effort: None,
+                configured_effort: None,
+            });
         }
         if kind == "user"
             && self.prompt.is_none()
@@ -882,7 +1146,7 @@ impl State {
                     // A result that retires an already-displayed pending call changes
                     // that row in place, so a loaded page is stale.
                     if !row.call
-                        && self.emitted.is_some()
+                        && self.published
                         && row.id.as_ref().is_some_and(|id| self.calls.contains(id))
                     {
                         self.invalidated = true;
@@ -915,7 +1179,7 @@ impl State {
                 }
             }
         }
-        let mapped = map_indexed(&self.summary.key, &[(offset, v)]);
+        let mapped = map_indexed(&self.summary.meta.key, &[(offset, v)]);
         self.summary.hidden_records += mapped.hidden_records;
         for e in mapped.events {
             if let Some(t) = e.timestamp {
@@ -941,129 +1205,581 @@ impl State {
         } else if let Some(t) = &self.prompt {
             (t.clone(), true)
         } else {
-            (safe(&self.summary.key.provider_session_id).preview, false)
+            (safe(&self.summary.meta.key.native_id).preview, false)
         };
-        self.summary.title = name;
-        self.summary.title_derived = derived;
-        self.dirty = true;
+        self.summary.meta.title = name;
+        self.summary.meta.title_derived = derived;
     }
 }
-struct Pass {
-    id: u64,
-    sources: Vec<SourceFile>,
-    next: usize,
+/// Lightweight facts about one discovered source. The full parse lives in `states`.
+struct Known {
+    key: SessionKey,
+    len: u64,
+    modified: SystemTime,
+    /// Discovery pass that last saw this source.
+    pass: u64,
+    /// The source could be opened; an unreadable one is probed again every pass.
+    available: bool,
 }
-/// Incremental roster scanner; transcript bodies are not retained.
+
+struct Meter {
+    started: Instant,
+    records: usize,
+    bytes: usize,
+    budget: RefreshBudget,
+}
+
+impl Meter {
+    fn new(budget: RefreshBudget) -> Self {
+        Self {
+            started: Instant::now(),
+            records: 0,
+            bytes: 0,
+            budget,
+        }
+    }
+    fn spent(&self) -> bool {
+        self.records >= self.budget.max_records
+            || self.bytes >= self.budget.max_bytes
+            || self.started.elapsed().as_millis() >= u128::from(self.budget.max_millis)
+    }
+    fn progress(&self) -> WorkProgress {
+        WorkProgress {
+            records: self.records,
+            expanded_bytes: self.bytes,
+        }
+    }
+}
+
+enum Scanned {
+    Done,
+    Exhausted,
+}
+
+/// Discovery output accumulated across one call.
+#[derive(Default)]
+struct Found {
+    sessions: Vec<SessionMetadata>,
+    removed: Vec<SessionKey>,
+    warnings: Vec<Warning>,
+}
+
+fn file_path(key: &SessionKey) -> Result<PathBuf, ProviderError> {
+    if key.harness != Harness::Claude {
+        return Err(ProviderError::Unsupported("not a Claude session".into()));
+    }
+    match &key.source {
+        SourceKey::File(path) => Ok(path.clone()),
+        SourceKey::DbRow { .. } => Err(ProviderError::Unsupported(
+            "not a Claude file session".into(),
+        )),
+    }
+}
+
+fn modified_ms(modified: SystemTime) -> Option<Timestamp> {
+    let since = modified.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_millis()).ok()
+}
+
+/// A transcript root: the Claude projects store, an explicit extra root, or a
+/// local Cowork project root found under a Desktop data directory.
+#[derive(Clone, Debug)]
+struct RootSpec {
+    path: PathBuf,
+    cowork: bool,
+    /// The user named it, so a missing root is reported.
+    explicit: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    Idle,
+    /// Reading Desktop Code session manifests, which enrich transcripts.
+    Manifests,
+    Walking,
+}
+
+/// Incremental scanner; transcript bodies are not retained.
 pub struct ClaudeScanner {
     config: Config,
+    /// Hydrated (or hydrating) sessions, bounded by `max_cached_sessions`.
     states: HashMap<PathBuf, State>,
-    pass: Option<Pass>,
-    index: Option<TranscriptIndex>,
-    pass_counter: u64,
+    walk: Option<Walk>,
+    /// Every transcript root known to this reader (Cowork roots are rediscovered
+    /// at the start of each pass).
+    roots: Vec<RootSpec>,
+    /// Roots still to be walked in this pass.
+    queue: VecDeque<usize>,
+    stage: Stage,
+    manifest_queue: Vec<PathBuf>,
+    building: HashMap<String, DesktopManifest>,
+    /// Desktop manifests of the last completed manifest stage, by `cliSessionId`.
+    manifests: HashMap<String, DesktopManifest>,
+    pass_id: u64,
+    pass_sources: usize,
+    known: HashMap<PathBuf, Known>,
+    /// Discovered sources per duplicate-ID scope, for duplicate-ID warnings.
+    by_id: HashMap<String, Vec<PathBuf>>,
+    /// Child sources per (owning session source, agent), so a nested spawner
+    /// resolves inside its own family only — never by a session-directory name that
+    /// another project may reuse.
+    children_by_agent: HashMap<(PathBuf, String), PathBuf>,
+    /// Children whose scoped parent is not tracked yet, waiting per the same key.
+    unresolved_children: HashMap<(PathBuf, String), Vec<PathBuf>>,
+    /// Newest-first retention that bounds `known`/`by_id` to the metadata ceiling.
+    retention: Retention<PathBuf>,
+    /// Evicted sources that may still be frozen into a roster or read by a job.
+    forgotten: Forgotten<PathBuf, SessionKey>,
+    invalidated: Vec<SessionKey>,
+    ledger: JobLedger,
+    indexes: HashMap<PathBuf, Option<TranscriptIndex>>,
+    tick: u64,
 }
 impl ClaudeScanner {
     /// Map persisted records without paging or loading source files.
     pub fn map_transcript(key: &SessionKey, records: &[(u64, Value)]) -> ClaudeTranscript {
         map_transcript(key, records)
     }
+    /// Cheap: no filesystem access until the first `discover`.
     pub fn new(config: &Config) -> Result<Self, ProviderError> {
         Ok(Self {
             config: config.clone(),
             states: HashMap::new(),
-            pass: None,
-            index: None,
-            pass_counter: 0,
+            walk: None,
+            roots: config
+                .harnesses
+                .claude
+                .root
+                .iter()
+                .chain(&config.harnesses.claude.extra_roots)
+                .map(|path| RootSpec {
+                    path: path.clone(),
+                    cowork: false,
+                    explicit: true,
+                })
+                .collect(),
+            queue: VecDeque::new(),
+            stage: Stage::Idle,
+            manifest_queue: Vec::new(),
+            building: HashMap::new(),
+            manifests: HashMap::new(),
+            pass_id: 0,
+            pass_sources: 0,
+            known: HashMap::new(),
+            by_id: HashMap::new(),
+            children_by_agent: HashMap::new(),
+            unresolved_children: HashMap::new(),
+            retention: Retention::new(config.max_metadata_sources, config.max_metadata_bytes),
+            forgotten: Forgotten::new(FORGOTTEN_CAP),
+            invalidated: Vec::new(),
+            ledger: JobLedger::default(),
+            indexes: HashMap::new(),
+            tick: 0,
         })
     }
-    pub fn scan_roster(
+
+    /// The index slot of `path`, making room by dropping a completed index first.
+    fn index_slot<'a>(
+        indexes: &'a mut HashMap<PathBuf, Option<TranscriptIndex>>,
+        path: &Path,
+    ) -> Option<&'a mut Option<TranscriptIndex>> {
+        if !indexes.contains_key(path) && indexes.len() >= MAX_INDEXES {
+            // Only completed indexes may be dropped; when every slot is a live
+            // in-progress index the caller leaves the new job pending instead.
+            let victim = indexes
+                .iter()
+                .find(|(_, i)| i.as_ref().is_none_or(|i| i.ready))
+                .map(|(p, _)| p.clone())?;
+            indexes.remove(&victim);
+        }
+        Some(indexes.entry(path.to_path_buf()).or_insert(None))
+    }
+
+    /// Sessions with retained hydration state (bounded by `max_cached_sessions`).
+    pub fn cached_sessions(&self) -> usize {
+        self.states.len()
+    }
+
+    /// `(session, job)` pairs still holding partial work.
+    pub fn job_state(&self) -> usize {
+        self.ledger.len()
+    }
+
+    fn limit_warning(&self) -> Warning {
+        Warning {
+            key: WarningKey {
+                harness: Harness::Claude,
+                source: "metadata-limit".into(),
+                kind: WarningKind::Unsupported,
+            },
+            message: format!(
+                "Discovery limited: only the newest {} Claude sources are tracked; \
+                 raise max_metadata_sources to see more",
+                self.config.max_metadata_sources
+            ),
+            count: 1,
+        }
+    }
+
+    fn count_id(&mut self, id: &str, path: &Path) {
+        let paths = self.by_id.entry(id.to_owned()).or_default();
+        if !paths.iter().any(|p| p == path) {
+            paths.push(path.to_path_buf());
+        }
+        if paths.len() == 2 {
+            // The first source now has a duplicate; probe it again so a cached summary
+            // is rehydrated with the warning.
+            self.mark_stale(id);
+        }
+    }
+
+    fn uncount_id(&mut self, id: &str, path: &Path) {
+        if let Some(paths) = self.by_id.get_mut(id) {
+            paths.retain(|p| p != path);
+            if paths.is_empty() {
+                self.by_id.remove(id);
+            } else if paths.len() == 1 {
+                self.mark_stale(id);
+            }
+        }
+    }
+
+    /// Forces the next pass to probe every source of `id` again.
+    fn mark_stale(&mut self, id: &str) {
+        for path in self.by_id.get(id).into_iter().flatten() {
+            if let Some(known) = self.known.get_mut(path) {
+                known.len = u64::MAX;
+            }
+        }
+    }
+
+    /// Probes one source (bounded head and tail only) and records it.
+    fn visit(
         &mut self,
-        _now: Timestamp,
-        budget: RefreshBudget,
-    ) -> Result<ProviderDelta, ProviderError> {
-        let mut warnings = Vec::new();
-        let mut pass = match self.pass.take() {
-            Some(p) => p,
-            None => {
-                let d = discover_claude(&self.config)?;
-                warnings = d.warnings;
-                self.pass_counter += 1;
-                Pass {
-                    id: self.pass_counter,
-                    sources: d.sources,
-                    next: 0,
-                }
+        source: SourceFile,
+        limits: RefreshBudget,
+        bytes: &mut usize,
+        found: &mut Found,
+    ) {
+        if let Some(known) = self.known.get_mut(&source.path)
+            && known.available
+            && known.len == source.len
+            && known.modified == source.modified
+        {
+            known.pass = self.pass_id;
+            return;
+        }
+        let Some((root, cowork)) = self
+            .root_of(&source.path)
+            .map(|r| (r.path.clone(), r.cowork))
+        else {
+            return;
+        };
+        let main = self.main_key(&source.path);
+        let (mut meta, available) = match probe_metadata(
+            &source.path,
+            &root,
+            limits,
+            self.config.max_record_bytes,
+            main.clone(),
+        ) {
+            Ok((meta, read)) => {
+                *bytes = bytes.saturating_add(read);
+                (meta, true)
+            }
+            Err(_) => {
+                found.warnings.push(Warning {
+                    key: WarningKey {
+                        harness: Harness::Claude,
+                        source: format!("{}#unavailable", source.path.display()),
+                        kind: WarningKind::Unavailable,
+                    },
+                    message: "source unavailable".into(),
+                    count: 1,
+                });
+                (
+                    bare_state(&root, source.clone(), main, 16, 1 << 16)
+                        .summary
+                        .meta,
+                    false,
+                )
             }
         };
-        let start = Instant::now();
-        let mut count = 0usize;
-        let mut bytes = 0usize;
-        while pass.next < pass.sources.len()
-            && count < budget.max_records
-            && bytes < budget.max_bytes
-            && start.elapsed().as_millis() < u128::from(budget.max_millis)
+        self.overlay_for(&source.path, &meta.key.native_id, cowork)
+            .apply(&mut meta);
+        // A nested spawner whose transcript is discovered later resolves exactly
+        // inside this family; outside it the link stays scoped and orphaned.
+        self.remember_child(&source.path);
+        self.resolve_scoped_parent(&source.path, &mut meta);
+        if meta
+            .lineage
+            .parent
+            .as_ref()
+            .is_some_and(|link| children::scoped_parent(link).is_some())
         {
-            let source = pass.sources[pass.next].clone();
-            let state = self.states.entry(source.path.clone()).or_insert_with(|| {
-                State::new(
-                    source.clone(),
-                    self.config.dedup_ledger_entries,
-                    self.config.dedup_ledger_bytes,
-                )
-            });
+            self.note_unresolved_child(&source.path, &meta);
+        }
+        let dup = self.dup_key(&source.path, &meta.key.native_id);
+        meta.source_available = available;
+        if meta.activity.at.is_none() {
+            meta.activity = ActivityStamp {
+                at: modified_ms(source.modified),
+                class: AggregationClass::Derived,
+            };
+        }
+        let weight = crate::roster::metadata_bytes(&meta) + source.path.as_os_str().len();
+        match self.retention.admit(&source.path, meta.activity.at, weight) {
+            Admit::Dropped | Admit::Displaced => {
+                // Bookkeeping only: a tracked source that no longer fits is forgotten
+                // (and watched for deletion), never reported as removed.
+                self.forget(&source.path);
+                found.warnings.push(self.limit_warning());
+                return;
+            }
+            Admit::Kept { evicted } => {
+                // Eviction only forgets this adapter's bookkeeping: the files still
+                // exist and stay readable, so no removal is reported.
+                self.forgotten.remove(&source.path);
+                for path in evicted {
+                    self.forget(&path);
+                    found.warnings.push(self.limit_warning());
+                }
+            }
+        }
+        if let Some(old) = self.known.get(&source.path)
+            && old.key != meta.key
+        {
+            let old_key = old.key.clone();
+            let old_dup = self.dup_key(&source.path, &old_key.native_id);
+            self.uncount_id(&old_dup, &source.path);
+            found.removed.push(old_key);
+        }
+        self.count_id(&dup, &source.path);
+        self.known.insert(
+            source.path.clone(),
+            Known {
+                key: meta.key.clone(),
+                len: source.len,
+                modified: source.modified,
+                pass: self.pass_id,
+                available,
+            },
+        );
+        found.sessions.push(meta);
+    }
+
+    /// Tracks a child's agent ID within its family, for exact parent resolution.
+    fn remember_child(&mut self, path: &Path) {
+        let Some(child) = self
+            .root_of(path)
+            .and_then(|root| ClaudeChildId::of(&root.path, path))
+        else {
+            return;
+        };
+        let Some(owner) = main_path(path) else {
+            return;
+        };
+        let scope = (owner.clone(), child.agent_id);
+        if self
+            .children_by_agent
+            .insert(scope.clone(), path.to_path_buf())
+            .is_none()
+        {
+            // A spawner just became known: children visited before it were left
+            // orphaned, so they are probed again and republish the resolved edge.
+            for waiting in self.unresolved_children.remove(&scope).unwrap_or_default() {
+                self.mark_stale_path(&waiting);
+            }
+        }
+    }
+
+    /// Forces the next pass to probe `path` again even though its source is unchanged.
+    fn mark_stale_path(&mut self, path: &Path) {
+        if let Some(known) = self.known.get_mut(path) {
+            known.len = u64::MAX;
+        }
+    }
+
+    /// Replaces a family-scoped parent-agent link with the exact key when that
+    /// spawner's transcript is a tracked source of the same family. `path` is the
+    /// child's own source, which decides the family (two projects may use the same
+    /// session-directory name).
+    fn resolve_scoped_parent(&self, path: &Path, meta: &mut SessionMetadata) {
+        let Some(link) = meta.lineage.parent.as_ref() else {
+            return;
+        };
+        let Some((_, agent)) = children::scoped_parent(link) else {
+            return;
+        };
+        let Some(owner) = main_path(path) else {
+            return;
+        };
+        let Some(source) = self.children_by_agent.get(&(owner, agent.to_owned())) else {
+            return;
+        };
+        meta.lineage.parent = Some(SessionLink::Resolved(SessionKey {
+            harness: Harness::Claude,
+            native_id: agent.to_owned(),
+            source: SourceKey::File(source.clone()),
+        }));
+    }
+
+    /// Remembers a child whose scoped parent is not known yet, so it is re-probed
+    /// when that spawner is discovered.
+    fn note_unresolved_child(&mut self, path: &Path, meta: &SessionMetadata) {
+        let Some(link) = meta.lineage.parent.as_ref() else {
+            return;
+        };
+        let Some((_, agent)) = children::scoped_parent(link) else {
+            return;
+        };
+        let Some(owner) = main_path(path) else {
+            return;
+        };
+        let waiting = self
+            .unresolved_children
+            .entry((owner, agent.to_owned()))
+            .or_default();
+        if !waiting.iter().any(|p| p == path) {
+            waiting.push(path.to_path_buf());
+        }
+    }
+
+    /// A pass finished: sources it did not see are gone.
+    fn finish_pass(&mut self, found: &mut Found) {
+        let gone: Vec<PathBuf> = self
+            .known
+            .iter()
+            .filter(|(_, k)| k.pass != self.pass_id)
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in gone {
+            self.retention.remove(&path);
+            self.forgotten.remove(&path);
+            if let Some(known) = self.known.remove(&path) {
+                let dup = self.dup_key(&path, &known.key.native_id);
+                self.uncount_id(&dup, &path);
+                found.removed.push(known.key);
+            }
+            self.forget_child(path.clone());
+            self.states.remove(&path);
+        }
+        // Forgotten sources are not walked into `known`; a bounded existence check lets a
+        // genuine deletion of a frozen or in-flight row reach the roster.
+        for path in self.forgotten.keys() {
+            match std::fs::metadata(&path) {
+                Ok(_) => {}
+                // Only a confirmed absence is a deletion; any other error keeps the watch.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(key) = self.forgotten.remove(&path) {
+                        found.removed.push(key);
+                    }
+                }
+                Err(_) => found.warnings.push(Warning {
+                    key: WarningKey {
+                        harness: Harness::Claude,
+                        source: format!("{}#unavailable", path.display()),
+                        kind: WarningKind::Unavailable,
+                    },
+                    message: "source unavailable".into(),
+                    count: 1,
+                }),
+            }
+        }
+    }
+
+    fn source_file(&self, path: &Path) -> SourceFile {
+        match std::fs::metadata(path) {
+            Ok(meta) => SourceFile {
+                path: path.to_path_buf(),
+                modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                len: meta.len(),
+            },
+            Err(_) => SourceFile {
+                path: path.to_path_buf(),
+                modified: SystemTime::UNIX_EPOCH,
+                len: 0,
+            },
+        }
+    }
+
+    /// One bounded slice of scanning `path` under `key`.
+    fn scan(&mut self, path: &Path, key: &SessionKey, meter: &mut Meter) -> Scanned {
+        self.tick += 1;
+        if self
+            .states
+            .get(path)
+            .is_some_and(|s| s.summary.meta.key.native_id != key.native_id)
+        {
+            self.states.remove(path);
+        }
+        let source = self.source_file(path);
+        let (entries, ledger_bytes) = (
+            self.config.dedup_ledger_entries,
+            self.config.dedup_ledger_bytes,
+        );
+        if !self.states.contains_key(path) {
+            let state = self.fresh_state(path, key, source.clone(), entries, ledger_bytes);
+            self.states.insert(path.to_path_buf(), state);
+        }
+        let Some(state) = self.states.get_mut(path) else {
+            return Scanned::Done;
+        };
+        state.used = self.tick;
+        if state.done {
+            state.done = false;
+            state.checked_pass = 0;
+        }
+        let outcome = loop {
+            if meter.spent() {
+                break Scanned::Exhausted;
+            }
             if state.cursor.is_none() {
                 state.cursor =
-                    JsonlCursor::open(source.path.clone(), self.config.max_record_bytes).ok();
+                    JsonlCursor::open(path.to_path_buf(), self.config.max_record_bytes).ok();
                 if state.cursor.is_some() && state.reopen {
-                    state.reset(
-                        source.clone(),
-                        self.config.dedup_ledger_entries,
-                        self.config.dedup_ledger_bytes,
-                    );
+                    state.reset(source.clone(), entries, ledger_bytes);
                 }
             }
             let mut verdict = Verdict::Intact;
-            if state.checked_pass != pass.id {
-                state.checked_pass = pass.id;
+            if state.checked_pass != 1 {
+                state.checked_pass = 1;
                 state.verify = None;
-                let meta = std::fs::metadata(&source.path)
+                let meta = std::fs::metadata(path)
                     .ok()
                     .map(|m| (m.len(), m.modified().ok()));
                 if let Some(meta) = meta
                     && state.cursor.is_some()
                     && Some(meta) != state.stamp
                 {
-                    verdict = state.begin_verify(&source.path, meta);
+                    verdict = state.begin_verify(path, meta);
                 }
             }
             if state.verify.is_some() {
-                let (read, v) = state.verify_step(budget.max_bytes.saturating_sub(bytes).max(1));
-                bytes = bytes.saturating_add(read);
+                let left = meter.budget.max_bytes.saturating_sub(meter.bytes).max(1);
+                let (read, v) = state.verify_step(left);
+                meter.bytes = meter.bytes.saturating_add(read);
                 verdict = v;
             }
             match verdict {
                 Verdict::Pending => continue,
                 Verdict::Changed => {
                     // Consumed bytes changed in place: nothing parsed from them holds.
-                    state.reset(
-                        source.clone(),
-                        self.config.dedup_ledger_entries,
-                        self.config.dedup_ledger_bytes,
-                    );
+                    state.reset(source.clone(), entries, ledger_bytes);
                     state.cursor =
-                        JsonlCursor::open(source.path.clone(), self.config.max_record_bytes).ok();
+                        JsonlCursor::open(path.to_path_buf(), self.config.max_record_bytes).ok();
                     state.invalidated = true;
-                    state.checked_pass = pass.id;
-                    state.stamp = std::fs::metadata(&source.path)
+                    state.checked_pass = 1;
+                    state.stamp = std::fs::metadata(path)
                         .ok()
                         .map(|m| (m.len(), m.modified().ok()));
                 }
                 Verdict::Intact => {}
             }
             let Some(cursor) = state.cursor.as_mut() else {
-                state.summary.source_available = false;
-                state.dirty = true;
-                pass.next += 1;
-                continue;
+                state.summary.meta.source_available = false;
+                state.done = true;
+                break Scanned::Done;
             };
             let before = cursor.position();
             let rotations = cursor.rotation_count();
@@ -1071,14 +1787,10 @@ impl ClaudeScanner {
             let after = cursor.position();
             let rotated = cursor.rotation_count() != rotations;
             if rotated {
-                state.reset(
-                    source.clone(),
-                    self.config.dedup_ledger_entries,
-                    self.config.dedup_ledger_bytes,
-                );
+                state.reset(source.clone(), entries, ledger_bytes);
                 state.invalidated = true;
             }
-            bytes = bytes.saturating_add(
+            meter.bytes = meter.bytes.saturating_add(
                 usize::try_from(if rotated {
                     after
                 } else {
@@ -1088,155 +1800,592 @@ impl ClaudeScanner {
             );
             match result {
                 Ok(Some(Record::Json { offset, value })) => {
-                    state.summary.source_available = true;
-                    state.ingest(offset, &value, &self.config.pricing);
-                    count += 1;
+                    state.summary.meta.source_available = true;
+                    state.ingest(
+                        offset,
+                        &value,
+                        &self.config.pricing,
+                        self.config.reference_policy(Harness::Claude),
+                    );
+                    meter.records += 1;
                 }
                 Ok(None) => {
-                    state.summary.source_available = true;
+                    state.summary.meta.source_available = true;
                     if !state.parent_seen
                         && let Some(ledger) = &state.side_ledger
                     {
-                        let usage = ledger.summary(&self.config.pricing);
-                        let tools = ledger.server_tools();
-                        if state.summary.usage != usage || state.summary.server_tools != tools {
-                            state.summary.usage = usage;
-                            state.summary.server_tools = tools;
-                            state.dirty = true;
-                        }
+                        state.summary.usage = ledger.summary();
+                        state.summary.server_tools = ledger.server_tools();
                     }
-                    pass.next += 1;
+                    state.done = true;
+                    break Scanned::Done;
                 }
                 Ok(Some(Record::Incomplete { .. })) => {
-                    state.summary.source_available = true;
-                    pass.next += 1;
+                    state.summary.meta.source_available = true;
+                    state.done = true;
+                    break Scanned::Done;
                 }
                 Ok(Some(Record::Skipping { .. })) => {
                     // Oversized line still draining; bytes were charged above.
-                    state.summary.source_available = true;
+                    state.summary.meta.source_available = true;
                 }
                 Ok(Some(Record::Invalid { .. })) => {
-                    state.summary.source_available = true;
+                    state.summary.meta.source_available = true;
                     state.warning("malformed", WarningKind::Parse, "malformed records skipped");
-                    count += 1;
+                    meter.records += 1;
                 }
                 Ok(Some(Record::TooLarge { .. })) => {
-                    state.summary.source_available = true;
+                    state.summary.meta.source_available = true;
                     state.warning(
                         "oversized",
                         WarningKind::Unsupported,
                         "oversized records skipped",
                     );
-                    count += 1;
+                    meter.records += 1;
                 }
                 Err(_) => {
-                    state.summary.source_available = false;
+                    state.summary.meta.source_available = false;
                     state.cursor = None;
                     state.reopen = true;
-                    state.dirty = true;
-                    pass.next += 1;
+                    state.done = true;
+                    break Scanned::Done;
                 }
             }
+        };
+        if matches!(outcome, Scanned::Done)
+            && let (Some(cursor), SourceKey::File(path)) =
+                (&state.cursor, &state.summary.meta.key.source)
+        {
+            let end = cursor.position();
+            if end > PREFIX_VERIFY_MAX
+                && state
+                    .fingerprint
+                    .is_none_or(|(previous, _)| previous != end)
+            {
+                state.fingerprint = fingerprint(path, end).map(|hash| (end, hash));
+            }
         }
-        let done = pass.next == pass.sources.len();
-        let mut removed = Vec::new();
-        if done {
-            let live: HashSet<_> = pass.sources.iter().map(|s| &s.path).collect();
-            self.states.retain(|p, s| {
-                let keep = live.contains(p);
-                if !keep && let Some(key) = s.emitted.take() {
-                    removed.push(key);
-                }
-                keep
-            });
+        if matches!(outcome, Scanned::Done) {
+            self.maintain(path);
         }
-        let mut ids: HashMap<String, usize> = HashMap::new();
-        for state in self.states.values() {
-            *ids.entry(state.summary.key.provider_session_id.clone())
-                .or_default() += 1;
-        }
-        for state in self.states.values_mut() {
-            let count = ids[&state.summary.key.provider_session_id];
-            let source = match &state.summary.key.source {
-                SourceKey::File(p) => format!("{}#duplicate-id", p.display()),
-                _ => "#duplicate-id".into(),
-            };
-            let previous = state
-                .summary
-                .warnings
+        outcome
+    }
+
+    /// Bounds retained states after a scan completes.
+    fn maintain(&mut self, current: &Path) {
+        let cap = self.config.max_cached_sessions.max(1);
+        while self.states.len() > cap {
+            let victim = self
+                .states
                 .iter()
-                .find(|w| w.key.source == source)
-                .map(|w| w.count);
-            let wanted = (count > 1).then(|| u32::try_from(count).unwrap_or(u32::MAX));
-            if previous != wanted {
-                state.summary.warnings.retain(|w| w.key.source != source);
-                if let Some(count) = wanted {
-                    state.summary.warnings.push(Warning {
-                        key: WarningKey {
-                            provider: Provider::Claude,
-                            source,
-                            kind: WarningKind::Unsupported,
-                        },
-                        message: "Duplicate ID: another source shares this session ID".into(),
-                        count,
+                .filter(|(p, s)| {
+                    p.as_path() != current && !self.ledger.has_consumer(&s.summary.meta.key)
+                })
+                .min_by_key(|(_, s)| s.used)
+                .map(|(p, _)| p.clone());
+            match victim {
+                Some(path) => {
+                    self.states.remove(&path);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Drops the bookkeeping of `path` but remembers it, bounded, so a frozen row stays
+    /// readable and a later physical deletion is still noticed.
+    fn forget(&mut self, path: &Path) {
+        if let Some(known) = self.known.remove(path) {
+            let dup = self.dup_key(path, &known.key.native_id);
+            self.uncount_id(&dup, path);
+            // State an active job is still consuming is not disposed of: only the
+            // bookkeeping is forgotten, so a read in flight never restarts.
+            if !self.ledger.has_consumer(&known.key) {
+                self.states.remove(path);
+            }
+            self.forgotten.insert(path.to_path_buf(), known.key);
+        }
+        self.forget_child(path.to_path_buf());
+    }
+
+    /// Drops `path` from the family-scoped child indexes (it is no longer tracked).
+    fn forget_child(&mut self, path: PathBuf) {
+        self.children_by_agent.retain(|_, p| *p != path);
+        for waiting in self.unresolved_children.values_mut() {
+            waiting.retain(|p| *p != path);
+        }
+        self.unresolved_children
+            .retain(|_, waiting| !waiting.is_empty());
+    }
+
+    /// The session ID the discovery probe would assign to the file as it is now.
+    fn probed_id(&self, path: &Path) -> Option<String> {
+        let root = self.root_of(path)?;
+        let limits = RefreshBudget {
+            max_records: PROBE_RECORDS,
+            max_bytes: usize::MAX,
+            max_millis: u64::MAX,
+        };
+        probe_claude_metadata(path, &root.path, limits)
+            .ok()
+            .map(|meta| meta.key.native_id)
+    }
+
+    /// An existing transcript at an allowlisted place under a known root.
+    fn allowlisted(&self, path: &Path) -> bool {
+        self.root_of(path).is_some() && std::fs::metadata(path).is_ok_and(|m| m.is_file())
+    }
+
+    /// The transcript root `path` is an allowlisted source of.
+    fn root_of(&self, path: &Path) -> Option<&RootSpec> {
+        self.roots
+            .iter()
+            .filter(|r| classify_claude(&r.path, path).is_some())
+            .max_by_key(|r| r.path.as_os_str().len())
+    }
+
+    /// The key of the main session a child transcript sits under, once discovered.
+    fn main_key(&self, path: &Path) -> Option<SessionKey> {
+        self.known.get(&main_path(path)?).map(|k| k.key.clone())
+    }
+
+    /// Duplicate-ID scope: a child's agent ID is only unique within its session.
+    fn dup_key(&self, path: &Path, native_id: &str) -> String {
+        // Derived from the path, never from the root registry: a Cowork root that
+        // disappears between passes must not change the key its sources were
+        // counted with.
+        match crate::discovery::claude_family(path) {
+            Some(session) => format!("{session}\u{1f}{native_id}"),
+            None => native_id.to_owned(),
+        }
+    }
+
+    /// Facts about `path` that no record states: its Cowork root, and the Desktop
+    /// manifest naming it by `cliSessionId` (a child has none).
+    fn overlay_for(&self, path: &Path, native_id: &str, cowork: bool) -> Overlay {
+        let mut overlay = Overlay::default();
+        if cowork {
+            add_origin(
+                &mut overlay.origins,
+                OriginObservation::new(OriginSurface::Cowork, Some(COWORK_ORIGIN), None),
+            );
+        }
+        let child = self
+            .root_of(path)
+            .is_some_and(|r| ClaudeChildId::of(&r.path, path).is_some());
+        if !child && let Some(manifest) = self.manifests.get(native_id) {
+            manifest.apply(&mut overlay);
+        }
+        overlay
+    }
+
+    /// A state for hydrating `path` under `key`, bound to its layout and overlay.
+    fn fresh_state(
+        &self,
+        path: &Path,
+        key: &SessionKey,
+        source: SourceFile,
+        entries: usize,
+        ledger_bytes: usize,
+    ) -> State {
+        let root = self.root_of(path).map(|r| (r.path.clone(), r.cowork));
+        let mut state = match &root {
+            Some((root, _)) => bare_state(root, source, self.main_key(path), entries, ledger_bytes),
+            None => State::new(source, entries, ledger_bytes),
+        };
+        state.pinned = Some(key.native_id.clone());
+        state.summary.meta.key.native_id = key.native_id.clone();
+        let cowork = root.is_some_and(|(_, cowork)| cowork);
+        state.set_overlay(self.overlay_for(path, &key.native_id, cowork));
+        state
+    }
+
+    /// Starts a pass: locates the allowlisted Desktop stores (bounded listings) and
+    /// queues the manifests and every root.
+    fn begin_pass(&mut self, found: &mut Found) {
+        self.pass_id += 1;
+        self.pass_sources = 0;
+        self.roots.retain(|r| !r.cowork);
+        self.manifest_queue.clear();
+        self.building.clear();
+        if self.config.harnesses.claude.root.is_none() {
+            let mut missing = Walk::new(Harness::Claude, None);
+            found.warnings.extend(missing.take_warnings());
+        }
+        let desktop = self.config.claude_desktop.clone();
+        for dir in &desktop.data_dirs {
+            let stores = desktop_stores(dir, desktop.explicit);
+            found.warnings.extend(stores.warnings);
+            self.manifest_queue.extend(stores.manifests);
+            for root in stores.cowork_roots {
+                if !self.roots.iter().any(|r| r.path == root) {
+                    self.roots.push(RootSpec {
+                        path: root,
+                        cowork: true,
+                        explicit: false,
                     });
                 }
-                state.dirty = true;
             }
         }
-        let scan = ScanProgress {
-            provider: Provider::Claude,
-            scanned: pass.next,
-            total: Some(pass.sources.len()),
-            done,
-        };
-        if !done {
-            self.pass = Some(pass);
-        }
-        for state in self.states.values_mut() {
-            if let (Some(cursor), SourceKey::File(path)) =
-                (&state.cursor, &state.summary.key.source)
-            {
-                let end = cursor.position();
-                if end > PREFIX_VERIFY_MAX
-                    && state
-                        .fingerprint
-                        .is_none_or(|(previous, _)| previous != end)
-                {
-                    state.fingerprint = fingerprint(path, end).map(|hash| (end, hash));
-                }
-            }
-        }
-        let mut invalidated = Vec::new();
-        let sessions = self
-            .states
-            .values_mut()
-            .filter_map(|s| {
-                if s.dirty {
-                    if std::mem::take(&mut s.invalidated) {
-                        invalidated.push(s.summary.key.clone());
-                    }
-                    if let Some(old) = s.emitted.replace(s.summary.key.clone())
-                        && old != s.summary.key
-                    {
-                        removed.push(old);
-                    }
-                    s.dirty = false;
-                    Some(s.summary.clone())
-                } else {
-                    None
-                }
-            })
+        self.queue = (0..self.roots.len()).collect();
+        self.stage = Stage::Manifests;
+    }
+
+    /// All manifests are read: transcripts whose manifest facts changed are
+    /// probed again, and cached states take the new facts.
+    fn finish_manifests(&mut self) {
+        let building = std::mem::take(&mut self.building);
+        let changed: HashSet<String> = building
+            .iter()
+            .filter(|(id, m)| self.manifests.get(*id) != Some(m))
+            .map(|(id, _)| id.clone())
+            .chain(
+                self.manifests
+                    .keys()
+                    .filter(|id| !building.contains_key(*id))
+                    .cloned(),
+            )
             .collect();
-        Ok(ProviderDelta {
-            sessions,
-            removed,
-            invalidated,
-            warnings,
-            scan,
-        })
+        self.manifests = building;
+        for id in &changed {
+            self.mark_stale(id);
+        }
+        let cached: Vec<(PathBuf, String)> = self
+            .states
+            .iter()
+            .filter(|(_, s)| s.child.is_none())
+            .map(|(p, s)| (p.clone(), s.summary.meta.key.native_id.clone()))
+            .filter(|(_, id)| changed.contains(id))
+            .collect();
+        for (path, id) in cached {
+            let cowork = self.root_of(&path).is_some_and(|r| r.cowork);
+            let overlay = self.overlay_for(&path, &id, cowork);
+            if let Some(state) = self.states.get_mut(&path) {
+                state.set_overlay(overlay);
+            }
+        }
+        self.stage = Stage::Walking;
+    }
+
+    /// Sources this adapter currently tracks (bounded by the metadata ceiling).
+    pub fn tracked_sources(&self) -> usize {
+        self.retention.len()
+    }
+
+    /// Duplicate-ID scopes this adapter currently tracks. Every tracked source
+    /// contributes exactly one, so eviction never leaves stale paths behind.
+    pub fn duplicate_scopes(&self) -> usize {
+        self.by_id.len()
+    }
+
+    /// The path of `key` if discovery has published exactly this session.
+    fn discovered(&self, key: &SessionKey) -> Result<PathBuf, ProviderError> {
+        let path = file_path(key)?;
+        match self.known.get(&path) {
+            Some(known) if known.key == *key => Ok(path),
+            Some(_) => Err(ProviderError::Unavailable("unknown Claude session".into())),
+            // Retention may have forgotten a source that still exists (a frozen row or an
+            // in-flight read). Only a key this adapter published is honoured, and only
+            // while the file still carries that session's identity.
+            None if self.forgotten.get(&path) == Some(key)
+                && self.allowlisted(&path)
+                && self.probed_id(&path).as_deref() == Some(key.native_id.as_str()) =>
+            {
+                Ok(path)
+            }
+            None => Err(ProviderError::Unavailable("unknown Claude session".into())),
+        }
+    }
+
+    /// Makes the session's scan complete, or reports the work this slice did.
+    fn prepare(
+        &mut self,
+        job: ReadJobId,
+        key: &SessionKey,
+        budget: RefreshBudget,
+    ) -> Result<Option<WorkProgress>, ProviderError> {
+        let path = self.discovered(key)?;
+        if let Some(state) = self.states.get_mut(&path)
+            && state.summary.meta.key.native_id == key.native_id
+            && state.done
+        {
+            self.tick += 1;
+            state.used = self.tick;
+            return Ok(None);
+        }
+        let mut meter = Meter::new(budget);
+        self.ledger.join(key, job);
+        match self.scan(&path, key, &mut meter) {
+            Scanned::Exhausted => Ok(Some(meter.progress())),
+            Scanned::Done => Ok(None),
+        }
+    }
+
+    /// A job that is no longer `Pending` holds nothing.
+    fn settle<T>(
+        &mut self,
+        key: &SessionKey,
+        job: ReadJobId,
+        result: &Result<ReadProgress<T>, ProviderError>,
+    ) {
+        if !matches!(result, Ok(ReadProgress::Pending(_))) {
+            self.ledger.release(key, job);
+        }
+    }
+
+    /// The duplicate-ID warning for a state about to be published.
+    fn publish(&mut self, path: &Path) -> Option<SessionSummary> {
+        let native_id = self.states.get(path)?.summary.meta.key.native_id.clone();
+        let dup = self.dup_key(path, &native_id);
+        let count = self.by_id.get(&dup).map_or(1, Vec::len);
+        // A spawner discovered before this hydration now resolves exactly.
+        let mut meta = self.states.get(path)?.summary.meta.clone();
+        self.resolve_scoped_parent(path, &mut meta);
+        let state = self.states.get_mut(path)?;
+        state.summary.meta.lineage = meta.lineage;
+        let source = match &state.summary.meta.key.source {
+            SourceKey::File(p) => format!("{}#duplicate-id", p.display()),
+            _ => "#duplicate-id".into(),
+        };
+        state.summary.warnings.retain(|w| w.key.source != source);
+        if count > 1 {
+            state.summary.warnings.push(Warning {
+                key: WarningKey {
+                    harness: Harness::Claude,
+                    source,
+                    kind: WarningKind::Unsupported,
+                },
+                message: "Duplicate ID: another source shares this session ID".into(),
+                count: u32::try_from(count).unwrap_or(u32::MAX),
+            });
+        }
+        state
+            .summary
+            .warnings
+            .retain(|w| !w.key.source.ends_with("#approximate-id"));
+        if state.id_conflict {
+            state.summary.warnings.push(Warning {
+                key: WarningKey {
+                    harness: Harness::Claude,
+                    source: format!("{}#approximate-id", path.display()),
+                    kind: WarningKind::Unsupported,
+                },
+                message: "Approximate session ID: the ID in the transcript lies beyond the \
+                          discovery probe, so the file name identifies this session"
+                    .into(),
+                count: 1,
+            });
+        }
+        state.published = true;
+        if std::mem::take(&mut state.invalidated) {
+            self.invalidated.push(state.summary.meta.key.clone());
+        }
+        Some(state.summary.clone())
+    }
+
+    fn page_ready(
+        &mut self,
+        job: ReadJobId,
+        key: &SessionKey,
+        anchor: Option<PageAnchor>,
+        direction: PageDirection,
+        request: PageRequest,
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<TranscriptPage>, ProviderError> {
+        if let Some(progress) = self.prepare(job, key, budget)? {
+            return Ok(ReadProgress::Pending(progress));
+        }
+        let (path, end) = checked_source(&self.states, key)?;
+        let generation = self.states[path].generation;
+        let Some(slot) = Self::index_slot(&mut self.indexes, path) else {
+            self.ledger.join(key, job);
+            return Ok(ReadProgress::Pending(WorkProgress::default()));
+        };
+        let index = match ensure_index(
+            slot,
+            path,
+            generation,
+            end,
+            self.config.max_record_bytes,
+            budget,
+        )? {
+            Indexed::Building(progress) => {
+                self.ledger.join(key, job);
+                return Ok(ReadProgress::Pending(progress));
+            }
+            Indexed::Ready(index) => index,
+        };
+        let position = match anchor.as_ref() {
+            Some(anchor) => match index
+                .rows
+                .binary_search_by(|row| index.blocks[*row].anchor.cmp(anchor))
+            {
+                Ok(pos) => Some(pos),
+                Err(_) => {
+                    return Ok(ReadProgress::Ready(TranscriptPage {
+                        events: vec![],
+                        diagnostics: vec![],
+                        next: None,
+                        has_more: false,
+                        truncated: false,
+                    }));
+                }
+            },
+            None => None,
+        };
+        let forward = direction == PageDirection::Forward;
+        let indices: Box<dyn Iterator<Item = usize>> = if forward {
+            Box::new(position.map_or(0, |p| p + 1)..index.rows.len())
+        } else {
+            Box::new((0..position.unwrap_or(index.rows.len())).rev())
+        };
+        let mut page = Vec::new();
+        let mut size = 0usize;
+        let mut truncated = false;
+        let mut has_more = false;
+        let mut selected = Vec::new();
+        for row in indices {
+            let mut event = indexed_event(index, row, key, end, self.config.max_record_bytes)?;
+            let cut = fit_event(&mut event, request.max_bytes);
+            let cost = event_size(&event);
+            if !page.is_empty()
+                && (page.len() >= request.max_events.max(1)
+                    || size.saturating_add(cost) > request.max_bytes)
+            {
+                has_more = true;
+                break;
+            }
+            size += cost;
+            truncated |= cut
+                || event.text.as_ref().is_some_and(|t| t.truncated)
+                || event.tool.as_ref().is_some_and(|t| {
+                    t.input.as_ref().is_some_and(|v| v.truncated)
+                        || t.output.as_ref().is_some_and(|v| v.truncated)
+                });
+            page.push(event);
+            selected.push(row);
+        }
+        if !forward {
+            page.reverse();
+            selected.reverse();
+        }
+        let next = if forward { page.last() } else { page.first() }.map(event_anchor);
+        // Assign diagnostics to the next event in total order, or the last event.
+        let mut page_diags = Vec::new();
+        if !selected.is_empty() || (index.rows.is_empty() && anchor.is_none()) {
+            let first = selected.first().copied().unwrap_or(0);
+            let last = selected.last().copied().unwrap_or(0);
+            let start = if first == 0 {
+                0
+            } else {
+                let previous = &index.blocks[index.rows[first - 1]].anchor;
+                index.diag_order.partition_point(|d| {
+                    let d = &index.diagnostics[*d];
+                    (d.timestamp, d.offset) <= (previous.timestamp, previous.source_order)
+                })
+            };
+            let stop = if index.rows.is_empty() || last + 1 == index.rows.len() {
+                index.diag_order.len()
+            } else {
+                let last_anchor = &index.blocks[index.rows[last]].anchor;
+                index.diag_order.partition_point(|d| {
+                    let d = &index.diagnostics[*d];
+                    (d.timestamp, d.offset) <= (last_anchor.timestamp, last_anchor.source_order)
+                })
+            };
+            let overflow = stop.saturating_sub(start) > 200;
+            let visible_stop = if overflow { start + 199 } else { stop };
+            for entry in &index.diag_order[start..visible_stop] {
+                let d = &index.diagnostics[*entry];
+                let mut loc = locator(key, d.offset);
+                loc.generation = Some(generation);
+                page_diags.push(DiagnosticEntry {
+                    locator: loc,
+                    label: d.label.into(),
+                    hidden: d.hidden,
+                });
+            }
+            if overflow {
+                let omitted = &index.diagnostics[index.diag_order[visible_stop]];
+                let mut loc = locator(key, omitted.offset);
+                loc.generation = Some(generation);
+                page_diags.push(DiagnosticEntry {
+                    locator: loc,
+                    label: "diagnostics truncated (200-entry limit); first omitted source".into(),
+                    hidden: true,
+                });
+                truncated = true;
+            }
+        }
+        Ok(ReadProgress::Ready(TranscriptPage {
+            events: page,
+            diagnostics: page_diags,
+            next,
+            has_more,
+            truncated,
+        }))
+    }
+
+    fn details_ready(
+        &mut self,
+        job: ReadJobId,
+        key: &SessionKey,
+        anchor: Option<PageAnchor>,
+        request: PageRequest,
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<SessionDetailPage>, ProviderError> {
+        let first = anchor.is_none();
+        // Requests, compactions and events share one record/byte allowance.
+        let allowance = request.max_events.max(1);
+        let mut compactions = Vec::new();
+        let mut request = request;
+        let mut cut = false;
+        if first {
+            if let Some(progress) = self.prepare(job, key, budget)? {
+                return Ok(ReadProgress::Pending(progress));
+            }
+            let path = file_path(key)?;
+            if let Some(state) = self.states.get(&path) {
+                compactions = state.facts.compactions.clone();
+            }
+            let (keep, events) = super::share_details_budget(request, compactions.len(), true);
+            if compactions.len() > keep {
+                compactions.drain(..compactions.len() - keep);
+                cut = true;
+            }
+            request = events;
+        } else {
+            request = super::share_details_budget(request, 0, true).1;
+        }
+        let page =
+            match self.page_ready(job, key, anchor, PageDirection::Backward, request, budget)? {
+                ReadProgress::Pending(progress) => return Ok(ReadProgress::Pending(progress)),
+                ReadProgress::Ready(page) => page,
+            };
+        // Each returned record consumes the shared allowance exactly once: the request
+        // observations take only what the compactions and events left over.
+        let room = allowance.saturating_sub(compactions.len() + page.events.len());
+        let mut requests: Vec<_> = page.events.iter().filter_map(|e| e.usage.clone()).collect();
+        let cut = cut || requests.len() > room;
+        requests.truncate(room);
+        let truncated = page.truncated || cut;
+        // Request observations are the usage the paged events themselves recorded
+        // (one per deduplicated assistant message), so they page with the same anchor
+        // and budget. The dedup ledger keeps totals only.
+        Ok(ReadProgress::Ready(SessionDetailPage {
+            requests,
+            compactions,
+            recent: page.events,
+            next: page.next,
+            has_more: page.has_more,
+            truncated,
+        }))
     }
 }
+
+/// Transcript indexes kept at once: every in-progress one is retained so two large live
+/// sessions never restart each other; completed ones are dropped first when full.
+const MAX_INDEXES: usize = 8;
 
 const PREFIX_VERIFY_MAX: u64 = 4 * 1024 * 1024;
 
@@ -1274,7 +2423,9 @@ fn checked_source<'a>(
     let state = states
         .get(path)
         .filter(|s| {
-            key.provider == Provider::Claude && s.summary.key == *key && s.summary.source_available
+            key.harness == Harness::Claude
+                && s.summary.meta.key == *key
+                && s.summary.meta.source_available
         })
         .ok_or_else(|| {
             ProviderError::Unavailable("unknown or unavailable Claude session".into())
@@ -1313,7 +2464,7 @@ fn checked_source<'a>(
             "source changed since refresh".into(),
         ));
     }
-    let SourceKey::File(path) = &state.summary.key.source else {
+    let SourceKey::File(path) = &state.summary.meta.key.source else {
         unreachable!()
     };
     Ok((path, end))
@@ -1758,13 +2909,21 @@ impl TranscriptIndex {
     }
 }
 
+/// Result of one bounded indexing slice.
+enum Indexed<'a> {
+    Ready(&'a TranscriptIndex),
+    /// More of the file remains to index or finalize; call again.
+    Building(WorkProgress),
+}
+
 fn ensure_index<'a>(
     slot: &'a mut Option<TranscriptIndex>,
     path: &Path,
     generation: u64,
     end: u64,
     max: usize,
-) -> Result<&'a TranscriptIndex, ProviderError> {
+    budget: RefreshBudget,
+) -> Result<Indexed<'a>, ProviderError> {
     if slot
         .as_ref()
         .is_none_or(|index| index.path != path || index.generation != generation || index.end > end)
@@ -1795,9 +2954,7 @@ fn ensure_index<'a>(
         return Err(over());
     }
     if index.end < end && index.finalization.is_some() && !index.finish_step() {
-        return Err(ProviderError::Unavailable(
-            "transcript index is building (finalizing); retry".into(),
-        ));
+        return Ok(Indexed::Building(WorkProgress::default()));
     }
     if index.end < end {
         if index.ready || index.finalization.is_some() {
@@ -1807,13 +2964,17 @@ fn ensure_index<'a>(
             index.finalization = None;
             index.ready = false;
         }
+        let started = Instant::now();
+        let step = INDEX_STEP.min(budget.max_records.max(1));
+        let allowance_total = INDEX_BYTES_PER_STEP.min(budget.max_bytes.max(1) as u64);
         let start = index.cursor.position;
         let mut count = 0;
         while index.cursor.position < end
-            && count < INDEX_STEP
-            && index.cursor.position.saturating_sub(start) < INDEX_BYTES_PER_STEP
+            && count < step
+            && index.cursor.position.saturating_sub(start) < allowance_total
+            && (count == 0 || started.elapsed().as_millis() < u128::from(budget.max_millis))
         {
-            let allowance = INDEX_BYTES_PER_STEP - index.cursor.position.saturating_sub(start);
+            let allowance = allowance_total - index.cursor.position.saturating_sub(start);
             let record = index
                 .cursor
                 .next(end, max, allowance)
@@ -1848,18 +3009,16 @@ fn ensure_index<'a>(
         }
         index.end = index.cursor.position;
         if index.end < end {
-            return Err(ProviderError::Unavailable(format!(
-                "transcript index is building ({} of {end} bytes); retry",
-                index.end
-            )));
+            return Ok(Indexed::Building(WorkProgress {
+                records: count,
+                expanded_bytes: usize::try_from(index.end - start).unwrap_or(usize::MAX),
+            }));
         }
     }
     if !index.ready && !index.finish_step() {
-        return Err(ProviderError::Unavailable(
-            "transcript index is building (finalizing); retry".into(),
-        ));
+        return Ok(Indexed::Building(WorkProgress::default()));
     }
-    Ok(index)
+    Ok(Indexed::Ready(index))
 }
 
 fn read_indexed_value(
@@ -1908,7 +3067,11 @@ fn indexed_event(
         .ok_or_else(|| ProviderError::Unavailable("indexed event changed".into()))?;
     event.provenance.locator.generation = Some(index.generation);
     event.usage = if block.usage {
-        usage(&records[0].1["message"], &event.provenance)
+        usage(
+            &records[0].1["message"],
+            &event.provenance,
+            records[0].1.get("timestamp").and_then(timestamp),
+        )
     } else {
         None
     };
@@ -1916,230 +3079,313 @@ fn indexed_event(
 }
 
 impl ProviderReader for ClaudeScanner {
-    fn provider(&self) -> Provider {
-        Provider::Claude
+    fn harness(&self) -> Harness {
+        Harness::Claude
     }
 
-    fn refresh(
+    fn discover(
         &mut self,
-        now: Timestamp,
+        _now: Timestamp,
         budget: RefreshBudget,
-    ) -> Result<ProviderDelta, ProviderError> {
-        self.scan_roster(now, budget)
+    ) -> Result<DiscoveryDelta, ProviderError> {
+        let deadline = Instant::now() + Duration::from_millis(budget.max_millis);
+        let mut found = Found::default();
+        let (mut records, mut bytes) = (0usize, 0usize);
+        if self.stage == Stage::Idle {
+            self.begin_pass(&mut found);
+        }
+        let spent = |records: usize, bytes: usize| {
+            records >= budget.max_records || bytes >= budget.max_bytes || Instant::now() >= deadline
+        };
+        if self.stage == Stage::Manifests {
+            while let Some(path) = self.manifest_queue.pop() {
+                let (manifest, read) = read_manifest(&path);
+                records += 1;
+                bytes = bytes.saturating_add(read);
+                if let Some((id, manifest)) = manifest {
+                    match self.building.get_mut(&id) {
+                        Some(existing) => existing.merge(&manifest),
+                        None => {
+                            self.building.insert(id, manifest);
+                        }
+                    }
+                }
+                if spent(records, bytes) {
+                    break;
+                }
+            }
+            if self.manifest_queue.is_empty() {
+                self.finish_manifests();
+            }
+        }
+        let mut finished = false;
+        if self.stage == Stage::Walking {
+            loop {
+                if self.walk.is_none() {
+                    let Some(index) = self.queue.pop_front() else {
+                        finished = true;
+                        break;
+                    };
+                    let root = &self.roots[index];
+                    self.walk = Some(Walk::new_in(
+                        Harness::Claude,
+                        Some(&root.path),
+                        root.explicit,
+                    ));
+                }
+                let Some(walk) = self.walk.as_mut() else {
+                    break;
+                };
+                let batch = walk.step(1, deadline);
+                found.warnings.extend(walk.take_warnings());
+                if walk.is_done() {
+                    self.walk = None;
+                    finished = self.queue.is_empty();
+                }
+                for source in batch {
+                    self.pass_sources += 1;
+                    records += 1;
+                    let limits = RefreshBudget {
+                        max_records: PROBE_RECORDS,
+                        max_bytes: budget.max_bytes.saturating_sub(bytes).max(1),
+                        max_millis: u64::try_from(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .as_millis(),
+                        )
+                        .unwrap_or(u64::MAX)
+                        .max(1),
+                    };
+                    self.visit(source, limits, &mut bytes, &mut found);
+                }
+                if finished || spent(records, bytes) {
+                    break;
+                }
+            }
+        }
+        if finished {
+            self.stage = Stage::Idle;
+            self.finish_pass(&mut found);
+        }
+        Ok(DiscoveryDelta {
+            sessions: found.sessions,
+            removed: found.removed,
+            invalidated: std::mem::take(&mut self.invalidated),
+            warnings: found.warnings,
+            scan: ScanProgress {
+                harness: Harness::Claude,
+                scanned: self.pass_sources,
+                total: finished.then_some(self.pass_sources),
+                done: finished,
+            },
+        })
+    }
+
+    fn hydrate(
+        &mut self,
+        job: ReadJobId,
+        key: &SessionKey,
+        _now: Timestamp,
+        budget: RefreshBudget,
+    ) -> Result<HydrationDelta, ProviderError> {
+        let path = self.discovered(key)?;
+        let mut meter = Meter::new(budget);
+        self.ledger.join(key, job);
+        match self.scan(&path, key, &mut meter) {
+            Scanned::Exhausted => {
+                let Some(state) = self.states.get(&path) else {
+                    self.ledger.release(key, job);
+                    return Err(ProviderError::Internal("hydration state vanished".into()));
+                };
+                Ok(HydrationDelta {
+                    summary: SessionSummary::unhydrated(state.summary.meta.clone()),
+                    done: false,
+                })
+            }
+            Scanned::Done => {
+                self.ledger.release(key, job);
+                let summary = self
+                    .publish(&path)
+                    .ok_or_else(|| ProviderError::Internal("hydration state vanished".into()))?;
+                Ok(HydrationDelta {
+                    summary,
+                    done: true,
+                })
+            }
+        }
+    }
+
+    fn cancel_read(&mut self, key: &SessionKey, job: ReadJobId) {
+        if !self.ledger.release(key, job) {
+            return;
+        }
+        // The last consumer is gone: abandoned partial work goes, healthy state stays.
+        let Ok(path) = file_path(key) else {
+            return;
+        };
+        if self
+            .states
+            .get(&path)
+            .is_some_and(|s| !s.done && s.summary.meta.key.native_id == key.native_id)
+        {
+            self.states.remove(&path);
+        }
+        if self
+            .indexes
+            .get(&path)
+            .and_then(Option::as_ref)
+            .is_some_and(|i| !i.ready)
+        {
+            self.indexes.remove(&path);
+        }
+    }
+
+    fn details_page(
+        &mut self,
+        job: ReadJobId,
+        key: &SessionKey,
+        anchor: Option<PageAnchor>,
+        request: PageRequest,
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<SessionDetailPage>, ProviderError> {
+        let result = self.details_ready(job, key, anchor, request, budget);
+        self.settle(key, job, &result);
+        result
     }
 
     fn transcript_page(
         &mut self,
+        job: ReadJobId,
         key: &SessionKey,
         anchor: Option<PageAnchor>,
         direction: PageDirection,
         request: PageRequest,
-    ) -> Result<TranscriptPage, ProviderError> {
-        let (path, end) = checked_source(&self.states, key)?;
-        let generation = self.states[path].generation;
-        let index = ensure_index(
-            &mut self.index,
-            path,
-            generation,
-            end,
-            self.config.max_record_bytes,
-        )?;
-        let position = match anchor.as_ref() {
-            Some(anchor) => match index
-                .rows
-                .binary_search_by(|row| index.blocks[*row].anchor.cmp(anchor))
-            {
-                Ok(pos) => Some(pos),
-                Err(_) => {
-                    return Ok(TranscriptPage {
-                        events: vec![],
-                        diagnostics: vec![],
-                        next: None,
-                        has_more: false,
-                        truncated: false,
-                    });
-                }
-            },
-            None => None,
-        };
-        let forward = direction == PageDirection::Forward;
-        let indices: Box<dyn Iterator<Item = usize>> = if forward {
-            Box::new(position.map_or(0, |p| p + 1)..index.rows.len())
-        } else {
-            Box::new((0..position.unwrap_or(index.rows.len())).rev())
-        };
-        let mut page = Vec::new();
-        let mut size = 0usize;
-        let mut truncated = false;
-        let mut has_more = false;
-        let mut selected = Vec::new();
-        for row in indices {
-            let mut event = indexed_event(index, row, key, end, self.config.max_record_bytes)?;
-            let cut = fit_event(&mut event, request.max_bytes);
-            let cost = event_size(&event);
-            if !page.is_empty()
-                && (page.len() >= request.max_events.max(1)
-                    || size.saturating_add(cost) > request.max_bytes)
-            {
-                has_more = true;
-                break;
-            }
-            size += cost;
-            truncated |= cut
-                || event.text.as_ref().is_some_and(|t| t.truncated)
-                || event.tool.as_ref().is_some_and(|t| {
-                    t.input.as_ref().is_some_and(|v| v.truncated)
-                        || t.output.as_ref().is_some_and(|v| v.truncated)
-                });
-            page.push(event);
-            selected.push(row);
-        }
-        if !forward {
-            page.reverse();
-            selected.reverse();
-        }
-        let next = if forward { page.last() } else { page.first() }.map(event_anchor);
-        // Assign diagnostics to the next event in total order, or the last event.
-        let mut page_diags = Vec::new();
-        if !selected.is_empty() || (index.rows.is_empty() && anchor.is_none()) {
-            let first = selected.first().copied().unwrap_or(0);
-            let last = selected.last().copied().unwrap_or(0);
-            let start = if first == 0 {
-                0
-            } else {
-                let previous = &index.blocks[index.rows[first - 1]].anchor;
-                index.diag_order.partition_point(|d| {
-                    let d = &index.diagnostics[*d];
-                    (d.timestamp, d.offset) <= (previous.timestamp, previous.source_order)
-                })
-            };
-            let stop = if index.rows.is_empty() || last + 1 == index.rows.len() {
-                index.diag_order.len()
-            } else {
-                let last_anchor = &index.blocks[index.rows[last]].anchor;
-                index.diag_order.partition_point(|d| {
-                    let d = &index.diagnostics[*d];
-                    (d.timestamp, d.offset) <= (last_anchor.timestamp, last_anchor.source_order)
-                })
-            };
-            let overflow = stop.saturating_sub(start) > 200;
-            let visible_stop = if overflow { start + 199 } else { stop };
-            for entry in &index.diag_order[start..visible_stop] {
-                let d = &index.diagnostics[*entry];
-                let mut loc = locator(key, d.offset);
-                loc.generation = Some(generation);
-                page_diags.push(DiagnosticEntry {
-                    locator: loc,
-                    label: d.label.into(),
-                    hidden: d.hidden,
-                });
-            }
-            if overflow {
-                let omitted = &index.diagnostics[index.diag_order[visible_stop]];
-                let mut loc = locator(key, omitted.offset);
-                loc.generation = Some(generation);
-                page_diags.push(DiagnosticEntry {
-                    locator: loc,
-                    label: "diagnostics truncated (200-entry limit); first omitted source".into(),
-                    hidden: true,
-                });
-                truncated = true;
-            }
-        }
-        Ok(TranscriptPage {
-            events: page,
-            diagnostics: page_diags,
-            next,
-            has_more,
-            truncated,
-        })
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<TranscriptPage>, ProviderError> {
+        let result = self.page_ready(job, key, anchor, direction, request, budget);
+        self.settle(key, job, &result);
+        result
     }
 
     fn count_events_after(
         &mut self,
+        job: ReadJobId,
         key: &SessionKey,
         anchor: &PageAnchor,
-    ) -> Result<usize, ProviderError> {
-        let (path, end) = checked_source(&self.states, key)?;
-        let generation = self.states[path].generation;
-        let index = ensure_index(
-            &mut self.index,
-            path,
-            generation,
-            end,
-            self.config.max_record_bytes,
-        )?;
-        Ok(index.rows.len()
-            - index
-                .rows
-                .partition_point(|row| index.blocks[*row].anchor <= *anchor))
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<usize>, ProviderError> {
+        let result = (|| {
+            if let Some(progress) = self.prepare(job, key, budget)? {
+                return Ok(ReadProgress::Pending(progress));
+            }
+            let (path, end) = checked_source(&self.states, key)?;
+            let generation = self.states[path].generation;
+            let Some(slot) = Self::index_slot(&mut self.indexes, path) else {
+                self.ledger.join(key, job);
+                return Ok(ReadProgress::Pending(WorkProgress::default()));
+            };
+            let index = match ensure_index(
+                slot,
+                path,
+                generation,
+                end,
+                self.config.max_record_bytes,
+                budget,
+            )? {
+                Indexed::Building(progress) => {
+                    self.ledger.join(key, job);
+                    return Ok(ReadProgress::Pending(progress));
+                }
+                Indexed::Ready(index) => index,
+            };
+            Ok(ReadProgress::Ready(
+                index.rows.len()
+                    - index
+                        .rows
+                        .partition_point(|row| index.blocks[*row].anchor <= *anchor),
+            ))
+        })();
+        self.settle(key, job, &result);
+        result
     }
 
-    fn source_record(&mut self, source: &SourceLocator) -> Result<SourceRecord, ProviderError> {
-        let LocatorKind::FileOffset { path, offset } = &source.kind else {
-            return Err(ProviderError::Unsupported(
-                "not a Claude file locator".into(),
-            ));
-        };
-        let (expected, end) = checked_source(&self.states, &source.session)?;
-        if self.states[expected].generation != source.generation.unwrap_or(0) {
-            return Err(ProviderError::Unavailable("stale source locator".into()));
-        }
-        if path != expected {
-            return Err(ProviderError::Unsupported(
-                "locator does not belong to session".into(),
-            ));
-        }
-        if *offset >= end {
-            return Err(ProviderError::Unavailable(
-                "record beyond scanned data".into(),
-            ));
-        }
-        let mut file = File::open(path)
-            .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
-        if *offset > 0 {
-            file.seek(SeekFrom::Start(offset - 1))
-                .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
-            let mut prior = [0u8; 1];
-            file.read_exact(&mut prior)
-                .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
-            if prior[0] != b'\n' {
-                return Err(ProviderError::Parse(
-                    "locator is not a record boundary".into(),
+    fn source_record(
+        &mut self,
+        job: ReadJobId,
+        source: &SourceLocator,
+        budget: RefreshBudget,
+    ) -> Result<ReadProgress<SourceRecord>, ProviderError> {
+        let result = (|| {
+            let LocatorKind::FileOffset { path, offset } = &source.kind else {
+                return Err(ProviderError::Unsupported(
+                    "not a Claude file locator".into(),
+                ));
+            };
+            if let Some(progress) = self.prepare(job, &source.session, budget)? {
+                return Ok(ReadProgress::Pending(progress));
+            }
+            let (expected, end) = checked_source(&self.states, &source.session)?;
+            if self.states[expected].generation != source.generation.unwrap_or(0) {
+                return Err(ProviderError::Unavailable("stale source locator".into()));
+            }
+            if path != expected {
+                return Err(ProviderError::Unsupported(
+                    "locator does not belong to session".into(),
                 ));
             }
-        }
-        file.seek(SeekFrom::Start(*offset))
-            .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
-        let mut bytes = Vec::new();
-        BufReader::new(file)
-            .take((end - offset).min(self.config.max_record_bytes as u64 + 2))
-            .read_until(b'\n', &mut bytes)
-            .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
-        if bytes.last() != Some(&b'\n') {
-            return Ok(SourceRecord {
-                raw: String::new(),
-                display: String::new(),
-                unavailable: Some("record incomplete or exceeds limit".into()),
-            });
-        }
-        bytes.pop();
-        if bytes.last() == Some(&b'\r') {
+            if *offset >= end {
+                return Err(ProviderError::Unavailable(
+                    "record beyond scanned data".into(),
+                ));
+            }
+            let mut file = File::open(path)
+                .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+            if *offset > 0 {
+                file.seek(SeekFrom::Start(offset - 1))
+                    .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+                let mut prior = [0u8; 1];
+                file.read_exact(&mut prior)
+                    .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+                if prior[0] != b'\n' {
+                    return Err(ProviderError::Parse(
+                        "locator is not a record boundary".into(),
+                    ));
+                }
+            }
+            file.seek(SeekFrom::Start(*offset))
+                .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+            let mut bytes = Vec::new();
+            BufReader::new(file)
+                .take((end - offset).min(self.config.max_record_bytes as u64 + 2))
+                .read_until(b'\n', &mut bytes)
+                .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+            if bytes.last() != Some(&b'\n') {
+                return Ok(ReadProgress::Ready(SourceRecord {
+                    raw: String::new(),
+                    display: String::new(),
+                    unavailable: Some("record incomplete or exceeds limit".into()),
+                }));
+            }
             bytes.pop();
-        }
-        if bytes.len() > self.config.max_record_bytes {
-            return Ok(SourceRecord {
-                raw: String::new(),
-                display: String::new(),
-                unavailable: Some("record exceeds limit".into()),
-            });
-        }
-        let raw = String::from_utf8_lossy(&bytes).into_owned();
-        let display = display_safe(&raw);
-        Ok(SourceRecord {
-            raw,
-            display,
-            unavailable: None,
-        })
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            if bytes.len() > self.config.max_record_bytes {
+                return Ok(ReadProgress::Ready(SourceRecord {
+                    raw: String::new(),
+                    display: String::new(),
+                    unavailable: Some("record exceeds limit".into()),
+                }));
+            }
+            let raw = String::from_utf8_lossy(&bytes).into_owned();
+            let display = display_safe(&raw);
+            Ok(ReadProgress::Ready(SourceRecord {
+                raw,
+                display,
+                unavailable: None,
+            }))
+        })();
+        self.settle(&source.session, job, &result);
+        result
     }
 }

@@ -1,22 +1,42 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod support;
+
 use agentscope::config::{CliOverrides, Config, Env};
 use agentscope::domain::*;
 use agentscope::processes::{ProcessInfo, ProcessSnapshot};
-use agentscope::providers::{ProviderDelta, ProviderError, ProviderReader, SourceRecord};
+use agentscope::providers::{
+    DiscoveryDelta, HydrationDelta, ProviderError, ProviderReader, ReadJobId, ReadProgress,
+    SourceRecord,
+};
 use agentscope::worker::{WorkerEvent, WorkerHandle, WorkerRequest};
+use support::facts::{self, metadata};
 
 const WAIT: Duration = Duration::from_secs(5);
 
+/// What a scripted discovery slice reports: the full sessions it announces (their
+/// metadata goes to the index; the summaries answer later hydration).
+struct Delta {
+    sessions: Vec<SessionSummary>,
+    removed: Vec<SessionKey>,
+    invalidated: Vec<SessionKey>,
+    warnings: Vec<Warning>,
+    scan: ScanProgress,
+}
+
 #[derive(Default)]
 struct Script {
-    refreshes: VecDeque<Result<ProviderDelta, ProviderError>>,
+    refreshes: VecDeque<Result<Delta, ProviderError>>,
+    /// Summaries hydration answers with, by key.
+    known: HashMap<SessionKey, SessionSummary>,
     pages: VecDeque<Result<TranscriptPage, ProviderError>>,
     refresh_calls: usize,
+    hydrate_calls: Vec<SessionKey>,
+    cancelled: Vec<(SessionKey, ReadJobId)>,
     page_calls: usize,
     page_requests: Vec<(Option<PageAnchor>, PageDirection)>,
     page_max_events: Vec<usize>,
@@ -25,59 +45,51 @@ struct Script {
 }
 
 struct Fake {
-    provider: Provider,
+    harness: Harness,
     script: Arc<Mutex<Script>>,
     /// When set, every `refresh` call announces itself then waits for a permit.
     gate: Option<(Sender<()>, Receiver<()>)>,
     /// When set, every `transcript_page` call announces itself then waits.
     page_gate: Option<(Sender<()>, Receiver<()>)>,
+    /// When set, every `hydrate` call announces itself then waits.
+    hydrate_gate: Option<(Sender<()>, Receiver<()>)>,
+    /// When set, every `details_page` call announces itself then waits.
+    details_gate: Option<(Sender<()>, Receiver<()>)>,
 }
 
-fn key(provider: Provider, id: &str) -> SessionKey {
+fn key(provider: Harness, id: &str) -> SessionKey {
     SessionKey {
-        provider,
-        provider_session_id: id.into(),
+        harness: provider,
+        native_id: id.into(),
         source: SourceKey::File("a".into()),
     }
 }
 
-fn summary(provider: Provider, id: &str, persisted: i64, count: usize) -> SessionSummary {
+fn summary(provider: Harness, id: &str, persisted: i64, count: usize) -> SessionSummary {
+    let mut meta = metadata(key(provider, id), "t");
+    meta.activity = ActivityStamp {
+        at: Some(persisted),
+        class: AggregationClass::Reported,
+    };
     SessionSummary {
-        key: key(provider, id),
-        title: "t".into(),
-        title_derived: false,
-        project: None,
-        cwd: None,
-        models: vec![],
-        model_details: vec![],
-        provider_version: None,
-        created_at: None,
         last_event_at: None,
-        last_persisted_at: Some(persisted),
         last_completion: None,
         unfinished_work: false,
         displayed_event_count: count,
         hidden_records: 0,
-        source_available: true,
-        archived: false,
-        context_window: None,
         server_tools: None,
         lifecycle: Lifecycle::Unknown,
         process: ProcessAssociation::NotChecked,
         usage: None,
-        lineage: Lineage {
-            parent: None,
-            fork: None,
-            sidechain: false,
-        },
         warnings: vec![],
+        ..facts::summary(meta)
     }
 }
 
-fn warning(provider: Provider, source: &str, kind: WarningKind, msg: &str) -> Warning {
+fn warning(provider: Harness, source: &str, kind: WarningKind, msg: &str) -> Warning {
     Warning {
         key: WarningKey {
-            provider,
+            harness: provider,
             source: source.into(),
             kind,
         },
@@ -86,10 +98,12 @@ fn warning(provider: Provider, source: &str, kind: WarningKind, msg: &str) -> Wa
     }
 }
 
-fn delta(sessions: Vec<SessionSummary>, warnings: Vec<Warning>, done: bool) -> ProviderDelta {
-    ProviderDelta {
+fn delta(sessions: Vec<SessionSummary>, warnings: Vec<Warning>, done: bool) -> Delta {
+    Delta {
         scan: ScanProgress {
-            provider: sessions.first().map_or(Provider::Codex, |s| s.key.provider),
+            harness: sessions
+                .first()
+                .map_or(Harness::Codex, |s| s.meta.key.harness),
             scanned: sessions.len(),
             total: None,
             done,
@@ -101,7 +115,7 @@ fn delta(sessions: Vec<SessionSummary>, warnings: Vec<Warning>, done: bool) -> P
     }
 }
 
-fn with_invalidated(mut d: ProviderDelta, keys: Vec<SessionKey>) -> ProviderDelta {
+fn with_invalidated(mut d: Delta, keys: Vec<SessionKey>) -> Delta {
     d.invalidated = keys;
     d
 }
@@ -116,33 +130,126 @@ fn empty_page() -> TranscriptPage {
     }
 }
 
-impl ProviderReader for Fake {
-    fn provider(&self) -> Provider {
-        self.provider
+fn event_page(key: &SessionKey, id: &str) -> TranscriptPage {
+    TranscriptPage {
+        events: vec![Event {
+            id: id.into(),
+            session: key.clone(),
+            timestamp: Some(1),
+            source_order: 1,
+            kind: EventKind::AssistantMessage,
+            actor: Actor::Assistant,
+            text: Some(BoundedText {
+                preview: format!("body {id}"),
+                byte_len: 4,
+                truncated: false,
+                locator: None,
+            }),
+            tool: None,
+            usage: None,
+            provenance: Provenance {
+                harness: key.harness,
+                source: key.source.clone(),
+                locator: SourceLocator {
+                    session: key.clone(),
+                    kind: LocatorKind::FileOffset {
+                        path: "a.jsonl".into(),
+                        offset: 1,
+                    },
+                    generation: None,
+                },
+                record_type: "test".into(),
+                harness_version: None,
+            },
+        }],
+        diagnostics: vec![],
+        next: None,
+        has_more: false,
+        truncated: false,
     }
-    fn refresh(
+}
+
+impl ProviderReader for Fake {
+    fn harness(&self) -> Harness {
+        self.harness
+    }
+    fn discover(
         &mut self,
         _now: Timestamp,
         _budget: RefreshBudget,
-    ) -> Result<ProviderDelta, ProviderError> {
+    ) -> Result<DiscoveryDelta, ProviderError> {
         if let Some((entered, gate)) = &self.gate {
             let _ = entered.send(());
             let _ = gate.recv_timeout(WAIT);
         }
         let mut s = self.script.lock().unwrap();
         s.refresh_calls += 1;
-        match s.refreshes.pop_front() {
-            Some(r) => r,
-            None => Ok(delta(vec![], vec![], !s.endless)),
+        let d = match s.refreshes.pop_front() {
+            Some(r) => r?,
+            None => delta(vec![], vec![], !s.endless),
+        };
+        for session in &d.sessions {
+            s.known.insert(session.meta.key.clone(), session.clone());
         }
+        Ok(DiscoveryDelta {
+            sessions: d.sessions.into_iter().map(|s| s.meta).collect(),
+            removed: d.removed,
+            invalidated: d.invalidated,
+            warnings: d.warnings,
+            scan: d.scan,
+        })
+    }
+    fn hydrate(
+        &mut self,
+        _job: ReadJobId,
+        key: &SessionKey,
+        _now: Timestamp,
+        _budget: RefreshBudget,
+    ) -> Result<HydrationDelta, ProviderError> {
+        if let Some((entered, gate)) = &self.hydrate_gate {
+            let _ = entered.send(());
+            let _ = gate.recv_timeout(WAIT);
+        }
+        let mut s = self.script.lock().unwrap();
+        s.hydrate_calls.push(key.clone());
+        s.known
+            .get(key)
+            .map(|summary| HydrationDelta {
+                summary: summary.clone(),
+                done: true,
+            })
+            .ok_or_else(|| ProviderError::Unavailable("unknown session".into()))
+    }
+    fn cancel_read(&mut self, key: &SessionKey, job: ReadJobId) {
+        self.script
+            .lock()
+            .unwrap()
+            .cancelled
+            .push((key.clone(), job));
+    }
+    fn details_page(
+        &mut self,
+        _job: ReadJobId,
+        _key: &SessionKey,
+        _anchor: Option<PageAnchor>,
+        _request: PageRequest,
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<SessionDetailPage>, ProviderError> {
+        if let Some((entered, gate)) = &self.details_gate {
+            let _ = entered.send(());
+            let _ = gate.recv_timeout(WAIT);
+        }
+        Ok(ReadProgress::Ready(SessionDetailPage::default()))
     }
     fn transcript_page(
         &mut self,
+        _job: ReadJobId,
         _key: &SessionKey,
         anchor: Option<PageAnchor>,
         direction: PageDirection,
         request: PageRequest,
-    ) -> Result<TranscriptPage, ProviderError> {
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<TranscriptPage>, ProviderError> {
         if let Some((entered, gate)) = &self.page_gate {
             let _ = entered.send(());
             let _ = gate.recv_timeout(WAIT);
@@ -151,21 +258,31 @@ impl ProviderReader for Fake {
         s.page_calls += 1;
         s.page_requests.push((anchor, direction));
         s.page_max_events.push(request.max_events);
-        s.pages.pop_front().unwrap_or_else(|| Ok(empty_page()))
+        s.pages
+            .pop_front()
+            .unwrap_or_else(|| Ok(empty_page()))
+            .map(ReadProgress::Ready)
     }
     fn count_events_after(
         &mut self,
+        _job: ReadJobId,
         _key: &SessionKey,
         _anchor: &PageAnchor,
-    ) -> Result<usize, ProviderError> {
-        Ok(self.script.lock().unwrap().count)
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<usize>, ProviderError> {
+        Ok(ReadProgress::Ready(self.script.lock().unwrap().count))
     }
-    fn source_record(&mut self, _locator: &SourceLocator) -> Result<SourceRecord, ProviderError> {
-        Ok(SourceRecord {
+    fn source_record(
+        &mut self,
+        _job: ReadJobId,
+        _locator: &SourceLocator,
+        _budget: RefreshBudget,
+    ) -> Result<ReadProgress<SourceRecord>, ProviderError> {
+        Ok(ReadProgress::Ready(SourceRecord {
             raw: "raw".into(),
             display: "display".into(),
             unavailable: None,
-        })
+        }))
     }
 }
 
@@ -177,24 +294,68 @@ fn config() -> Config {
     c
 }
 
-fn fake(provider: Provider, script: &Arc<Mutex<Script>>) -> Fake {
+fn fake(provider: Harness, script: &Arc<Mutex<Script>>) -> Fake {
     Fake {
-        provider,
+        harness: provider,
         script: script.clone(),
         gate: None,
         page_gate: None,
+        hydrate_gate: None,
+        details_gate: None,
     }
 }
 
-fn gated(provider: Provider, script: &Arc<Mutex<Script>>) -> (Fake, Receiver<()>, Sender<()>) {
+fn gated(provider: Harness, script: &Arc<Mutex<Script>>) -> (Fake, Receiver<()>, Sender<()>) {
     let (entered_tx, entered_rx) = mpsc::channel();
     let (gate_tx, gate_rx) = mpsc::channel();
     (
         Fake {
-            provider,
+            harness: provider,
             script: script.clone(),
             gate: Some((entered_tx, gate_rx)),
             page_gate: None,
+            hydrate_gate: None,
+            details_gate: None,
+        },
+        entered_rx,
+        gate_tx,
+    )
+}
+
+fn gated_hydrate(
+    provider: Harness,
+    script: &Arc<Mutex<Script>>,
+) -> (Fake, Receiver<()>, Sender<()>) {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (gate_tx, gate_rx) = mpsc::channel();
+    (
+        Fake {
+            harness: provider,
+            script: script.clone(),
+            gate: None,
+            page_gate: None,
+            hydrate_gate: Some((entered_tx, gate_rx)),
+            details_gate: None,
+        },
+        entered_rx,
+        gate_tx,
+    )
+}
+
+fn gated_details(
+    provider: Harness,
+    script: &Arc<Mutex<Script>>,
+) -> (Fake, Receiver<()>, Sender<()>) {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (gate_tx, gate_rx) = mpsc::channel();
+    (
+        Fake {
+            harness: provider,
+            script: script.clone(),
+            gate: None,
+            page_gate: None,
+            hydrate_gate: None,
+            details_gate: Some((entered_tx, gate_rx)),
         },
         entered_rx,
         gate_tx,
@@ -226,14 +387,15 @@ fn finished(gen_: u64) -> impl Fn(&WorkerEvent) -> bool {
     move |e| matches!(e, WorkerEvent::RefreshFinished { generation } if *generation == gen_)
 }
 
-fn last_roster(events: &[WorkerEvent]) -> (&[SessionSummary], &[Warning]) {
+/// The loaded roots of the newest roster event and its warnings.
+fn last_roster(events: &[WorkerEvent]) -> (&[Arc<SessionMetadata>], &[Warning]) {
     events
         .iter()
         .rev()
         .find_map(|e| match e {
-            WorkerEvent::Roster {
-                sessions, warnings, ..
-            } => Some((sessions.as_slice(), warnings.as_slice())),
+            WorkerEvent::Roster { snapshot, warnings } => {
+                Some((snapshot.metadata.as_slice(), warnings.as_slice()))
+            }
             _ => None,
         })
         .expect("a roster event")
@@ -242,12 +404,12 @@ fn last_roster(events: &[WorkerEvent]) -> (&[SessionSummary], &[Warning]) {
 #[test]
 fn coalesces_refresh_and_drops_stale_transcript_responses() {
     let script = Arc::new(Mutex::new(Script::default()));
-    let (f, entered, gate) = gated(Provider::Codex, &script);
+    let (f, entered, gate) = gated(Harness::Codex, &script);
     let h = spawn(f);
     // The initial refresh is now running and blocked inside the adapter.
     entered.recv_timeout(WAIT).unwrap();
-    let a = key(Provider::Codex, "a");
-    let b = key(Provider::Codex, "b");
+    let a = key(Harness::Codex, "a");
+    let b = key(Harness::Codex, "b");
     for _ in 0..3 {
         h.tx.send(WorkerRequest::Refresh).unwrap();
     }
@@ -302,18 +464,18 @@ fn services_page_requests_between_refresh_chunks() {
     {
         let mut s = script.lock().unwrap();
         s.refreshes.push_back(Ok(delta(
-            vec![summary(Provider::Codex, "a", 1, 1)],
+            vec![summary(Harness::Codex, "a", 1, 1)],
             vec![],
             false,
         )));
         s.refreshes.push_back(Ok(delta(vec![], vec![], true)));
     }
-    let (f, entered, gate) = gated(Provider::Codex, &script);
+    let (f, entered, gate) = gated(Harness::Codex, &script);
     let h = spawn(f);
     entered.recv_timeout(WAIT).unwrap(); // chunk 1 running
     h.tx.send(WorkerRequest::Select {
         request_id: 7,
-        key: key(Provider::Codex, "a"),
+        key: key(Harness::Codex, "a"),
     })
     .unwrap();
     gate.send(()).unwrap(); // chunk 1 returns (not done)
@@ -328,7 +490,7 @@ fn services_page_requests_between_refresh_chunks() {
     );
     assert!(events.iter().any(|e| matches!(
         e,
-        WorkerEvent::Roster { scan, .. } if !scan.done
+        WorkerEvent::Roster { snapshot, .. } if snapshot.scan.iter().any(|s| !s.done)
     )));
     gate.send(()).unwrap();
     until(&h, finished(1));
@@ -338,9 +500,9 @@ fn services_page_requests_between_refresh_chunks() {
 #[test]
 fn provider_failure_keeps_last_good_sessions_and_replaces_warning() {
     let script = Arc::new(Mutex::new(Script::default()));
-    let w1 = warning(Provider::Codex, "root", WarningKind::Parse, "bad line");
+    let w1 = warning(Harness::Codex, "root", WarningKind::Parse, "bad line");
     let w2 = warning(
-        Provider::Codex,
+        Harness::Codex,
         "root",
         WarningKind::Unsupported,
         "newer schema",
@@ -348,7 +510,7 @@ fn provider_failure_keeps_last_good_sessions_and_replaces_warning() {
     {
         let mut s = script.lock().unwrap();
         s.refreshes.push_back(Ok(delta(
-            vec![summary(Provider::Codex, "a", 1, 1)],
+            vec![summary(Harness::Codex, "a", 1, 1)],
             vec![w1.clone()],
             true,
         )));
@@ -358,7 +520,7 @@ fn provider_failure_keeps_last_good_sessions_and_replaces_warning() {
             .push_back(Ok(delta(vec![], vec![w2.clone()], true)));
         s.refreshes.push_back(Ok(delta(vec![], vec![], true)));
     }
-    let h = spawn(fake(Provider::Codex, &script));
+    let h = spawn(fake(Harness::Codex, &script));
 
     let ev = until(&h, finished(1));
     let (sessions, warnings) = last_roster(&ev);
@@ -394,8 +556,8 @@ fn opencode_in_place_update_emits_transcript_invalidated_for_selected_session() 
         let mut s = script.lock().unwrap();
         s.refreshes.push_back(Ok(delta(
             vec![
-                summary(Provider::OpenCode, "a", 10, 3),
-                summary(Provider::OpenCode, "b", 10, 3),
+                summary(Harness::OpenCode, "a", 10, 3),
+                summary(Harness::OpenCode, "b", 10, 3),
             ],
             vec![],
             true,
@@ -404,20 +566,20 @@ fn opencode_in_place_update_emits_transcript_invalidated_for_selected_session() 
         s.refreshes.push_back(Ok(with_invalidated(
             delta(
                 vec![
-                    summary(Provider::OpenCode, "a", 20, 3),
-                    summary(Provider::OpenCode, "b", 20, 3),
+                    summary(Harness::OpenCode, "a", 20, 3),
+                    summary(Harness::OpenCode, "b", 20, 3),
                 ],
                 vec![],
                 true,
             ),
-            vec![key(Provider::OpenCode, "a"), key(Provider::OpenCode, "b")],
+            vec![key(Harness::OpenCode, "a"), key(Harness::OpenCode, "b")],
         )));
     }
-    let h = spawn(fake(Provider::OpenCode, &script));
+    let h = spawn(fake(Harness::OpenCode, &script));
     until(&h, finished(1));
     h.tx.send(WorkerRequest::Select {
         request_id: 1,
-        key: key(Provider::OpenCode, "a"),
+        key: key(Harness::OpenCode, "a"),
     })
     .unwrap();
     until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
@@ -431,7 +593,7 @@ fn opencode_in_place_update_emits_transcript_invalidated_for_selected_session() 
             _ => None,
         })
         .collect();
-    assert_eq!(invalidated, vec![&key(Provider::OpenCode, "a")]);
+    assert_eq!(invalidated, vec![&key(Harness::OpenCode, "a")]);
     assert!(h.shutdown());
 }
 
@@ -447,12 +609,12 @@ fn unavailable_page_is_retried_later_without_busy_looping() {
             "transcript index is building (5 of 9 bytes); retry".into(),
         )));
     }
-    let h = spawn(fake(Provider::Codex, &script));
+    let h = spawn(fake(Harness::Codex, &script));
     until(&h, finished(1));
     let start = Instant::now();
     h.tx.send(WorkerRequest::Select {
         request_id: 1,
-        key: key(Provider::Codex, "a"),
+        key: key(Harness::Codex, "a"),
     })
     .unwrap();
     until(&h, |e| {
@@ -471,7 +633,7 @@ fn unavailable_page_is_retried_later_without_busy_looping() {
 fn processes_are_merged_into_published_roster() {
     let script = Arc::new(Mutex::new(Script::default()));
     script.lock().unwrap().refreshes.push_back(Ok(delta(
-        vec![summary(Provider::Codex, "01a1", 1, 1)],
+        vec![summary(Harness::Codex, "01a1", 1, 1)],
         vec![],
         true,
     )));
@@ -489,19 +651,22 @@ fn processes_are_merged_into_published_roster() {
             )],
         })
     });
-    let h = WorkerHandle::spawn_with_sampler(
-        vec![Box::new(fake(Provider::Codex, &script))],
-        c,
-        sampler,
-    );
-    let ev = until(&h, finished(1));
+    let h =
+        WorkerHandle::spawn_with_sampler(vec![Box::new(fake(Harness::Codex, &script))], c, sampler);
+    // The hydrated summary arrives after the frozen page; its process is associated.
+    let ev = until(&h, |e| {
+        matches!(e, WorkerEvent::Roster { snapshot, .. }
+            if snapshot.summaries.first().is_some_and(|s| s.process != ProcessAssociation::NotChecked))
+    });
     assert!(
         ev.iter()
             .any(|e| matches!(e, WorkerEvent::Processes { .. }))
     );
-    let (sessions, _) = last_roster(&ev);
+    let Some(WorkerEvent::Roster { snapshot, .. }) = ev.last() else {
+        panic!("roster expected");
+    };
     assert_eq!(
-        sessions[0].process,
+        snapshot.summaries[0].process,
         ProcessAssociation::Matched {
             pid: 42,
             started_at: Some(1_000)
@@ -513,7 +678,7 @@ fn processes_are_merged_into_published_roster() {
 #[test]
 fn shutdown_joins_without_panicking() {
     let script = Arc::new(Mutex::new(Script::default()));
-    let h = spawn(fake(Provider::Codex, &script));
+    let h = spawn(fake(Harness::Codex, &script));
     until(&h, finished(1));
     assert!(h.shutdown());
 
@@ -523,7 +688,7 @@ fn shutdown_joins_without_panicking() {
         endless: true,
         ..Script::default()
     }));
-    let h = spawn(fake(Provider::Codex, &script));
+    let h = spawn(fake(Harness::Codex, &script));
     std::thread::sleep(Duration::from_millis(200));
     let start = Instant::now();
     assert!(h.shutdown());
@@ -536,27 +701,27 @@ fn invalidation_follows_the_adapter_signal_not_summary_changes() {
     {
         let mut s = script.lock().unwrap();
         s.refreshes.push_back(Ok(delta(
-            vec![summary(Provider::Claude, "a", 10, 3)],
+            vec![summary(Harness::Claude, "a", 10, 3)],
             vec![],
             true,
         )));
         // Persisted time and count both moved, but nothing was revised.
         s.refreshes.push_back(Ok(delta(
-            vec![summary(Provider::Claude, "a", 20, 2)],
+            vec![summary(Harness::Claude, "a", 20, 2)],
             vec![],
             true,
         )));
         // Same persisted time and count, content revised.
         s.refreshes.push_back(Ok(with_invalidated(
-            delta(vec![summary(Provider::Claude, "a", 20, 2)], vec![], true),
-            vec![key(Provider::Claude, "a")],
+            delta(vec![summary(Harness::Claude, "a", 20, 2)], vec![], true),
+            vec![key(Harness::Claude, "a")],
         )));
     }
-    let h = spawn(fake(Provider::Claude, &script));
+    let h = spawn(fake(Harness::Claude, &script));
     until(&h, finished(1));
     h.tx.send(WorkerRequest::Select {
         request_id: 1,
-        key: key(Provider::Claude, "a"),
+        key: key(Harness::Claude, "a"),
     })
     .unwrap();
     until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
@@ -588,11 +753,8 @@ fn process_sampling_is_not_starved_by_faster_refreshes() {
             processes: vec![],
         })
     });
-    let h = WorkerHandle::spawn_with_sampler(
-        vec![Box::new(fake(Provider::Codex, &script))],
-        c,
-        sampler,
-    );
+    let h =
+        WorkerHandle::spawn_with_sampler(vec![Box::new(fake(Harness::Codex, &script))], c, sampler);
     let start = Instant::now();
     while start.elapsed() < Duration::from_millis(1_100) {
         let _ = h.rx.recv_timeout(Duration::from_millis(20));
@@ -607,19 +769,19 @@ fn selection_arriving_during_a_page_load_is_served_without_more_messages() {
     let script = Arc::new(Mutex::new(Script::default()));
     let (entered_tx, entered) = mpsc::channel();
     let (release, gate_rx) = mpsc::channel();
-    let mut f = fake(Provider::Codex, &script);
+    let mut f = fake(Harness::Codex, &script);
     f.page_gate = Some((entered_tx, gate_rx));
     let h = spawn(f);
     until(&h, finished(1));
     h.tx.send(WorkerRequest::Select {
         request_id: 1,
-        key: key(Provider::Codex, "a"),
+        key: key(Harness::Codex, "a"),
     })
     .unwrap();
     entered.recv_timeout(WAIT).unwrap(); // request 1 is inside the adapter
     h.tx.send(WorkerRequest::Select {
         request_id: 2,
-        key: key(Provider::Codex, "b"),
+        key: key(Harness::Codex, "b"),
     })
     .unwrap();
     release.send(()).unwrap();
@@ -634,19 +796,19 @@ fn selection_arriving_during_a_page_load_is_served_without_more_messages() {
 }
 
 #[test]
-fn initial_selection_requests_the_oldest_page_forward() {
+fn initial_selection_requests_the_newest_page_backward() {
     let script = Arc::new(Mutex::new(Script::default()));
-    let h = spawn(fake(Provider::Codex, &script));
+    let h = spawn(fake(Harness::Codex, &script));
     until(&h, finished(1));
     h.tx.send(WorkerRequest::Select {
         request_id: 1,
-        key: key(Provider::Codex, "a"),
+        key: key(Harness::Codex, "a"),
     })
     .unwrap();
     until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
     assert_eq!(
         script.lock().unwrap().page_requests,
-        vec![(None, PageDirection::Forward)]
+        vec![(None, PageDirection::Backward)]
     );
     assert!(h.shutdown());
 }
@@ -655,13 +817,13 @@ fn initial_selection_requests_the_oldest_page_forward() {
 fn requests_are_serviced_at_provider_boundaries() {
     let a = Arc::new(Mutex::new(Script::default()));
     let b = Arc::new(Mutex::new(Script::default()));
-    let (fa, entered_a, gate_a) = gated(Provider::Codex, &a);
-    let (fb, entered_b, gate_b) = gated(Provider::Claude, &b);
+    let (fa, entered_a, gate_a) = gated(Harness::Codex, &a);
+    let (fb, entered_b, gate_b) = gated(Harness::Claude, &b);
     let h = WorkerHandle::spawn(vec![Box::new(fa), Box::new(fb)], config());
     entered_a.recv_timeout(WAIT).unwrap();
     h.tx.send(WorkerRequest::Select {
         request_id: 1,
-        key: key(Provider::Codex, "a"),
+        key: key(Harness::Codex, "a"),
     })
     .unwrap();
     // Provider A finishes (done) in this single chunk; the page must be
@@ -699,8 +861,8 @@ fn anchor(n: u64) -> PageAnchor {
 fn count_after_is_answered_with_the_adapter_count() {
     let script = Arc::new(Mutex::new(Script::default()));
     script.lock().unwrap().count = 7;
-    let h = spawn(fake(Provider::Codex, &script));
-    let k = key(Provider::Codex, "a");
+    let h = spawn(fake(Harness::Codex, &script));
+    let k = key(Harness::Codex, "a");
     select(&h, 1, &k);
     until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
     h.tx.send(WorkerRequest::CountAfter {
@@ -728,8 +890,8 @@ fn page_failures_carry_the_request_id() {
         .unwrap()
         .pages
         .push_back(Err(ProviderError::Parse("bad".into())));
-    let h = spawn(fake(Provider::Codex, &script));
-    select(&h, 5, &key(Provider::Codex, "a"));
+    let h = spawn(fake(Harness::Codex, &script));
+    select(&h, 5, &key(Harness::Codex, "a"));
     let events = until(&h, |e| matches!(e, WorkerEvent::LoadFailed { .. }));
     assert!(matches!(
         events.last(),
@@ -743,12 +905,398 @@ fn requested_page_size_never_exceeds_the_ui_window() {
     let script = Arc::new(Mutex::new(Script::default()));
     let mut c = config();
     c.max_page_events = 1_000_000;
-    let h = WorkerHandle::spawn(vec![Box::new(fake(Provider::Codex, &script))], c);
-    select(&h, 1, &key(Provider::Codex, "a"));
+    let h = WorkerHandle::spawn(vec![Box::new(fake(Harness::Codex, &script))], c);
+    select(&h, 1, &key(Harness::Codex, "a"));
     until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
     assert_eq!(
         script.lock().unwrap().page_max_events,
         vec![agentscope::app::MAX_LOADED_EVENTS]
+    );
+    assert!(h.shutdown());
+}
+
+/// An OpenCode-like reader that owns one database and rejects any other
+/// database's keys, as the real scanner does.
+struct DbReader {
+    database: &'static str,
+    session: SessionSummary,
+    served: Arc<Mutex<Vec<(&'static str, &'static str)>>>,
+}
+
+impl DbReader {
+    fn owns(&self, key: &SessionKey) -> bool {
+        key == &self.session.meta.key
+    }
+    fn note(&self, what: &'static str) {
+        self.served.lock().unwrap().push((self.database, what));
+    }
+}
+
+impl ProviderReader for DbReader {
+    fn harness(&self) -> Harness {
+        Harness::OpenCode
+    }
+    fn discover(
+        &mut self,
+        _: Timestamp,
+        _: RefreshBudget,
+    ) -> Result<DiscoveryDelta, ProviderError> {
+        Ok(DiscoveryDelta {
+            sessions: vec![self.session.meta.clone()],
+            removed: vec![],
+            invalidated: vec![],
+            warnings: vec![],
+            scan: ScanProgress {
+                harness: Harness::OpenCode,
+                scanned: 1,
+                total: Some(1),
+                done: true,
+            },
+        })
+    }
+    fn hydrate(
+        &mut self,
+        _: ReadJobId,
+        key: &SessionKey,
+        _: Timestamp,
+        _: RefreshBudget,
+    ) -> Result<HydrationDelta, ProviderError> {
+        if !self.owns(key) {
+            return Err(ProviderError::Unsupported("not an OpenCode session".into()));
+        }
+        Ok(HydrationDelta {
+            summary: self.session.clone(),
+            done: true,
+        })
+    }
+    fn cancel_read(&mut self, _: &SessionKey, _: ReadJobId) {}
+    fn details_page(
+        &mut self,
+        _: ReadJobId,
+        _: &SessionKey,
+        _: Option<PageAnchor>,
+        _: PageRequest,
+        _: RefreshBudget,
+    ) -> Result<ReadProgress<SessionDetailPage>, ProviderError> {
+        Ok(ReadProgress::Ready(SessionDetailPage::default()))
+    }
+    fn transcript_page(
+        &mut self,
+        _: ReadJobId,
+        key: &SessionKey,
+        _: Option<PageAnchor>,
+        _: PageDirection,
+        _: PageRequest,
+        _: RefreshBudget,
+    ) -> Result<ReadProgress<TranscriptPage>, ProviderError> {
+        if !self.owns(key) {
+            return Err(ProviderError::Unsupported("not an OpenCode session".into()));
+        }
+        self.note("page");
+        Ok(ReadProgress::Ready(empty_page()))
+    }
+    fn count_events_after(
+        &mut self,
+        _: ReadJobId,
+        key: &SessionKey,
+        _: &PageAnchor,
+        _: RefreshBudget,
+    ) -> Result<ReadProgress<usize>, ProviderError> {
+        if !self.owns(key) {
+            return Err(ProviderError::Unsupported("not an OpenCode session".into()));
+        }
+        self.note("count");
+        Ok(ReadProgress::Ready(3))
+    }
+    fn source_record(
+        &mut self,
+        _: ReadJobId,
+        locator: &SourceLocator,
+        _: RefreshBudget,
+    ) -> Result<ReadProgress<SourceRecord>, ProviderError> {
+        if !self.owns(&locator.session) {
+            return Err(ProviderError::Unsupported("not an OpenCode session".into()));
+        }
+        self.note("source");
+        Ok(ReadProgress::Ready(SourceRecord {
+            raw: "raw".into(),
+            display: "display".into(),
+            unavailable: None,
+        }))
+    }
+}
+
+#[test]
+fn loads_reach_the_reader_that_owns_the_database() {
+    let served = Arc::new(Mutex::new(Vec::new()));
+    let mk = |database: &'static str| {
+        let key = SessionKey {
+            harness: Harness::OpenCode,
+            native_id: "same".into(),
+            source: SourceKey::DbRow {
+                database: database.into(),
+                table: "session_v2".into(),
+                id: "same".into(),
+            },
+        };
+        DbReader {
+            database,
+            session: facts::summary(metadata(key, "t")),
+            served: served.clone(),
+        }
+    };
+    let (a, b) = (mk("a/state.db"), mk("b/state.db"));
+    let kb = b.session.meta.key.clone();
+    let h = WorkerHandle::spawn(vec![Box::new(a), Box::new(b)], config());
+    until(&h, |e| matches!(e, WorkerEvent::RefreshFinished { .. }));
+
+    select(&h, 1, &kb);
+    until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
+    h.tx.send(WorkerRequest::CountAfter {
+        request_id: 2,
+        key: kb.clone(),
+        anchor: anchor(1),
+    })
+    .unwrap();
+    let events = until(&h, |e| matches!(e, WorkerEvent::EventsAfter { .. }));
+    assert!(matches!(
+        events.last(),
+        Some(WorkerEvent::EventsAfter {
+            request_id: 2,
+            count: 3
+        })
+    ));
+    h.tx.send(WorkerRequest::LoadSource {
+        request_id: 3,
+        locator: SourceLocator {
+            session: kb,
+            kind: LocatorKind::DbRow {
+                table: "session_v2".into(),
+                row_id: "same".into(),
+                part_index: None,
+            },
+            generation: None,
+        },
+    })
+    .unwrap();
+    until(&h, |e| {
+        matches!(e, WorkerEvent::Source { request_id: 3, .. })
+    });
+    assert!(h.shutdown());
+    assert_eq!(
+        *served.lock().unwrap(),
+        [
+            ("b/state.db", "page"),
+            ("b/state.db", "count"),
+            ("b/state.db", "source")
+        ]
+    );
+}
+
+#[test]
+fn an_in_flight_preview_superseded_by_b_is_released_without_answering() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    let a = summary(Harness::Codex, "a", 10, 3);
+    let b = summary(Harness::Codex, "b", 20, 4);
+    {
+        let mut s = script.lock().unwrap();
+        s.known.insert(a.meta.key.clone(), a.clone());
+        s.known.insert(b.meta.key.clone(), b.clone());
+    }
+    let (f, entered, release) = gated_hydrate(Harness::Codex, &script);
+    let h = spawn(f);
+    until(&h, finished(1));
+    h.tx.send(WorkerRequest::HydratePreview {
+        request_id: 1,
+        key: a.meta.key.clone(),
+    })
+    .unwrap();
+    // A is inside its adapter slice when B supersedes it.
+    entered.recv_timeout(WAIT).unwrap();
+    h.tx.send(WorkerRequest::HydratePreview {
+        request_id: 2,
+        key: b.meta.key.clone(),
+    })
+    .unwrap();
+    release.send(()).unwrap(); // A's slice returns and is discarded
+    release.send(()).unwrap(); // B's slice runs to completion
+
+    let events = until(
+        &h,
+        |e| matches!(e, WorkerEvent::Preview { request_id: 2, key, done: true, .. } if key == &b.meta.key),
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::Preview { request_id: 1, .. })),
+        "the superseded in-flight preview never answers"
+    );
+    let s = script.lock().unwrap();
+    assert!(
+        s.cancelled.iter().any(|(key, _)| key == &a.meta.key),
+        "the running preview job is released when superseded"
+    );
+    drop(s);
+    assert!(h.shutdown());
+}
+
+#[test]
+fn an_in_flight_details_slice_can_be_cancelled_without_answering() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    let a = summary(Harness::Codex, "a", 10, 3);
+    let k = a.meta.key.clone();
+    script.lock().unwrap().known.insert(k.clone(), a);
+    let (f, entered, release) = gated_details(Harness::Codex, &script);
+    let h = spawn(f);
+    until(&h, finished(1));
+    h.tx.send(WorkerRequest::LoadDetails {
+        request_id: 1,
+        key: k.clone(),
+        anchor: None,
+    })
+    .unwrap();
+    entered.recv_timeout(WAIT).unwrap(); // details slice is running
+    h.tx.send(WorkerRequest::CancelLoad { request_id: 1 })
+        .unwrap();
+    release.send(()).unwrap();
+    // A refresh is a deterministic completion boundary for the cancelled slice.
+    h.tx.send(WorkerRequest::Refresh).unwrap();
+    let events = until(&h, finished(2));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::Details { request_id: 1, .. }))
+    );
+    {
+        let s = script.lock().unwrap();
+        assert_eq!(s.cancelled.iter().filter(|(key, _)| key == &k).count(), 1);
+    }
+    // A fresh request on the same key starts cleanly.
+    h.tx.send(WorkerRequest::LoadDetails {
+        request_id: 2,
+        key: k,
+        anchor: None,
+    })
+    .unwrap();
+    release.send(()).unwrap();
+    let events = until(&h, |e| {
+        matches!(e, WorkerEvent::Details { request_id: 2, .. })
+    });
+    assert!(matches!(
+        events.last(),
+        Some(WorkerEvent::Details { request_id: 2, .. })
+    ));
+    assert!(h.shutdown());
+}
+
+#[test]
+fn cancelling_details_releases_only_that_job_and_the_transcript_completes() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    let a = summary(Harness::Codex, "a", 10, 3);
+    let k = a.meta.key.clone();
+    {
+        let mut s = script.lock().unwrap();
+        s.known.insert(k.clone(), a);
+        s.pages.push_back(Ok(event_page(&k, "e0")));
+        s.pages.push_back(Ok(event_page(&k, "fresh")));
+    }
+    let (f, entered, gate) = gated(Harness::Codex, &script);
+    let h = spawn(f);
+    entered.recv_timeout(WAIT).unwrap();
+    h.tx.send(WorkerRequest::LoadDetails {
+        request_id: 1,
+        key: k.clone(),
+        anchor: None,
+    })
+    .unwrap();
+    h.tx.send(WorkerRequest::Select {
+        request_id: 2,
+        key: k.clone(),
+    })
+    .unwrap();
+    h.tx.send(WorkerRequest::CancelLoad { request_id: 1 })
+        .unwrap();
+    gate.send(()).unwrap();
+
+    let events = until(&h, |e| {
+        matches!(e, WorkerEvent::Transcript { request_id: 2, .. })
+    });
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::Details { request_id: 1, .. })),
+        "the cancelled details job never answers"
+    );
+    {
+        let s = script.lock().unwrap();
+        assert_eq!(
+            s.cancelled.iter().filter(|(key, _)| key == &k).count(),
+            1,
+            "only the details job was released"
+        );
+    }
+
+    // The transcript selection still owns its worker state: a fresh page loads.
+    h.tx.send(WorkerRequest::LoadPage {
+        request_id: 3,
+        key: k.clone(),
+        anchor: None,
+        direction: PageDirection::Backward,
+    })
+    .unwrap();
+    let events = until(&h, |e| {
+        matches!(e, WorkerEvent::Transcript { request_id: 3, .. })
+    });
+    match events.last() {
+        Some(WorkerEvent::Transcript { page, .. }) => {
+            assert_eq!(page.events.first().map(|e| e.id.as_str()), Some("fresh"));
+        }
+        other => panic!("expected a fresh transcript page, got {other:?}"),
+    }
+    assert!(h.shutdown());
+}
+
+#[test]
+fn a_preview_rehydrates_after_its_cached_summary_was_evicted() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    let a = summary(Harness::Codex, "a", 10, 3);
+    let b = summary(Harness::Codex, "b", 20, 4);
+    {
+        let mut s = script.lock().unwrap();
+        s.known.insert(a.meta.key.clone(), a.clone());
+        s.known.insert(b.meta.key.clone(), b.clone());
+        // Discovery keeps both metadata records; only one summary fits the cache.
+        s.refreshes
+            .push_back(Ok(delta(vec![a.clone(), b.clone()], vec![], true)));
+    }
+    let mut c = config();
+    c.max_cached_sessions = 1;
+    let h = WorkerHandle::spawn(vec![Box::new(fake(Harness::Codex, &script))], c);
+    until(&h, finished(1));
+
+    for (id, key) in [&a.meta.key, &b.meta.key, &a.meta.key]
+        .into_iter()
+        .enumerate()
+    {
+        let id = id as u64 + 1;
+        h.tx.send(WorkerRequest::HydratePreview {
+            request_id: id,
+            key: key.clone(),
+        })
+        .unwrap();
+        let events = until(&h, |e| {
+            matches!(e, WorkerEvent::Preview { request_id, key: got, done: true, .. }
+                if *request_id == id && got == key)
+        });
+        let Some(WorkerEvent::Preview { summary, .. }) = events.last() else {
+            panic!("expected a completed preview");
+        };
+        assert_eq!(&summary.meta.key, key);
+    }
+    let calls = script.lock().unwrap().hydrate_calls.clone();
+    assert!(
+        calls.iter().filter(|key| *key == &a.meta.key).count() >= 2,
+        "A is hydrated again from its metadata, not lost with the summary"
     );
     assert!(h.shutdown());
 }

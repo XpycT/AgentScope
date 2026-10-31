@@ -19,6 +19,8 @@ cargo test
 
 The GitHub Actions workflow runs these checks on a Linux runner for pushes and pull requests. Its presence is not a claim of a passing CI run. Include a short verification summary with any PR. `cargo run -- inspect <jsonl-file>` exercises the experimental reader; use synthetic data for testing.
 
+Fixtures that need the whole native picture (125 roots, families, Desktop stores, archives, damaged records, locked WAL, planted secrets) come from `World::native()` in `tests/support/world.rs`; extend that world and its exact expectations rather than adding another ad-hoc store. The integrated suites are `cargo test --test acceptance --test read_only --test privacy --test perf_budget --test native_children --test desktop_sessions --test tui_flow`. OMP, Hermes and Pi readers are not implemented yet, so do not add fixtures or registrations for them outside their own plans.
+
 ## Pull requests
 
 - Make one focused change at a time; describe its user-visible behavior and motivation.

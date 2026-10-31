@@ -1,11 +1,11 @@
 mod support;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agentscope::domain::{
-    Actor, AggregationClass, EventKind, Lifecycle, LocatorKind, PageDirection, PageRequest,
-    Provider, RefreshBudget, SessionKey, SessionSummary, SourceKey, ToolStatus, Warning,
+    Actor, AggregationClass, EventKind, Harness, Lifecycle, LocatorKind, PageDirection,
+    PageRequest, RefreshBudget, SessionKey, SessionSummary, SourceKey, ToolStatus, Warning,
     WarningKind,
 };
 use agentscope::providers::opencode::OpenCodeScanner;
@@ -30,9 +30,9 @@ fn scan(scanner: &mut OpenCodeScanner) -> (HashMap<String, SessionSummary>, Vec<
     let mut sessions = HashMap::new();
     let mut warnings = Vec::new();
     loop {
-        let delta = scanner.scan_roster(NOW, BIG).expect("scan");
+        let delta = support::world::rescan(scanner, NOW, BIG);
         for s in delta.sessions {
-            sessions.insert(s.key.provider_session_id.clone(), s);
+            sessions.insert(s.meta.key.native_id.clone(), s);
         }
         warnings.extend(delta.warnings);
         if delta.scan.done {
@@ -41,15 +41,22 @@ fn scan(scanner: &mut OpenCodeScanner) -> (HashMap<String, SessionSummary>, Vec<
     }
 }
 
+thread_local! {
+    /// Database of the scanner this test thread opened last; keys are built from it.
+    static DATABASE: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
+}
+
 fn scanner_for(db: &Path) -> OpenCodeScanner {
+    DATABASE.with(|d| *d.borrow_mut() = db.to_path_buf());
     OpenCodeScanner::new(&config_for_db(db)).expect("scanner")
 }
 
 fn legacy_key(id: &str) -> SessionKey {
     SessionKey {
-        provider: Provider::OpenCode,
-        provider_session_id: id.to_owned(),
+        harness: Harness::OpenCode,
+        native_id: id.to_owned(),
         source: SourceKey::DbRow {
+            database: DATABASE.with(|d| d.borrow().clone()),
             table: "session".into(),
             id: id.to_owned(),
         },
@@ -136,7 +143,7 @@ fn legacy_schema_falls_back_when_v2_is_absent_or_empty() {
     let (sessions, warnings) = scan(&mut scanner);
     let old = &sessions["old"];
     assert!(warnings.is_empty(), "no v2 shape means no fallback warning");
-    assert!(old.models.is_empty(), "legacy model JSON stays unset");
+    assert!(old.meta.model.is_none(), "legacy model JSON stays unset");
     assert_eq!(old.lifecycle, Lifecycle::Completed);
     assert_eq!(old.last_completion, Some(20));
     let usage = old.usage.as_ref().expect("derived usage");
@@ -145,9 +152,16 @@ fn legacy_schema_falls_back_when_v2_is_absent_or_empty() {
     assert_eq!(usage.cost.usd, Some(0.5));
     assert_eq!(usage.cost.class, AggregationClass::Derived);
 
-    let page = scanner
-        .transcript_page(&legacy_key("old"), None, PageDirection::Forward, ALL)
-        .expect("legacy page");
+    let page = support::world::try_transcript(
+        &mut scanner,
+        &legacy_key("old"),
+        None,
+        PageDirection::Forward,
+        ALL,
+        BIG,
+        support::world::STEPS,
+    )
+    .expect("legacy page");
     let rows: Vec<_> = page
         .events
         .iter()
@@ -178,17 +192,19 @@ fn legacy_schema_falls_back_when_v2_is_absent_or_empty() {
     let mut seen = Vec::new();
     let mut anchor = None;
     loop {
-        let p = scanner
-            .transcript_page(
-                &legacy_key("old"),
-                anchor.clone(),
-                PageDirection::Forward,
-                PageRequest {
-                    max_events: 1,
-                    max_bytes: 10_000,
-                },
-            )
-            .expect("page");
+        let p = support::world::try_transcript(
+            &mut scanner,
+            &legacy_key("old"),
+            anchor.clone(),
+            PageDirection::Forward,
+            PageRequest {
+                max_events: 1,
+                max_bytes: 10_000,
+            },
+            BIG,
+            support::world::STEPS,
+        )
+        .expect("page");
         seen.extend(p.events.iter().map(|e| e.id.clone()));
         if !p.has_more {
             break;
@@ -203,7 +219,8 @@ fn legacy_schema_falls_back_when_v2_is_absent_or_empty() {
         &locator.kind,
         LocatorKind::DbRow { table, row_id, .. } if table == "part" && row_id == "p4"
     ));
-    let record = scanner.source_record(&locator).expect("record");
+    let record = support::world::try_source(&mut scanner, &locator, BIG, support::world::STEPS)
+        .expect("record");
     assert!(record.raw.contains("\"callID\""));
     assert!(record.unavailable.is_none());
 
@@ -258,9 +275,16 @@ fn populated_v2_is_never_mixed_with_legacy_rows() {
         "legacy rows stay out of a v2 roster"
     );
     assert!(warnings.is_empty());
-    let err = scanner
-        .transcript_page(&legacy_key("old"), None, PageDirection::Forward, ALL)
-        .expect_err("legacy key is not valid against v2");
+    let err = support::world::try_transcript(
+        &mut scanner,
+        &legacy_key("old"),
+        None,
+        PageDirection::Forward,
+        ALL,
+        BIG,
+        support::world::STEPS,
+    )
+    .expect_err("legacy key is not valid against v2");
     assert!(matches!(err, ProviderError::Unsupported(_)));
 }
 
@@ -316,9 +340,16 @@ fn unsupported_schema_lists_nothing_and_refuses_transcripts() {
             .iter()
             .any(|w| w.key.kind == WarningKind::Unsupported)
     );
-    let err = scanner
-        .transcript_page(&legacy_key("x"), None, PageDirection::Forward, ALL)
-        .expect_err("unsupported");
+    let err = support::world::try_transcript(
+        &mut scanner,
+        &legacy_key("x"),
+        None,
+        PageDirection::Forward,
+        ALL,
+        BIG,
+        support::world::STEPS,
+    )
+    .expect_err("unsupported");
     assert!(matches!(err, ProviderError::Unsupported(_)));
 }
 
@@ -353,20 +384,18 @@ fn legacy_message_rows_of_every_kind_spend_the_evidence_budget() {
         max_records: 3,
         ..BIG
     };
-    let first = scanner.scan_roster(NOW, small).expect("scan");
-    assert!(!first.scan.done && first.sessions.is_empty());
-    let mut steps = 1;
+    let key = support::world::discover_pass(&mut scanner, NOW, BIG)
+        .sessions
+        .remove(0)
+        .key;
+    let first = scanner
+        .hydrate(support::world::new_job(), &key, NOW, small)
+        .unwrap();
+    assert!(!first.done);
     let mut out = HashMap::new();
-    loop {
-        let d = scanner.scan_roster(NOW, small).expect("scan");
-        steps += 1;
-        for s in d.sessions {
-            out.insert(s.key.provider_session_id.clone(), s);
-        }
-        if d.scan.done {
-            break;
-        }
-    }
+    let (summary, rest) = support::world::hydrate_steps(&mut scanner, &key, NOW, small, 1000);
+    let steps = rest + 1;
+    out.insert(key.native_id.clone(), summary);
     assert!(steps >= 3, "10 message rows at 3 per step, got {steps}");
     assert_eq!(out["s"].usage.as_ref().and_then(|u| u.total), Some(2));
     assert_eq!(
@@ -403,17 +432,16 @@ fn legacy_oversized_prefix_group_makes_derived_usage_partial() {
     let mut scanner = scanner_for(&db);
     let mut out = HashMap::new();
     for _ in 0..50 {
-        let d = scanner
-            .scan_roster(
-                NOW,
-                RefreshBudget {
-                    max_records: 1,
-                    ..BIG
-                },
-            )
-            .expect("scan");
+        let d = support::world::rescan(
+            &mut scanner,
+            NOW,
+            RefreshBudget {
+                max_records: 1,
+                ..BIG
+            },
+        );
         for s in d.sessions {
-            out.insert(s.key.provider_session_id.clone(), s);
+            out.insert(s.meta.key.native_id.clone(), s);
         }
         if d.scan.done {
             break;
@@ -423,4 +451,82 @@ fn legacy_oversized_prefix_group_makes_derived_usage_partial() {
     assert_eq!(usage.class, AggregationClass::Partial);
     assert_eq!(usage.total, None, "a skipped group may hide assistant rows");
     assert_eq!(usage.categories.input, Some(11));
+}
+
+#[test]
+fn legacy_task_metadata_links_the_child_and_other_keys_do_not() {
+    use agentscope::domain::SessionLink;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("legacy.db");
+    {
+        let conn = create_legacy(&db);
+        insert_legacy_session(&conn, &Session::new("old", 10, 100));
+        message(&conn, "old", "m1", 10, json!({"role": "assistant"}));
+        let tool = |id: &str, name: &str, metadata: Value, output: &str| {
+            json!({"type": "tool", "callID": id, "tool": name,
+                   "state": {"status": "completed", "input": {}, "output": output,
+                             "metadata": metadata}})
+        };
+        part(
+            &conn,
+            "old",
+            "m1",
+            "p1",
+            11,
+            tool("c1", "task", json!({"sessionId": "ses_child"}), ""),
+        );
+        // Wrong tool, wrong key, and output text are never authority.
+        part(
+            &conn,
+            "old",
+            "m1",
+            "p2",
+            12,
+            tool("c2", "subagent", json!({"sessionID": "ses_v2_shape"}), ""),
+        );
+        part(
+            &conn,
+            "old",
+            "m1",
+            "p3",
+            13,
+            tool("c3", "task", json!({"sessionID": "ses_wrong_key"}), ""),
+        );
+        part(
+            &conn,
+            "old",
+            "m1",
+            "p4",
+            14,
+            tool("c4", "task", json!({}), "sessionId: ses_from_output"),
+        );
+    }
+    let mut scanner = scanner_for(&db);
+    let page = support::world::try_transcript(
+        &mut scanner,
+        &legacy_key("old"),
+        None,
+        PageDirection::Forward,
+        ALL,
+        BIG,
+        support::world::STEPS,
+    )
+    .expect("legacy page");
+    let tools: Vec<&agentscope::domain::Event> = page
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::Tool)
+        .collect();
+    assert_eq!(tools.len(), 4);
+    assert_eq!(
+        tools[0].tool.as_ref().unwrap().child_session,
+        Some(SessionLink::Unresolved("ses_child".into()))
+    );
+    for event in &tools[1..] {
+        assert_eq!(
+            event.tool.as_ref().unwrap().child_session,
+            None,
+            "no guessed jump"
+        );
+    }
 }

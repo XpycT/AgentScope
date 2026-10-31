@@ -1,7 +1,16 @@
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-use agentscope::app::{App, FilterState, SortMode, UsageAvailability};
+mod support;
+
+use agentscope::app::{
+    App, FilterState, FilterTarget, PreviewState, RosterItem, SortMode, UsageAvailability,
+};
 use agentscope::domain::*;
+use agentscope::providers::WorkProgress;
+use agentscope::worker::WorkerRequest;
+use support::facts::{self, file_key, metadata};
 
 const NOW: Timestamp = 10_000_000;
 
@@ -16,25 +25,16 @@ fn app() -> App {
     App::new(NOW, thresholds())
 }
 
-fn key(provider: Provider, id: &str) -> SessionKey {
-    SessionKey {
-        provider,
-        provider_session_id: id.into(),
-        source: SourceKey::File(format!("{id}.jsonl").into()),
-    }
+fn key(harness: Harness, id: &str) -> SessionKey {
+    file_key(harness, id, Path::new(&format!("{id}.jsonl")))
 }
 
-fn dup_key(provider: Provider, id: &str, file: &str) -> SessionKey {
-    SessionKey {
-        provider,
-        provider_session_id: id.into(),
-        source: SourceKey::File(file.into()),
-    }
+fn dup_key(harness: Harness, id: &str, file: &str) -> SessionKey {
+    file_key(harness, id, Path::new(file))
 }
 
 fn usage(total: Option<u64>, usd: Option<f64>) -> UsageSummary {
     UsageSummary {
-        model: None,
         categories: TokenCategories::default(),
         total,
         class: AggregationClass::Reported,
@@ -43,59 +43,42 @@ fn usage(total: Option<u64>, usd: Option<f64>) -> UsageSummary {
             class: AggregationClass::Estimated,
             as_of: None,
             note: None,
+            ..CostEstimate::default()
         },
+        ..UsageSummary::default()
     }
 }
 
 /// Active-looking session (recent persisted activity, matched process).
-fn session(provider: Provider, id: &str, last: Timestamp) -> SessionSummary {
+fn session(harness: Harness, id: &str, last: Timestamp) -> SessionSummary {
+    let mut meta = metadata(key(harness, id), &format!("title {id}"));
+    meta.activity = ActivityStamp {
+        at: Some(last),
+        class: AggregationClass::Reported,
+    };
     SessionSummary {
-        key: key(provider, id),
-        title: format!("title {id}"),
-        title_derived: false,
-        project: None,
-        cwd: None,
-        models: vec![],
-        model_details: vec![],
-        provider_version: None,
-        created_at: None,
         last_event_at: Some(last),
-        last_persisted_at: Some(last),
-        last_completion: None,
-        unfinished_work: false,
-        displayed_event_count: 0,
-        hidden_records: 0,
-        source_available: true,
-        archived: false,
-        context_window: None,
-        server_tools: None,
         lifecycle: Lifecycle::Ongoing,
         process: ProcessAssociation::Unmatched,
-        usage: None,
-        lineage: Lineage {
-            parent: None,
-            fork: None,
-            sidechain: false,
-        },
-        warnings: vec![],
+        ..facts::summary(meta)
     }
 }
 
 fn ids(app: &App) -> Vec<String> {
     app.visible_rows()
         .iter()
-        .map(|r| r.session.key.provider_session_id.clone())
+        .map(|r| r.session.meta.key.native_id.clone())
         .collect()
 }
 
 fn selected_id(app: &App) -> Option<String> {
-    app.selected_key().map(|k| k.provider_session_id)
+    app.selected_key().map(|k| k.native_id)
 }
 
 fn warning(source: &str, message: &str, count: u32) -> Warning {
     Warning {
         key: WarningKey {
-            provider: Provider::Codex,
+            harness: Harness::Codex,
             source: source.into(),
             kind: WarningKind::Parse,
         },
@@ -109,9 +92,9 @@ fn merges_roster_deltas_and_preserves_selection() {
     let mut app = app();
     app.apply_roster(
         vec![
-            session(Provider::Codex, "a", NOW - 1000),
-            session(Provider::Claude, "b", NOW - 2000),
-            session(Provider::OpenCode, "c", NOW - 3000),
+            session(Harness::Codex, "a", NOW - 1000),
+            session(Harness::Claude, "b", NOW - 2000),
+            session(Harness::OpenCode, "c", NOW - 3000),
         ],
         vec![],
     );
@@ -121,23 +104,23 @@ fn merges_roster_deltas_and_preserves_selection() {
     assert_eq!(selected_id(&app).as_deref(), Some("b"));
 
     // A new, newer session arrives and `a` is updated; selection stays on `b`.
-    let mut a2 = session(Provider::Codex, "a", NOW - 10);
-    a2.title = "renamed".into();
+    let mut a2 = session(Harness::Codex, "a", NOW - 10);
+    a2.meta.title = "renamed".into();
     app.apply_roster(
         vec![
-            session(Provider::Codex, "z", NOW - 5),
+            session(Harness::Codex, "z", NOW - 5),
             a2,
-            session(Provider::Claude, "b", NOW - 2000),
-            session(Provider::OpenCode, "c", NOW - 3000),
+            session(Harness::Claude, "b", NOW - 2000),
+            session(Harness::OpenCode, "c", NOW - 3000),
         ],
         vec![],
     );
     assert_eq!(ids(&app), ["z", "a", "b", "c"]);
     assert_eq!(selected_id(&app).as_deref(), Some("b"));
-    assert_eq!(app.visible_rows()[1].session.title, "renamed");
+    assert_eq!(app.visible_rows()[1].session.meta.title, "renamed");
 
     // Sessions absent from the new snapshot are removed.
-    app.apply_roster(vec![session(Provider::Claude, "b", NOW - 2000)], vec![]);
+    app.apply_roster(vec![session(Harness::Claude, "b", NOW - 2000)], vec![]);
     assert_eq!(ids(&app), ["b"]);
     assert_eq!(selected_id(&app).as_deref(), Some("b"));
     assert_eq!(app.total_sessions(), 1);
@@ -151,14 +134,14 @@ fn merges_roster_deltas_and_preserves_selection() {
 #[test]
 fn counts_providers_and_synthesized_states() {
     let mut app = app();
-    let mut done = session(Provider::Claude, "done", NOW - 1000);
+    let mut done = session(Harness::Claude, "done", NOW - 1000);
     done.lifecycle = Lifecycle::Failed;
-    let mut gone = session(Provider::Claude, "gone", NOW - 1000);
-    gone.source_available = false;
+    let mut gone = session(Harness::Claude, "gone", NOW - 1000);
+    gone.meta.source_available = false;
     app.apply_roster(
         vec![
-            session(Provider::Codex, "a", NOW - 1000),
-            session(Provider::Codex, "b", NOW - 1000),
+            session(Harness::Codex, "a", NOW - 1000),
+            session(Harness::Codex, "b", NOW - 1000),
             done,
             gone,
         ],
@@ -168,9 +151,12 @@ fn counts_providers_and_synthesized_states() {
     assert_eq!(
         providers,
         vec![
-            (Provider::Codex, 2),
-            (Provider::Claude, 2),
-            (Provider::OpenCode, 0)
+            (Harness::Codex, 2),
+            (Harness::Claude, 2),
+            (Harness::OpenCode, 0),
+            (Harness::Omp, 0),
+            (Harness::Hermes, 0),
+            (Harness::Pi, 0),
         ]
     );
     let states = app.status_counts();
@@ -180,25 +166,25 @@ fn counts_providers_and_synthesized_states() {
     assert_eq!(states.iter().map(|(_, n)| n).sum::<usize>(), 4);
     // Counts cover discovered sessions, not the filtered view.
     app.set_filter(FilterState {
-        providers: Some(vec![Provider::Codex]),
+        providers: Some(vec![Harness::Codex]),
         ..FilterState::default()
     });
     assert_eq!(app.visible_rows().len(), 2);
-    assert_eq!(app.provider_counts()[1], (Provider::Claude, 2));
+    assert_eq!(app.provider_counts()[1], (Harness::Claude, 2));
 }
 
 #[test]
 fn filters_and_sorts_with_unknown_tokens_last() {
     let mut app = app();
-    let mut a = session(Provider::Codex, "a", NOW - 3000);
+    let mut a = session(Harness::Codex, "a", NOW - 3000);
     a.usage = Some(usage(Some(100), None));
-    a.project = Some("Zeta".into());
-    let mut b = session(Provider::Claude, "b", NOW - 2000);
+    a.meta.project = Some("Zeta".into());
+    let mut b = session(Harness::Claude, "b", NOW - 2000);
     b.usage = Some(usage(None, None));
-    b.project = Some("alpha".into());
-    let mut c = session(Provider::OpenCode, "c", NOW - 1000);
+    b.meta.project = Some("alpha".into());
+    let mut c = session(Harness::OpenCode, "c", NOW - 1000);
     c.usage = Some(usage(Some(900), None));
-    let d = session(Provider::Codex, "d", NOW - 4000); // usage None
+    let d = session(Harness::Codex, "d", NOW - 4000); // usage None
     app.apply_roster(vec![a, b, c, d], vec![]);
 
     // Default: last activity, newest first.
@@ -224,7 +210,7 @@ fn filters_and_sorts_with_unknown_tokens_last() {
 
     // Provider + status + project filters.
     app.set_filter(FilterState {
-        providers: Some(vec![Provider::Codex, Provider::Claude]),
+        providers: Some(vec![Harness::Codex, Harness::Claude]),
         ..FilterState::default()
     });
     assert_eq!(app.visible_rows().len(), 3);
@@ -248,7 +234,7 @@ fn filters_and_sorts_with_unknown_tokens_last() {
 fn app_status_of(app: &App, id: &str) -> StatusLabel {
     app.all_rows()
         .into_iter()
-        .find(|r| r.session.key.provider_session_id == id)
+        .find(|r| r.session.meta.key.native_id == id)
         .unwrap()
         .status
         .label
@@ -257,12 +243,12 @@ fn app_status_of(app: &App, id: &str) -> StatusLabel {
 #[test]
 fn search_matches_title_project_cwd_and_session_id() {
     let mut app = app();
-    let mut a = session(Provider::Codex, "abc-123", NOW - 1);
-    a.title = "Inventory API".into();
-    let mut b = session(Provider::Claude, "b", NOW - 2);
-    b.project = Some("RipperGame".into());
-    let mut c = session(Provider::Claude, "c", NOW - 3);
-    c.cwd = Some("/work/Sandbox".into());
+    let mut a = session(Harness::Codex, "abc-123", NOW - 1);
+    a.meta.title = "Inventory API".into();
+    let mut b = session(Harness::Claude, "b", NOW - 2);
+    b.meta.project = Some("RipperGame".into());
+    let mut c = session(Harness::Claude, "c", NOW - 3);
+    c.meta.cwd = Some("/work/Sandbox".into());
     app.apply_roster(vec![a, b, c], vec![]);
 
     let q = |app: &mut App, q: &str| {
@@ -280,7 +266,7 @@ fn search_matches_title_project_cwd_and_session_id() {
 #[test]
 fn removing_the_selected_session_selects_the_nearest_row() {
     let mut app = app();
-    let mk = |id: &str, age: i64| session(Provider::Codex, id, NOW - age);
+    let mk = |id: &str, age: i64| session(Harness::Codex, id, NOW - age);
     app.apply_roster(vec![mk("a", 1), mk("b", 2), mk("c", 3), mk("d", 4)], vec![]);
     app.move_selection(2);
     assert_eq!(selected_id(&app).as_deref(), Some("c"));
@@ -343,13 +329,13 @@ fn warning_keys_replace_and_count_instead_of_accumulating() {
 #[test]
 fn filters_usage_availability_and_composes_with_search() {
     let mut app = app();
-    let mut known = session(Provider::Codex, "known", NOW - 1);
+    let mut known = session(Harness::Codex, "known", NOW - 1);
     known.usage = Some(usage(Some(10), None));
-    let mut cost = session(Provider::Codex, "cost", NOW - 2);
+    let mut cost = session(Harness::Codex, "cost", NOW - 2);
     cost.usage = Some(usage(Some(20), Some(0.5)));
-    let mut unk = session(Provider::Claude, "unk", NOW - 3);
+    let mut unk = session(Harness::Claude, "unk", NOW - 3);
     unk.usage = Some(usage(None, None));
-    let none = session(Provider::Claude, "none", NOW - 4);
+    let none = session(Harness::Claude, "none", NOW - 4);
     app.apply_roster(vec![known, cost, unk, none], vec![]);
 
     let with = |app: &mut App, usage| {
@@ -373,7 +359,7 @@ fn filters_usage_availability_and_composes_with_search() {
     assert_eq!(ids(&app), ["known"]);
     app.set_filter(FilterState {
         usage: UsageAvailability::Unknown,
-        providers: Some(vec![Provider::Claude]),
+        providers: Some(vec![Harness::Claude]),
         query: "none".into(),
         ..FilterState::default()
     });
@@ -388,73 +374,74 @@ fn filters_usage_availability_and_composes_with_search() {
 
 #[test]
 fn duplicate_parent_resolution_is_ambiguous_on_equal_recency_and_resolves_newest_otherwise() {
-    let parent_target = key(Provider::Codex, "parent");
-    let mut child = session(Provider::Codex, "child", NOW - 1);
-    child.lineage.parent = Some(SessionLink::Resolved(parent_target.clone()));
+    let parent_target = key(Harness::Codex, "parent");
+    let mut child = session(Harness::Codex, "child", NOW - 1);
+    child.meta.lineage.parent = Some(SessionLink::Resolved(parent_target.clone()));
 
-    let mut old = session(Provider::Codex, "parent", NOW - 5000);
-    old.key = dup_key(Provider::Codex, "parent", "old.jsonl");
-    let mut new = session(Provider::Codex, "parent", NOW - 100);
-    new.key = dup_key(Provider::Codex, "parent", "new.jsonl");
+    let mut old = session(Harness::Codex, "parent", NOW - 5000);
+    old.meta.key = dup_key(Harness::Codex, "parent", "old.jsonl");
+    let mut new = session(Harness::Codex, "parent", NOW - 100);
+    new.meta.key = dup_key(Harness::Codex, "parent", "new.jsonl");
 
     let mut app = app();
     app.apply_roster(vec![child.clone(), old.clone(), new.clone()], vec![]);
     assert_eq!(
-        app.resolved_parent(&child.key),
-        Some(SessionLink::Resolved(new.key.clone()))
+        app.resolved_parent(&child.meta.key),
+        Some(SessionLink::Resolved(new.meta.key.clone()))
     );
 
     // Equal recency across duplicates: never guess.
     let mut tie = old.clone();
     tie.last_event_at = new.last_event_at;
-    tie.last_persisted_at = new.last_persisted_at;
+    tie.meta.activity.at = new.meta.activity.at;
     app.apply_roster(vec![child.clone(), tie, new.clone()], vec![]);
     assert_eq!(
-        app.resolved_parent(&child.key),
+        app.resolved_parent(&child.meta.key),
         Some(SessionLink::Ambiguous)
     );
 
     // A single match resolves to itself; a missing target keeps the link.
     app.apply_roster(vec![child.clone(), new.clone()], vec![]);
     assert_eq!(
-        app.resolved_parent(&child.key),
-        Some(SessionLink::Resolved(new.key.clone()))
+        app.resolved_parent(&child.meta.key),
+        Some(SessionLink::Resolved(new.meta.key.clone()))
     );
     app.apply_roster(vec![child.clone()], vec![]);
     assert_eq!(
-        app.resolved_parent(&child.key),
+        app.resolved_parent(&child.meta.key),
         Some(SessionLink::Resolved(parent_target))
     );
 
     // Unresolved ids resolve against same-provider sessions; Ambiguous is preserved.
-    let mut by_id = session(Provider::Codex, "c2", NOW - 2);
-    by_id.lineage.parent = Some(SessionLink::Unresolved("parent".into()));
-    by_id.lineage.fork = Some(SessionLink::Ambiguous);
+    let mut by_id = session(Harness::Codex, "c2", NOW - 2);
+    by_id.meta.lineage.parent = Some(SessionLink::Unresolved("parent".into()));
+    by_id.meta.lineage.fork = Some(SessionLink::Ambiguous);
     app.apply_roster(vec![by_id.clone(), new.clone()], vec![]);
     assert_eq!(
-        app.resolved_parent(&by_id.key),
-        Some(SessionLink::Resolved(new.key.clone()))
+        app.resolved_parent(&by_id.meta.key),
+        Some(SessionLink::Resolved(new.meta.key.clone()))
     );
-    assert_eq!(app.resolved_fork(&by_id.key), Some(SessionLink::Ambiguous));
-    assert_eq!(app.resolved_parent(&new.key), None);
+    assert_eq!(
+        app.resolved_fork(&by_id.meta.key),
+        Some(SessionLink::Ambiguous)
+    );
+    assert_eq!(app.resolved_parent(&new.meta.key), None);
 }
 
 #[test]
 fn stale_generations_are_ignored_and_clock_updates_statuses() {
     let mut app = app();
     let scan = ScanProgress {
-        provider: Provider::Codex,
+        harness: Harness::Codex,
         scanned: 1,
         total: Some(1),
         done: true,
     };
-    assert!(app.apply_roster_generation(
-        2,
-        vec![session(Provider::Codex, "a", NOW - 1000)],
-        vec![],
-        scan
+    assert!(app.apply_roster_snapshot(
+        support::snapshot(2, vec![session(Harness::Codex, "a", NOW - 1000)], scan),
+        vec![]
     ));
-    assert!(!app.apply_roster_generation(1, vec![], vec![], scan));
+    assert!(!app.apply_roster_snapshot(support::snapshot(1, vec![], scan), vec![]));
     assert_eq!(app.total_sessions(), 1);
     assert_eq!(app.generation(), 2);
     let before = app_status_of(&app, "a");
@@ -466,18 +453,980 @@ fn stale_generations_are_ignored_and_clock_updates_statuses() {
 #[test]
 fn reset_generation_accepts_a_restarted_worker() {
     let scan = ScanProgress {
-        provider: Provider::Codex,
+        harness: Harness::Codex,
         scanned: 0,
         total: None,
         done: true,
     };
     let mut app = app();
     for g in 1..=4 {
-        assert!(app.apply_roster_generation(g, vec![], vec![], scan));
+        assert!(app.apply_roster_snapshot(support::snapshot(g, vec![], scan), vec![]));
     }
-    assert!(!app.apply_roster_generation(1, vec![], vec![], scan));
+    assert!(!app.apply_roster_snapshot(support::snapshot(1, vec![], scan), vec![]));
     app.reset_generation();
     assert_eq!(app.generation(), 0);
     assert!(app.scan().is_none());
-    assert!(app.apply_roster_generation(1, vec![], vec![], scan));
+    assert!(app.apply_roster_snapshot(support::snapshot(1, vec![], scan), vec![]));
+}
+
+fn db_key(database: &str, id: &str) -> SessionKey {
+    SessionKey {
+        harness: Harness::OpenCode,
+        native_id: id.into(),
+        source: SourceKey::DbRow {
+            database: database.into(),
+            table: "session_v2".into(),
+            id: id.into(),
+        },
+    }
+}
+
+fn db_session(database: &str, id: &str, title: &str, last: Timestamp) -> SessionSummary {
+    let mut meta = metadata(db_key(database, id), title);
+    meta.activity = ActivityStamp {
+        at: Some(last),
+        class: AggregationClass::Reported,
+    };
+    facts::summary(meta)
+}
+
+#[test]
+fn profile_database_identity() {
+    let a = db_session("a/state.db", "ses_same", "profile a", NOW - 100);
+    let b = db_session("b/state.db", "ses_same", "profile b", NOW - 200);
+    assert_ne!(a.meta.key, b.meta.key);
+
+    let mut app = app();
+    app.apply_roster(vec![a.clone(), b.clone()], vec![]);
+    assert_eq!(app.total_sessions(), 2, "equal native IDs must not merge");
+
+    app.move_selection(1);
+    assert_eq!(app.selected_key().as_ref(), Some(&b.meta.key));
+
+    // A roster update that touches the other profile keeps the selection on `b`.
+    let mut a2 = a.clone();
+    a2.meta.title = "profile a renamed".into();
+    app.apply_roster(vec![a2, b.clone()], vec![]);
+    let selected_after_refresh = app.selected_key().expect("selection survives");
+    assert_eq!(selected_after_refresh, b.meta.key);
+
+    // Opening the inspector asks the worker for exactly the selected database's session.
+    assert!(app.open_inspector());
+    let requests = app.take_requests();
+    let Some(WorkerRequest::Select { key, .. }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
+        panic!("inspector open must request the selected session: {requests:?}");
+    };
+    assert_eq!(*key, b.meta.key);
+    assert_eq!(app.transcript().map(|t| t.key()), Some(&b.meta.key));
+    assert_eq!(
+        app.session(&a.meta.key)
+            .map(|r| r.session.meta.title.clone()),
+        Some("profile a renamed".to_owned())
+    );
+}
+
+#[test]
+fn database_sessions_only_resolve_lineage_within_their_database() {
+    let mut child = db_session("b/state.db", "child", "child", NOW - 10);
+    child.meta.lineage.parent = Some(SessionLink::Unresolved("shared".into()));
+    let other_db_parent = db_session("a/state.db", "shared", "elsewhere", NOW - 20);
+    let mut app = app();
+    app.apply_roster(vec![child.clone(), other_db_parent.clone()], vec![]);
+    assert_eq!(
+        app.resolved_parent(&child.meta.key),
+        Some(SessionLink::Unresolved("shared".into())),
+        "a same-ID session in another database is not the parent"
+    );
+
+    let own_parent = db_session("b/state.db", "shared", "mine", NOW - 30);
+    app.apply_roster(
+        vec![child.clone(), other_db_parent, own_parent.clone()],
+        vec![],
+    );
+    assert_eq!(
+        app.resolved_parent(&child.meta.key),
+        Some(SessionLink::Resolved(own_parent.meta.key))
+    );
+}
+
+#[test]
+fn tool_child_links_resolve_like_lineage_and_never_guess() {
+    let db = Path::new("opencode.db");
+    let db_key = |id: &str| SessionKey {
+        harness: Harness::OpenCode,
+        native_id: id.to_owned(),
+        source: SourceKey::DbRow {
+            database: db.to_path_buf(),
+            table: "session_v2".into(),
+            id: id.to_owned(),
+        },
+    };
+    let mut child_meta = metadata(db_key("child"), "child");
+    child_meta.activity = ActivityStamp {
+        at: Some(NOW - 1),
+        class: AggregationClass::Reported,
+    };
+    let child = facts::summary(child_meta);
+    let mut old_meta = metadata(db_key("target"), "old");
+    old_meta.activity = ActivityStamp {
+        at: Some(NOW - 5_000),
+        class: AggregationClass::Reported,
+    };
+    let old = facts::summary(old_meta);
+    let mut new_meta = metadata(db_key("target"), "new");
+    new_meta.activity = ActivityStamp {
+        at: Some(NOW - 100),
+        class: AggregationClass::Reported,
+    };
+    let new = facts::summary(new_meta);
+
+    let tool = |link: Option<SessionLink>| ToolInteraction {
+        name: "subagent".into(),
+        call_id: None,
+        input: None,
+        output: None,
+        status: ToolStatus::Completed,
+        exit_code: None,
+        started_at: None,
+        completed_at: None,
+        orphan: false,
+        child_session: link,
+    };
+
+    let mut app = app();
+    app.apply_roster(vec![child.clone(), old.clone(), new.clone()], vec![]);
+    let linked = tool(Some(SessionLink::Unresolved("target".into())));
+    assert_eq!(
+        app.resolved_tool_child(&child.meta.key, &linked),
+        Some(SessionLink::Resolved(new.meta.key.clone())),
+        "the newest confirmed same-database candidate wins"
+    );
+
+    // Equal recency across duplicate candidates is ambiguous, never a jump.
+    let mut tie = old.clone();
+    tie.meta.activity.at = new.meta.activity.at;
+    app.apply_roster(vec![child.clone(), tie, new.clone()], vec![]);
+    assert_eq!(
+        app.resolved_tool_child(&child.meta.key, &linked),
+        Some(SessionLink::Ambiguous)
+    );
+
+    // A missing target keeps the recorded id; a tool with no link has no jump.
+    app.apply_roster(vec![child.clone()], vec![]);
+    assert_eq!(
+        app.resolved_tool_child(&child.meta.key, &linked),
+        Some(SessionLink::Unresolved("target".into()))
+    );
+    assert_eq!(app.resolved_tool_child(&child.meta.key, &tool(None)), None);
+}
+
+// ---- B5: preview, details, loaded-only navigation and newest entry ----------
+
+fn done_scan() -> ScanProgress {
+    ScanProgress {
+        harness: Harness::Codex,
+        scanned: 1,
+        total: Some(1),
+        done: true,
+    }
+}
+
+fn event_for(key: &SessionKey, i: u64) -> Event {
+    Event {
+        id: format!("e{i}"),
+        session: key.clone(),
+        timestamp: Some(NOW + i as i64),
+        source_order: i,
+        kind: EventKind::AssistantMessage,
+        actor: Actor::Assistant,
+        text: Some(BoundedText {
+            preview: format!("body {i}"),
+            byte_len: 6,
+            truncated: false,
+            locator: None,
+        }),
+        tool: None,
+        usage: None,
+        provenance: Provenance {
+            harness: key.harness,
+            source: key.source.clone(),
+            locator: SourceLocator {
+                session: key.clone(),
+                kind: LocatorKind::FileOffset {
+                    path: "a.jsonl".into(),
+                    offset: i,
+                },
+                generation: None,
+            },
+            record_type: "test".into(),
+            harness_version: None,
+        },
+    }
+}
+
+fn anchor_of(event: &Event) -> PageAnchor {
+    PageAnchor {
+        timestamp: event.timestamp,
+        source_order: event.source_order,
+        stable_id: event.id.clone(),
+    }
+}
+
+fn forward_page(key: &SessionKey, range: std::ops::Range<u64>, has_more: bool) -> TranscriptPage {
+    let events: Vec<Event> = range.map(|i| event_for(key, i)).collect();
+    let next = events.last().map(anchor_of);
+    TranscriptPage {
+        events,
+        diagnostics: vec![],
+        next,
+        has_more,
+        truncated: false,
+    }
+}
+
+fn backward_page(key: &SessionKey, range: std::ops::Range<u64>, has_more: bool) -> TranscriptPage {
+    let events: Vec<Event> = range.map(|i| event_for(key, i)).collect();
+    let next = events.first().map(anchor_of);
+    TranscriptPage {
+        events,
+        diagnostics: vec![],
+        next,
+        has_more,
+        truncated: false,
+    }
+}
+
+#[test]
+fn preview_only_answers_the_current_selection_and_retries_explicitly() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let b = session(Harness::Claude, "b", NOW - 2_000);
+    let (ka, kb) = (a.meta.key.clone(), b.meta.key.clone());
+    app.apply_roster(vec![a.clone(), b.clone()], vec![]);
+    app.move_selection(1);
+    assert_eq!(app.selected_key(), Some(kb.clone()));
+
+    // Keyboard movement drove the first preview request for B, and only once.
+    // A's preview came with the first selection and is released for B's.
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::HydratePreview { .. },
+        WorkerRequest::CancelLoad { .. },
+        WorkerRequest::HydratePreview {
+            request_id: b_id, ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected A's then B's preview, got {requests:?}");
+    };
+    assert!(!app.select_session(&kb), "a render must not re-request");
+
+    // Moving to A cancels only the abandoned preview and asks for A.
+    app.move_selection(-1);
+    assert_eq!(app.selected_key(), Some(ka.clone()));
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::CancelLoad {
+            request_id: cancelled,
+        },
+        WorkerRequest::HydratePreview {
+            request_id: a_id, ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected cancel then preview, got {requests:?}");
+    };
+    assert_eq!(cancelled, b_id);
+
+    // A late response from B cannot replace the current preview or facts.
+    assert!(!app.apply_preview(*b_id, kb.clone(), Arc::new(b.clone()), true));
+    assert_eq!(app.preview().key(), Some(&ka));
+    assert!(!app.apply_load_progress(
+        *b_id,
+        WorkProgress {
+            records: 3,
+            expanded_bytes: 12
+        }
+    ));
+
+    // Cached facts are visible immediately and marked incomplete.
+    assert!(app.apply_preview(*a_id, ka.clone(), Arc::new(a.clone()), false));
+    assert!(matches!(
+        app.preview(),
+        PreviewState::Ready {
+            complete: false,
+            ..
+        }
+    ));
+    assert!(app.apply_preview(*a_id, ka.clone(), Arc::new(a.clone()), true));
+    assert!(matches!(
+        app.preview(),
+        PreviewState::Ready { complete: true, .. }
+    ));
+
+    // A failure is terminal; selecting the same row again does not retry it.
+    app.load_failed(*a_id);
+    assert!(matches!(app.preview(), PreviewState::Failed { key } if *key == ka));
+    assert!(!app.select_session(&ka));
+    assert!(app.retry_preview());
+    let requests = app.take_requests();
+    assert!(matches!(
+        requests.as_slice(),
+        [WorkerRequest::HydratePreview { .. }]
+    ));
+}
+
+#[test]
+fn a_child_only_search_keeps_its_loaded_parent_and_does_not_load_more_roots() {
+    let mut app = app();
+    let parent = session(Harness::Codex, "parent", NOW - 1_000);
+    let parent_key = parent.meta.key.clone();
+    let mut snap = support::snapshot(1, vec![parent], done_scan());
+    snap.has_more = true;
+    assert!(app.apply_roster_snapshot(snap, vec![]));
+    app.take_requests();
+
+    assert!(app.load_children(&parent_key));
+    let requests = app.take_requests();
+    let [WorkerRequest::LoadChildren { request_id, .. }] = requests.as_slice() else {
+        panic!("expected a child page request, got {requests:?}");
+    };
+    let child = metadata(key(Harness::Codex, "child"), "nested reviewer child");
+    assert!(app.apply_children(*request_id, &parent_key, vec![Arc::new(child)], None));
+    app.take_requests();
+
+    // A child-only match keeps the parent row as context; expanding is explicit.
+    app.set_query("nested reviewer");
+    let rows: Vec<RosterItem> = app.roster_rows().collect();
+    let keys: Vec<&SessionKey> = rows
+        .iter()
+        .filter_map(|item| match item {
+            RosterItem::Session(row) => Some(&row.session.meta.key),
+            _ => None,
+        })
+        .collect();
+    assert!(keys.contains(&&parent_key), "parent context must stay");
+    assert!(
+        keys.iter()
+            .any(|k| k.native_id == "child" && k.harness == Harness::Codex)
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|item| matches!(item, RosterItem::RootLoadMore)),
+        "search is loaded-only"
+    );
+    assert!(
+        app.take_requests().is_empty(),
+        "no historical roots are loaded by searching"
+    );
+}
+
+#[test]
+fn harness_filters_offer_six_identities() {
+    let app = app();
+    let providers: Vec<Harness> = app
+        .filter_items()
+        .into_iter()
+        .filter_map(|item| match item.target {
+            FilterTarget::Provider(h) => Some(h),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(providers, Harness::ALL);
+}
+
+#[test]
+fn transcript_opens_at_the_newest_entry_and_backward_paging_keeps_the_anchor() {
+    let mut app = app();
+    let root = session(Harness::Codex, "s", NOW - 1_000);
+    let k = root.meta.key.clone();
+    app.apply_roster(vec![root], vec![]);
+    app.take_requests(); // the initial selection requested its preview
+    assert!(app.open_inspector());
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+        panic!("expected Select, got {requests:?}");
+    };
+    // e3..e5 are the newest page even though the history is larger.
+    assert!(app.apply_transcript(*request_id, backward_page(&k, 3..6, true)));
+    let t = app.transcript().unwrap();
+    assert_eq!(t.selected(), 2, "lands on the actual newest event");
+    assert_eq!(t.selected_event().unwrap().id, "e5");
+    assert!(t.has_older());
+
+    // Walking toward the start pages backward from the window's first event.
+    app.inspector_move(-100);
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadPage {
+            request_id,
+            anchor: Some(anchor),
+            direction: PageDirection::Backward,
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected an older page request, got {requests:?}");
+    };
+    assert_eq!(anchor.stable_id, "e3");
+    assert!(app.apply_transcript(*request_id, backward_page(&k, 0..3, false)));
+    let t = app.transcript().unwrap();
+    assert_eq!(t.events().len(), 6);
+    // The explicit move put the reading anchor on e3; prepending older events
+    // keeps the same event selected rather than jumping back to the newest.
+    assert_eq!(t.selected_event().unwrap().id, "e3");
+    assert_eq!(t.selected(), 3);
+    assert!(!t.has_older());
+}
+
+#[test]
+fn details_pages_accumulate_and_stale_replies_are_rejected() {
+    let mut app = app();
+    let root = session(Harness::Codex, "s", NOW - 1_000);
+    let k = root.meta.key.clone();
+    app.apply_roster(vec![root], vec![]);
+    app.take_requests(); // the initial selection requested its preview
+    assert!(app.open_inspector());
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+        panic!("expected Select, got {requests:?}");
+    };
+    assert!(app.apply_transcript(*request_id, backward_page(&k, 0..1, false)));
+    app.take_requests();
+    assert!(app.open_session_info());
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadDetails {
+            request_id: first_id,
+            key: first_key,
+            anchor: None,
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected the first details page, got {requests:?}");
+    };
+    assert_eq!(first_key, &k);
+
+    let mut page = SessionDetailPage {
+        recent: vec![event_for(&k, 0)],
+        has_more: true,
+        next: Some(anchor_of(&event_for(&k, 0))),
+        ..SessionDetailPage::default()
+    };
+    assert!(app.apply_details(*first_id, k.clone(), page.clone()));
+    assert_eq!(app.details().page().recent.len(), 1);
+    assert!(app.details().page().has_more);
+
+    assert!(app.load_more_details());
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadDetails {
+            request_id: second_id,
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected an older details page, got {requests:?}");
+    };
+    // The superseded first page no longer changes anything.
+    assert!(!app.apply_details(*first_id, k.clone(), page.clone()));
+    page.recent = vec![event_for(&k, 1)];
+    page.has_more = false;
+    page.next = None;
+    assert!(app.apply_details(*second_id, k.clone(), page));
+    assert_eq!(app.details().page().recent.len(), 2);
+    assert!(!app.details().page().has_more);
+    assert!(app.details().complete());
+}
+
+#[test]
+fn restart_resumes_the_reading_anchor_by_walking_back_from_the_tail() {
+    let mut app = app();
+    let root = session(Harness::Codex, "s", NOW - 1_000);
+    let k = root.meta.key.clone();
+    app.apply_roster(vec![root], vec![]);
+    app.take_requests(); // the initial selection requested its preview
+    assert!(app.open_inspector());
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+        panic!("expected Select, got {requests:?}");
+    };
+    assert!(app.apply_transcript(*request_id, backward_page(&k, 4..10, true)));
+    app.inspector_move(-100);
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadPage {
+            request_id: older, ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected the older page, got {requests:?}");
+    };
+    assert!(app.apply_transcript(*older, backward_page(&k, 0..4, false)));
+    app.inspector_move(-1);
+    assert_eq!(app.transcript().unwrap().selected_event().unwrap().id, "e3");
+
+    // The worker was replaced: the same session is re-read from its tail.
+    app.restart_transcript();
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, key }] = requests.as_slice() else {
+        panic!("expected Select after restart, got {requests:?}");
+    };
+    assert_eq!(key, &k);
+    assert!(app.apply_transcript(*request_id, backward_page(&k, 7..10, true)));
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadPage {
+            request_id: older,
+            anchor: Some(anchor),
+            direction: PageDirection::Backward,
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected the resume page, got {requests:?}");
+    };
+    assert_eq!(anchor.stable_id, "e7");
+    assert!(app.apply_transcript(*older, backward_page(&k, 4..7, true)));
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadPage {
+            request_id: oldest,
+            anchor: Some(anchor),
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected one more resume page, got {requests:?}");
+    };
+    assert_eq!(anchor.stable_id, "e4");
+    assert!(app.apply_transcript(*oldest, backward_page(&k, 0..4, false)));
+    let t = app.transcript().unwrap();
+    assert_eq!(t.selected_event().unwrap().id, "e3");
+    // Recovery replaces pages instead of prepending the whole history.
+    assert_eq!(t.events().len(), 4);
+    assert!(!t.has_older());
+
+    // Forward pagination resumes after the retained page's last event, so the
+    // discarded window's first event (e4) is not skipped.
+    app.inspector_move(isize::MAX);
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadPage {
+            request_id: forward,
+            anchor: Some(anchor),
+            direction: PageDirection::Forward,
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected forward resume, got {requests:?}");
+    };
+    assert_eq!(anchor.stable_id, "e3");
+    assert!(app.apply_transcript(*forward, forward_page(&k, 4..10, false)));
+    let ids: Vec<String> = app
+        .transcript()
+        .unwrap()
+        .events()
+        .iter()
+        .map(|e| e.id.clone())
+        .collect();
+    let expected: Vec<String> = (0..10).map(|i| format!("e{i}")).collect();
+    assert_eq!(ids, expected, "forward round trip has no gap or duplicate");
+    assert_eq!(app.transcript().unwrap().selected_event().unwrap().id, "e3");
+}
+
+#[test]
+fn a_single_event_backward_tail_page_still_reaches_older_history() {
+    let mut app = app();
+    let root = session(Harness::Codex, "s", NOW - 1_000);
+    let k = root.meta.key.clone();
+    app.apply_roster(vec![root], vec![]);
+    app.take_requests(); // the initial selection requested its preview
+    assert!(app.open_inspector());
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+        panic!("expected Select, got {requests:?}");
+    };
+    let mut tail = backward_page(&k, 5..6, true);
+    tail.next = Some(anchor_of(&tail.events[0]));
+    assert!(app.apply_transcript(*request_id, tail));
+    assert_eq!(app.transcript().unwrap().selected_event().unwrap().id, "e5");
+    app.inspector_move(-100);
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadPage {
+            request_id: older,
+            anchor: Some(anchor),
+            direction: PageDirection::Backward,
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("single-event tail must keep an older anchor: {requests:?}");
+    };
+    assert_eq!(anchor.stable_id, "e5");
+    assert!(app.apply_transcript(*older, backward_page(&k, 3..5, false)));
+    assert_eq!(app.transcript().unwrap().events().len(), 3);
+}
+
+#[test]
+fn details_reset_between_sessions_and_on_reopen() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let b = session(Harness::Claude, "b", NOW - 2_000);
+    let (ka, kb) = (a.meta.key.clone(), b.meta.key.clone());
+    app.apply_roster(vec![a, b], vec![]);
+    assert!(app.open_inspector());
+    let requests = app.take_requests();
+    let select = requests
+        .iter()
+        .find_map(|r| match r {
+            WorkerRequest::Select { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .unwrap();
+    assert!(app.apply_transcript(select, backward_page(&ka, 0..1, false)));
+    assert!(app.open_session_info());
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadDetails {
+            request_id: first,
+            anchor: None,
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected first details page, got {requests:?}");
+    };
+    let mut page = SessionDetailPage {
+        recent: vec![event_for(&ka, 0)],
+        has_more: true,
+        next: Some(anchor_of(&event_for(&ka, 0))),
+        ..SessionDetailPage::default()
+    };
+    assert!(app.apply_details(*first, ka.clone(), page.clone()));
+
+    // Closing and reopening the same session starts a fresh stream, not a
+    // continuation that duplicates page 1.
+    app.close_overlay();
+    app.close_inspector();
+    assert!(app.open_inspector());
+    app.take_requests();
+    assert!(app.open_session_info());
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadDetails {
+            request_id: second,
+            anchor: None,
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("reopen must request the newest page, got {requests:?}");
+    };
+    page.recent = vec![event_for(&ka, 9)];
+    page.has_more = true;
+    page.next = Some(anchor_of(&event_for(&ka, 9)));
+    assert!(app.apply_details(*second, ka.clone(), page));
+    assert_eq!(app.details().page().recent.len(), 1);
+
+    // A pending stream for A is retired when B opens.
+    app.close_overlay();
+    app.close_inspector();
+    assert!(app.open_inspector());
+    app.take_requests();
+    assert!(app.open_session_info());
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadDetails {
+            request_id: pending,
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected pending details, got {requests:?}");
+    };
+    app.close_overlay();
+    app.close_inspector();
+    app.move_selection(1);
+    assert_eq!(app.selected_key(), Some(kb.clone()));
+    assert!(app.open_inspector());
+    let requests = app.take_requests();
+    assert!(
+        requests.iter().any(
+            |r| matches!(r, WorkerRequest::CancelLoad { request_id } if request_id == pending)
+        ),
+        "abandoned details must be cancelled: {requests:?}"
+    );
+    assert_eq!(app.details().key(), None);
+}
+
+#[test]
+fn obsolete_generation_previews_are_rejected_and_released() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let ka = a.meta.key.clone();
+    assert!(app.apply_roster_snapshot(support::snapshot(1, vec![a.clone()], done_scan()), vec![]));
+    // The snapshot's own selection asked for the preview.
+    let requests = app.take_requests();
+    let [WorkerRequest::HydratePreview { request_id, .. }] = requests.as_slice() else {
+        panic!("expected preview, got {requests:?}");
+    };
+    assert!(app.apply_roster_snapshot(support::snapshot(2, vec![a.clone()], done_scan()), vec![]));
+    // The old job is released and the new generation asks again for the same row.
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::CancelLoad { request_id: old },
+        WorkerRequest::HydratePreview {
+            request_id: fresh, ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected cancel then a fresh preview, got {requests:?}");
+    };
+    assert_eq!(old, request_id);
+    assert_ne!(fresh, request_id);
+    assert!(matches!(app.preview(), PreviewState::Loading { .. }));
+    assert!(!app.apply_preview(*request_id, ka.clone(), Arc::new(a.clone()), true));
+    assert!(app.apply_preview(*fresh, ka, Arc::new(a), true));
+}
+
+#[test]
+fn visual_positions_include_child_load_more_and_released_children_stay_hidden() {
+    let mut app = app();
+    let parent = session(Harness::Codex, "parent", NOW - 1_000);
+    let other = session(Harness::Claude, "other", NOW - 5_000);
+    let parent_key = parent.meta.key.clone();
+    let mut snap = support::snapshot(1, vec![parent, other], done_scan());
+    snap.has_more = false;
+    assert!(app.apply_roster_snapshot(snap, vec![]));
+    app.take_requests();
+    assert!(app.load_children(&parent_key));
+    let requests = app.take_requests();
+    let [WorkerRequest::LoadChildren { request_id, .. }] = requests.as_slice() else {
+        panic!("expected child page, got {requests:?}");
+    };
+    let child_key = key(Harness::Codex, "child");
+    let mut child = metadata(child_key.clone(), "child");
+    child.released = ReleaseState::Released;
+    assert!(app.apply_children(
+        *request_id,
+        &parent_key,
+        vec![Arc::new(child.clone())],
+        Some(child_key.clone())
+    ));
+    app.toggle_children(); // parent selected
+    let rows: Vec<RosterItem> = app.roster_rows().collect();
+    // The released child is hidden even without a search, but its Load more
+    // row remains an explicit visual row.
+    assert!(
+        rows.iter()
+            .any(|item| matches!(item, RosterItem::ChildLoadMore { .. }))
+    );
+    assert!(!rows.iter().any(|item| matches!(
+        item,
+        RosterItem::Session(row) if row.session.meta.key == child_key
+    )));
+    assert_eq!(
+        app.provider_counts()
+            .into_iter()
+            .find(|(h, _)| *h == Harness::Codex),
+        Some((Harness::Codex, 2)),
+        "loaded children count toward their harness"
+    );
+
+    // Selecting the second root accounts for the ChildLoadMore row before it.
+    assert_eq!(app.visual_selected_index(), Some(0), "parent selected");
+    app.move_selection(isize::MAX);
+    assert_eq!(app.selected_index(), Some(1));
+    assert_eq!(app.visual_selected_index(), Some(2));
+    // Collapsing the family removes the ChildLoadMore row and the cached visual
+    // position follows immediately.
+    app.move_selection(isize::MIN);
+    app.toggle_children();
+    assert_eq!(app.visual_selected_index(), Some(0));
+    app.move_selection(isize::MAX);
+    assert_eq!(app.visual_selected_index(), Some(1));
+}
+
+#[test]
+fn restart_anchor_recovery_is_bounded_by_the_window_cap() {
+    let cap = agentscope::app::MAX_LOADED_EVENTS;
+    let mut app = app();
+    let root = session(Harness::Codex, "s", NOW - 1_000);
+    let k = root.meta.key.clone();
+    app.apply_roster(vec![root], vec![]);
+    app.take_requests(); // the initial selection requested its preview
+    assert!(app.open_inspector());
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+        panic!("expected Select, got {requests:?}");
+    };
+    // The reading anchor is an event the re-read history no longer contains.
+    let mut old = backward_page(&k, 1_000_000..1_000_001, false);
+    old.next = Some(anchor_of(&old.events[0]));
+    assert!(app.apply_transcript(*request_id, old));
+    app.restart_transcript();
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+        panic!("expected Select, got {requests:?}");
+    };
+    assert!(app.apply_transcript(*request_id, backward_page(&k, 0..1, true)));
+    let mut scanned = 0usize;
+    loop {
+        let requests = app.take_requests();
+        let [
+            WorkerRequest::LoadPage {
+                request_id,
+                anchor: Some(_),
+                direction: PageDirection::Backward,
+                ..
+            },
+        ] = requests.as_slice()
+        else {
+            break;
+        };
+        let start = (scanned + 10_000) as u64;
+        scanned += cap / 2;
+        assert!(app.apply_transcript(
+            *request_id,
+            backward_page(&k, start..start + (cap as u64 / 2), true)
+        ));
+        assert!(app.transcript().unwrap().events().len() <= cap);
+        if scanned > cap {
+            break;
+        }
+    }
+    assert!(scanned >= cap, "recovery scanned beyond the cap: {scanned}");
+    assert!(
+        app.take_requests().is_empty(),
+        "bounded recovery must stop asking for more history"
+    );
+}
+
+fn preview_keys(requests: &[WorkerRequest]) -> Vec<SessionKey> {
+    requests
+        .iter()
+        .filter_map(|r| match r {
+            WorkerRequest::HydratePreview { key, .. } => Some(key.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_snapshot_selection_requests_its_preview_and_a_refresh_asks_again() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let b = session(Harness::Claude, "b", NOW - 2_000);
+    let ka = a.meta.key.clone();
+    assert!(app.apply_roster_snapshot(
+        support::snapshot(1, vec![a.clone(), b.clone()], done_scan()),
+        vec![]
+    ));
+    assert_eq!(app.selected_key(), Some(ka.clone()));
+    assert_eq!(
+        preview_keys(&app.take_requests()),
+        std::slice::from_ref(&ka)
+    );
+    assert!(app.preview().is_loading());
+
+    // The same generation (live summaries, clock ticks) does not ask again.
+    assert!(app.apply_roster_snapshot(
+        support::snapshot(1, vec![a.clone(), b.clone()], done_scan()),
+        vec![]
+    ));
+    app.set_now(NOW + 1_000);
+    assert!(app.take_requests().is_empty());
+
+    // A refresh freezes a new generation: the old job is released and the
+    // selected row is requested again, once.
+    assert!(app.apply_roster_snapshot(
+        support::snapshot(2, vec![b.clone(), a.clone()], done_scan()),
+        vec![]
+    ));
+    let requests = app.take_requests();
+    assert!(
+        matches!(requests[0], WorkerRequest::CancelLoad { .. }),
+        "{requests:?}"
+    );
+    assert_eq!(preview_keys(&requests).len(), 1, "{requests:?}");
+    assert_eq!(preview_keys(&requests), [app.selected_key().unwrap()]);
+}
+
+#[test]
+fn a_search_that_moves_the_selection_requests_the_new_preview_and_cancels_the_old() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let b = session(Harness::Claude, "b", NOW - 2_000);
+    let kb = b.meta.key.clone();
+    assert!(app.apply_roster_snapshot(support::snapshot(1, vec![a, b], done_scan()), vec![]));
+    let first = app.take_requests();
+    let [
+        WorkerRequest::HydratePreview {
+            request_id: a_id, ..
+        },
+    ] = first.as_slice()
+    else {
+        panic!("{first:?}");
+    };
+    app.set_query("title b");
+    assert_eq!(app.selected_key(), Some(kb.clone()));
+    let requests = app.take_requests();
+    assert!(
+        matches!(requests.first(), Some(WorkerRequest::CancelLoad { request_id }) if request_id == a_id),
+        "{requests:?}"
+    );
+    assert_eq!(preview_keys(&requests), std::slice::from_ref(&kb));
+
+    // Clearing the search returns to rows that keep the selection: no new request.
+    app.set_query("");
+    assert_eq!(app.selected_key(), Some(kb));
+    assert!(app.take_requests().is_empty());
+}
+
+#[test]
+fn a_child_selection_is_hydrated_once_and_a_filter_that_drops_it_selects_a_visible_row() {
+    let mut app = app();
+    let parent = session(Harness::Codex, "parent", NOW - 1_000);
+    let parent_key = parent.meta.key.clone();
+    assert!(app.apply_roster_snapshot(support::snapshot(1, vec![parent], done_scan()), vec![]));
+    app.take_requests();
+    assert!(app.load_children(&parent_key));
+    let requests = app.take_requests();
+    let [WorkerRequest::LoadChildren { request_id, .. }] = requests.as_slice() else {
+        panic!("{requests:?}");
+    };
+    let child_key = key(Harness::Codex, "child");
+    let child = metadata(child_key.clone(), "nested reviewer child");
+    assert!(app.apply_children(*request_id, &parent_key, vec![Arc::new(child)], None));
+    app.toggle_children();
+    app.take_requests();
+
+    app.move_selection(1);
+    assert_eq!(app.selected_key(), Some(child_key.clone()));
+    assert_eq!(
+        preview_keys(&app.take_requests()),
+        std::slice::from_ref(&child_key)
+    );
+
+    // Rebuilds that keep the child selected never duplicate its request.
+    app.set_now(NOW + 5_000);
+    app.set_query("nested reviewer");
+    assert_eq!(app.selected_key(), Some(child_key.clone()));
+    assert!(preview_keys(&app.take_requests()).is_empty());
+
+    // A query the child no longer matches moves the selection and its preview.
+    app.set_query("no such session");
+    assert_ne!(app.selected_key(), Some(child_key));
+    let requests = app.take_requests();
+    assert!(preview_keys(&requests).len() <= 1, "{requests:?}");
+    if let Some(selected) = app.selected_key() {
+        assert_eq!(preview_keys(&requests), [selected]);
+    }
 }

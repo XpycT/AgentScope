@@ -9,7 +9,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, SourceState, Transcript};
-use crate::domain::{DiagnosticEntry, Event, LocatorKind, SourceLocator};
+use crate::domain::{DiagnosticEntry, Event, LocatorKind, SessionLink, SourceLocator};
 use crate::ingest::text::display_safe;
 use crate::time::format_local;
 
@@ -133,7 +133,7 @@ fn time_text(event: &Event) -> String {
         .map_or_else(|| "—".to_string(), format_local)
 }
 
-fn event_rows(event: &Event, width: usize) -> Vec<String> {
+fn event_rows(event: &Event, width: usize, child: Option<&SessionLink>) -> Vec<String> {
     let mut rows = Vec::new();
     let head = format!(
         "Event: {}   Time: {}   Record: {}",
@@ -151,6 +151,13 @@ fn event_rows(event: &Event, width: usize) -> Vec<String> {
                 .map_or_else(|| "—".to_string(), display_safe)
         );
         capped |= wrap_into(&mut rows, &line, width);
+        if let Some(link) = child {
+            let line = format!(
+                "Child session: {}",
+                super::session::link_text(&Some(link.clone()))
+            );
+            capped |= wrap_into(&mut rows, &line, width);
+        }
     }
     rows.push(String::new());
     for line in detail_lines(event) {
@@ -171,7 +178,11 @@ pub fn render_details(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         frame.render_widget(Paragraph::new("No event is selected."), f.body);
         return;
     };
-    let rows = event_rows(event, f.width);
+    let child = event
+        .tool
+        .as_ref()
+        .and_then(|tool| app.resolved_tool_child(&event.session, tool));
+    let rows = event_rows(event, f.width, child.as_ref());
     draw_rows(frame, app, &rows, app.details_scroll(), f.body);
     let status = if app.revealed_for(&event.provenance.locator) {
         REVEALED_NOTICE
@@ -183,7 +194,7 @@ pub fn render_details(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         &f,
         "< Details",
         status,
-        "j/k scroll  v source  x redaction  D diagnostics  Esc back  q quit",
+        "j/k scroll  v source  x redaction  D diagnostics  o open child  Esc back  q quit",
     );
 }
 
@@ -230,6 +241,12 @@ fn locator_text(locator: &SourceLocator) -> String {
                 .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy());
             format!("Source: {} @ byte {offset}", display_safe(&name))
         }
+        LocatorKind::CompressedRecord { path, ordinal } => {
+            let name = path
+                .file_name()
+                .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy());
+            format!("Source: {} record {ordinal}", display_safe(&name))
+        }
         LocatorKind::DbRow {
             table,
             row_id,
@@ -266,7 +283,7 @@ pub fn render_diagnostics(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         head.push(format!(
             "Hidden records: {}   Source available: {}   Entries listed: {}",
             row.session.hidden_records,
-            if row.session.source_available {
+            if row.session.meta.source_available {
                 "yes"
             } else {
                 "no"

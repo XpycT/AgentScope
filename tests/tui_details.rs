@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+mod support;
+
 use agentscope::app::{App, Screen, SourceState};
 use agentscope::domain::*;
 use agentscope::providers::SourceRecord;
@@ -7,14 +9,15 @@ use agentscope::ui::{RosterContext, render};
 use agentscope::worker::WorkerRequest;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use support::facts::{self, metadata};
 
 const NOW: Timestamp = 1_800_000_000_000;
 const SECRET: &str = "sk-ant-abcdefghijklmnop1234";
 
 fn key() -> SessionKey {
     SessionKey {
-        provider: Provider::Codex,
-        provider_session_id: "sess-1".into(),
+        harness: Harness::Codex,
+        native_id: "sess-1".into(),
         source: SourceKey::File("sess-1.jsonl".into()),
     }
 }
@@ -35,35 +38,24 @@ fn locator(offset: u64) -> SourceLocator {
 }
 
 fn summary() -> SessionSummary {
+    let mut meta = metadata(key(), "Inventory API");
+    meta.project = Some("RipperGame".into());
+    meta.activity = ActivityStamp {
+        at: Some(NOW - 540_000),
+        class: AggregationClass::Reported,
+    };
     SessionSummary {
-        key: key(),
-        title: "Inventory API".into(),
-        title_derived: false,
-        project: Some("RipperGame".into()),
-        cwd: None,
-        models: vec![],
-        model_details: vec![],
-        provider_version: None,
-        created_at: None,
         last_event_at: Some(NOW - 540_000),
-        last_persisted_at: Some(NOW - 540_000),
         last_completion: None,
         unfinished_work: false,
         displayed_event_count: 3,
         hidden_records: 4,
-        source_available: true,
-        archived: false,
-        context_window: None,
         server_tools: None,
         lifecycle: Lifecycle::Unknown,
         process: ProcessAssociation::Unavailable,
         usage: None,
-        lineage: Lineage {
-            parent: None,
-            fork: None,
-            sidechain: false,
-        },
         warnings: vec![],
+        ..facts::summary(meta)
     }
 }
 
@@ -76,6 +68,7 @@ fn app() -> App {
         },
     );
     app.apply_roster(vec![summary()], vec![]);
+    app.take_requests(); // the initial selection's preview request
     app
 }
 
@@ -100,11 +93,11 @@ fn event(i: u64, kind: EventKind, body: &str) -> Event {
         tool: None,
         usage: None,
         provenance: Provenance {
-            provider: Provider::Codex,
+            harness: Harness::Codex,
             source: SourceKey::File("sess-1.jsonl".into()),
             locator: locator(100 * i),
             record_type: "response_item".into(),
-            provider_version: None,
+            harness_version: None,
         },
     }
 }
@@ -122,6 +115,7 @@ fn tool_event(i: u64) -> Event {
         started_at: Some(NOW - 10_000),
         completed_at: Some(NOW - 7_500),
         orphan: false,
+        child_session: None,
     });
     e
 }
@@ -152,8 +146,11 @@ fn page(events: Vec<Event>, diagnostics: Vec<DiagnosticEntry>) -> TranscriptPage
 fn open(app: &mut App, first: TranscriptPage) {
     assert!(app.open_inspector());
     let requests = app.take_requests();
-    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
-        panic!("expected a single Select, got {requests:?}");
+    let Some(WorkerRequest::Select { request_id, .. }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
+        panic!("expected a Select, got {requests:?}");
     };
     assert!(app.apply_transcript(*request_id, first));
     app.take_requests();
@@ -243,7 +240,7 @@ fn source_view_loads_by_locator_and_rejects_foreign_locators() {
     );
 
     let other = SessionKey {
-        provider_session_id: "other".into(),
+        native_id: "other".into(),
         ..key()
     };
     // Another session, a superseded generation, and an unreferenced offset.
@@ -512,6 +509,7 @@ fn x_in_inspector_reloads_the_selected_record_and_reveal_is_scoped_to_it() {
         ),
     );
     let raw = format!("key {SECRET}");
+    app.inspector_first();
     app.toggle_redaction();
     assert_eq!(app.screen, Screen::Source);
     let (id, loc) = source_request(&mut app);
@@ -610,4 +608,391 @@ fn diagnostics_selection_is_clamped_after_the_list_shrinks() {
     assert_eq!(app.diagnostics_selected(), 0);
     assert!(app.open_diagnostic_source());
     assert_eq!(source_request(&mut app).1, locator(500));
+}
+
+#[test]
+fn o_opens_a_confirmed_tool_child_and_ignores_unresolved_links() {
+    use agentscope::domain::SessionLink;
+    use agentscope::ui::handle_key;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let child_key = SessionKey {
+        harness: Harness::Codex,
+        native_id: "child-1".into(),
+        source: SourceKey::File("child-1.jsonl".into()),
+    };
+    let mut child = summary();
+    child.meta.key = child_key.clone();
+    child.meta.title = "Child session".into();
+    let mut opened = app();
+    opened.apply_roster(vec![summary(), child], vec![]);
+
+    let mut tool = tool_event(0);
+    tool.tool.as_mut().unwrap().child_session = Some(SessionLink::Unresolved("child-1".into()));
+    open(&mut opened, page(vec![tool], vec![]));
+    assert!(opened.open_details());
+    handle_key(
+        &mut opened,
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+    );
+    assert_eq!(opened.screen, Screen::Inspector);
+    assert_eq!(opened.selected_key(), Some(child_key.clone()));
+    assert_eq!(opened.transcript().unwrap().key(), &child_key);
+    let requests = opened.take_requests();
+    assert!(
+        requests.iter().any(|r| matches!(
+            r,
+            WorkerRequest::Select { key, .. } if key == &child_key
+        )),
+        "the child transcript is requested: {requests:?}"
+    );
+
+    // An unresolved or ambiguous link leaves the details screen unchanged.
+    for link in [
+        SessionLink::Unresolved("missing-child".into()),
+        SessionLink::Ambiguous,
+    ] {
+        let mut fresh = app();
+        let mut tool = tool_event(0);
+        tool.tool.as_mut().unwrap().child_session = Some(link);
+        open(&mut fresh, page(vec![tool], vec![]));
+        assert!(fresh.open_details());
+        handle_key(
+            &mut fresh,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        );
+        assert_eq!(fresh.screen, Screen::Details, "no guessed navigation");
+        assert_eq!(fresh.selected_key(), Some(key()));
+    }
+}
+
+// ---- paged record-level facts: requests and compactions ---------------------
+
+fn compaction(
+    id: &str,
+    scope: CompactionScope,
+    summary: Option<&str>,
+    reported_usd: Option<f64>,
+) -> CompactionObservation {
+    let mut usage = facts::usage(
+        id,
+        Some("openai"),
+        "gpt-5.5",
+        TokenCategories::default(),
+        TokenAccounting::default(),
+    );
+    if let Some(usd) = reported_usd {
+        usage.money.reported_api = Some(MoneyFact {
+            usd,
+            source: MoneySource::ReportedApi,
+            as_of: None,
+        });
+    }
+    CompactionObservation {
+        id: id.into(),
+        timestamp: Some(NOW - 120_000),
+        method: Some("auto".into()),
+        trigger: Some("limit".into()),
+        summary: summary.map(|s| text(s, false, s.len())),
+        before_tokens: Some(9_000),
+        after_tokens: Some(2_500),
+        duration_ms: None,
+        usage: Some(usage),
+        scope,
+        provenance: Provenance {
+            harness: Harness::Codex,
+            source: SourceKey::File("sess-1.jsonl".into()),
+            locator: locator(7),
+            record_type: "compacted".into(),
+            harness_version: None,
+        },
+    }
+}
+
+fn session_screen(app: &App) -> String {
+    let (w, h) = (130u16, 60u16);
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    let ctx = RosterContext {
+        no_color: true,
+        ..RosterContext::default()
+    };
+    terminal.draw(|f| render(f, app, &ctx)).unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(w as usize)
+        .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn press_key(app: &mut App, code: crossterm::event::KeyCode) {
+    agentscope::ui::handle_key(
+        app,
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+    );
+}
+
+#[test]
+fn session_details_list_compactions_with_separate_event_cost_and_reduction() {
+    let mut app = app();
+    open(
+        &mut app,
+        page(vec![event(0, EventKind::AssistantMessage, "hello")], vec![]),
+    );
+    assert!(app.open_session_info());
+    let requests = app.take_requests();
+    let [WorkerRequest::LoadDetails { request_id, .. }] = requests.as_slice() else {
+        panic!("expected one details request, got {requests:?}");
+    };
+    let hostile = format!(
+        "keep this\x1b[31m red\nsecond {SECRET} line {}",
+        "tail ".repeat(60)
+    );
+    let detail = SessionDetailPage {
+        requests: vec![facts::usage(
+            "req-1",
+            Some("openai"),
+            "gpt-5.5",
+            TokenCategories {
+                input: Some(1_200),
+                output: Some(340),
+                ..TokenCategories::default()
+            },
+            TokenAccounting::default(),
+        )],
+        compactions: vec![
+            compaction(
+                "c-event",
+                CompactionScope::Event,
+                Some(&hostile),
+                Some(0.42),
+            ),
+            compaction("c-none", CompactionScope::Event, None, None),
+            compaction(
+                "c-agg",
+                CompactionScope::Aggregate,
+                Some("aggregate note"),
+                Some(9.99),
+            ),
+        ],
+        recent: vec![],
+        next: Some(PageAnchor {
+            timestamp: Some(NOW),
+            source_order: 1,
+            stable_id: "older".into(),
+        }),
+        has_more: true,
+        truncated: false,
+    };
+    assert!(app.apply_details(*request_id, key(), detail));
+
+    let collapsed = session_screen(&app);
+    assert!(
+        collapsed.contains("1 requests · 3 compactions · 0 events loaded"),
+        "{collapsed}"
+    );
+    assert!(
+        collapsed.contains("older records exist (m loads the next page)"),
+        "{collapsed}"
+    );
+    assert!(collapsed.contains("Request"), "{collapsed}");
+    assert!(
+        collapsed.contains("input 1,200 · output 340"),
+        "{collapsed}"
+    );
+    // Context reduction and event cost are separate facts on separate lines.
+    assert!(
+        collapsed.contains("context 9,000 → 2,500 (removed 6,500)"),
+        "{collapsed}"
+    );
+    assert!(
+        collapsed.contains("Event cost: $0.42 (reported)"),
+        "{collapsed}"
+    );
+    assert!(
+        collapsed.contains("Event cost: not recorded for this event"),
+        "{collapsed}"
+    );
+    // An aggregate is never attributed to an event, even when money was recorded.
+    assert!(
+        collapsed.contains("Event cost: session aggregate only, not attributed to this event"),
+        "{collapsed}"
+    );
+    assert!(!collapsed.contains("9.99"), "{collapsed}");
+    // Summaries are sanitized, redacted and collapsed until expanded.
+    assert!(
+        !collapsed.contains('\x1b') && !collapsed.contains(SECRET),
+        "{collapsed}"
+    );
+    assert!(collapsed.contains("(Space expands)"), "{collapsed}");
+    assert!(
+        collapsed.matches("tail").count() < 20,
+        "collapsed summary is cut"
+    );
+
+    press_key(&mut app, crossterm::event::KeyCode::Char(' '));
+    assert!(app.summaries_expanded());
+    let expanded = session_screen(&app);
+    assert!(
+        !expanded.contains('\x1b') && !expanded.contains(SECRET),
+        "{expanded}"
+    );
+    assert!(expanded.contains("keep this"), "{expanded}");
+    assert!(!expanded.contains("(Space expands)"), "{expanded}");
+
+    // `m` asks for the next older page; the shown pages stay.
+    press_key(&mut app, crossterm::event::KeyCode::Char('m'));
+    let requests = app.take_requests();
+    assert!(
+        matches!(
+            requests.as_slice(),
+            [WorkerRequest::LoadDetails {
+                anchor: Some(_),
+                ..
+            }]
+        ),
+        "{requests:?}"
+    );
+    assert!(session_screen(&app).contains("Loading detailed facts"));
+}
+
+#[test]
+fn partial_category_costs_keep_their_subtotal_and_coverage_in_session_details() {
+    let mut s = summary();
+    s.usage = Some(UsageSummary {
+        total: Some(5_000),
+        class: AggregationClass::Reported,
+        categories: TokenCategories {
+            input: Some(4_000),
+            output: Some(1_000),
+            ..TokenCategories::default()
+        },
+        cost: CostEstimate {
+            usd: None,
+            class: AggregationClass::Partial,
+            known_subtotal: 0.05,
+            breakdown: CostBreakdown {
+                input: Some(0.05),
+                ..CostBreakdown::default()
+            },
+            ..CostEstimate::default()
+        },
+        coverage: UsageCoverage {
+            observed_requests: 2,
+            priced_requests: 1,
+            complete: false,
+            reason: None,
+        },
+        ..UsageSummary::default()
+    });
+    let mut app = App::new(
+        NOW,
+        Thresholds {
+            quiet: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+        },
+    );
+    app.apply_roster(vec![s], vec![]);
+    open(
+        &mut app,
+        page(vec![event(0, EventKind::AssistantMessage, "hi")], vec![]),
+    );
+    assert!(app.open_session_info());
+    let screen = session_screen(&app);
+    assert!(
+        screen.contains("Known subtotal: $0.05 (incomplete, not a total)"),
+        "{screen}"
+    );
+    assert!(screen.contains("Unpriced coverage: output"), "{screen}");
+    assert!(screen.contains("Priced requests: 1 of 2"), "{screen}");
+    assert!(screen.contains("Cost: $0.05+ partial 1/2"), "{screen}");
+    assert!(
+        !screen.contains("Cost: $0.05 "),
+        "no complete total is claimed:\n{screen}"
+    );
+}
+
+#[test]
+fn m_on_a_session_without_request_rows_pages_visible_recent_events() {
+    let mut app = app();
+    open(
+        &mut app,
+        page(vec![event(0, EventKind::AssistantMessage, "hello")], vec![]),
+    );
+    assert!(app.open_session_info());
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadDetails {
+            request_id: first, ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("{requests:?}");
+    };
+    // A Codex-style session: cumulative usage only, so pages carry events alone.
+    let anchor = |i: u64| PageAnchor {
+        timestamp: Some(NOW),
+        source_order: i,
+        stable_id: format!("e{i}"),
+    };
+    let page_of = |events: Vec<Event>, next: Option<PageAnchor>| SessionDetailPage {
+        recent: events,
+        next: next.clone(),
+        has_more: next.is_some(),
+        ..SessionDetailPage::default()
+    };
+    let newest = vec![
+        event(9, EventKind::AssistantMessage, "newest reply one"),
+        event(
+            8,
+            EventKind::UserPrompt,
+            "newest prompt\x1b[31m red\nsecond line",
+        ),
+    ];
+    assert!(app.apply_details(*first, key(), page_of(newest, Some(anchor(8)))));
+    let one = session_screen(&app);
+    assert!(
+        one.contains("0 requests · 0 compactions · 2 events loaded"),
+        "{one}"
+    );
+    assert!(
+        one.contains("newest reply one") && one.contains("newest prompt"),
+        "{one}"
+    );
+    assert!(!one.contains('\x1b'), "{one}");
+    assert!(
+        one.contains("older records exist (m loads the next page)"),
+        "{one}"
+    );
+    assert!(!one.contains("older reply"));
+
+    press_key(&mut app, crossterm::event::KeyCode::Char('m'));
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::LoadDetails {
+            request_id: second,
+            anchor: Some(_),
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("{requests:?}");
+    };
+    let older = vec![event(7, EventKind::AssistantMessage, "older reply two")];
+    assert!(app.apply_details(*second, key(), page_of(older, None)));
+    let two = session_screen(&app);
+    assert!(
+        two.contains("0 requests · 0 compactions · 3 events loaded"),
+        "{two}"
+    );
+    assert!(
+        two.contains("older reply two") && two.contains("newest reply one"),
+        "{two}"
+    );
+    assert!(
+        !two.contains("older records exist"),
+        "the last page ends the hint:\n{two}"
+    );
 }

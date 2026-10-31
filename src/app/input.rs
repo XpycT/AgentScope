@@ -7,11 +7,11 @@
 use std::cell::Cell;
 
 use crate::domain::{
-    ProcessAssociation, Provider, SessionKey, SessionSummary, StatusLabel, Timestamp,
+    Harness, ProcessAssociation, SessionKey, SessionSummary, StatusLabel, Timestamp,
 };
 use crate::processes::{self, ProcessInfo, ProcessSnapshot};
 
-use super::{App, FilterState, Focus, PROVIDERS, STATUS_ORDER, Screen, UsageAvailability};
+use super::{App, FilterState, Focus, STATUS_ORDER, Screen, UsageAvailability};
 
 /// Longest search text accepted (characters).
 const MAX_QUERY_CHARS: usize = 200;
@@ -59,11 +59,13 @@ pub(super) struct InputState {
 /// One row of the filter panel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FilterTarget {
-    Provider(Provider),
+    Provider(Harness),
     Status(StatusLabel),
     Usage(UsageAvailability),
     /// `None` is "any project".
     Project(Option<String>),
+    /// Show sessions a desktop app marked released (hidden by default).
+    Released,
     Clear,
 }
 
@@ -178,9 +180,10 @@ impl App {
             t.select_index(i);
         }
         if let Some(key) = key
-            && self.view.iter().any(|&i| self.sessions[i].key == key)
+            && self.view.iter().any(|&i| self.sessions[i].meta.key == key)
         {
             self.selected = Some(key);
+            self.recompute_visual_selection();
         }
         self.input.editing = None;
         self.focus = Focus::Roster;
@@ -329,7 +332,7 @@ impl App {
     pub fn filter_items(&self) -> Vec<FilterItem> {
         let f = &self.filter;
         let mut items = Vec::new();
-        for p in PROVIDERS {
+        for p in Harness::ALL {
             items.push(FilterItem {
                 target: FilterTarget::Provider(p),
                 selected: f.providers.as_ref().is_some_and(|v| v.contains(&p)),
@@ -359,7 +362,7 @@ impl App {
         let mut projects: Vec<&str> = self
             .sessions
             .iter()
-            .filter_map(|s| s.project.as_deref())
+            .filter_map(|s| s.meta.project.as_deref())
             .filter(|p| !p.is_empty())
             .collect();
         projects.sort_by_key(|p| (p.to_lowercase(), *p));
@@ -371,6 +374,10 @@ impl App {
                 selected: active.as_deref() == Some(p.to_lowercase().as_str()),
             });
         }
+        items.push(FilterItem {
+            target: FilterTarget::Released,
+            selected: f.include_released,
+        });
         items.push(FilterItem {
             target: FilterTarget::Clear,
             selected: false,
@@ -414,6 +421,7 @@ impl App {
             }
             FilterTarget::Usage(u) => f.usage = *u,
             FilterTarget::Project(p) => f.project = p.clone(),
+            FilterTarget::Released => f.include_released = !f.include_released,
             FilterTarget::Clear => {
                 f = FilterState {
                     query: f.query,
@@ -446,14 +454,14 @@ impl App {
             (Screen::Roster, _) | (_, None) => self.selected.clone(),
             (_, Some(t)) => Some(t.key().clone()),
         };
-        let session = key.and_then(|k| self.sessions.iter().find(|s| s.key == k));
+        let session = key.and_then(|k| self.sessions.iter().find(|s| s.meta.key == k));
         let snapshot = self.input.processes.as_ref();
         ProcessView {
-            session,
+            session: session.map(|s| &**s),
             association: session.map(|s| s.process),
             sampled_at: snapshot.map(|s| s.sampled_at),
             candidates: match (session, snapshot) {
-                (Some(s), Some(snap)) => processes::candidates(s.key.provider, snap),
+                (Some(s), Some(snap)) => processes::candidates(s.meta.key.harness, snap),
                 _ => Vec::new(),
             },
         }
@@ -461,10 +469,14 @@ impl App {
 
     // ---- pane focus ------------------------------------------------------
 
-    /// `Tab`: roster → transcript → details; from details back to the roster.
+    /// `Tab`: on a narrow roster swap list and preview; otherwise roster →
+    /// transcript → details, and from details back to the roster.
     pub fn focus_next(&mut self) {
         match self.screen {
             Screen::Roster => {
+                if self.swap_roster_pane() {
+                    return;
+                }
                 let retained = self
                     .transcript
                     .as_ref()
@@ -493,7 +505,10 @@ impl App {
             Screen::Details => {
                 self.close_overlay();
             }
-            Screen::Roster | Screen::Source | Screen::Diagnostics => {}
+            Screen::Roster => {
+                self.swap_roster_pane();
+            }
+            Screen::Source | Screen::Diagnostics => {}
             Screen::Session => {
                 self.close_overlay();
             }

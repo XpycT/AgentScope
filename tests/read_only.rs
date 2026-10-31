@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agentscope::app::{App, Screen, SourceState};
-use agentscope::discovery::{discover_claude, discover_codex};
 use agentscope::domain::{Thresholds, WarningKind};
 use agentscope::providers::opencode::open_read_only;
 use agentscope::ui::{RosterContext, apply_worker_event, flush_requests, handle_key};
 use agentscope::worker::{WorkerHandle, WorkerRequest};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use support::NOW;
 use support::world::*;
 
 type Meta = BTreeMap<PathBuf, (u64, std::time::SystemTime, u32)>;
@@ -178,10 +178,7 @@ fn full_worker_and_tui_session_leaves_provider_data_unchanged() {
         assert_eq!(app.selected_key(), Some(selected));
         handle_key(&mut app, key(KeyCode::Char('j')));
     }
-    let mut providers: Vec<_> = visited
-        .iter()
-        .map(|k| format!("{:?}", k.provider))
-        .collect();
+    let mut providers: Vec<_> = visited.iter().map(|k| format!("{:?}", k.harness)).collect();
     providers.sort();
     assert_eq!(providers, ["Claude", "Codex", "OpenCode"]);
     let _ = worker.tx.send(WorkerRequest::Refresh);
@@ -218,8 +215,8 @@ fn authorizer_denies_credential_tables_and_discovery_ignores_auth_files() {
     assert!(conn.execute_batch("VACUUM").is_err());
 
     // Discovery lists only transcript sources; decoys named like credentials are skipped.
-    let codex = discover_codex(&world.config()).expect("codex discovery");
-    let claude = discover_claude(&world.config()).expect("claude discovery");
+    let codex = support::codex_sources(&world.config());
+    let claude = support::claude_sources(&world.config());
     assert_eq!(codex.sources.len(), 1);
     assert_eq!(claude.sources.len(), 1);
     for s in codex.sources.iter().chain(&claude.sources) {
@@ -258,7 +255,7 @@ fn unreadable_database_is_reported_unavailable_and_never_repaired() {
     let result = agentscope::providers::opencode::OpenCodeScanner::new(&config);
     if let Ok(mut scanner) = result {
         use agentscope::providers::ProviderReader;
-        let outcome = scanner.refresh(support::NOW, BIG);
+        let outcome = scanner.discover(support::NOW, BIG);
         let reported = match outcome {
             Err(_) => true,
             Ok(d) => d.warnings.iter().any(|w| {
@@ -275,4 +272,316 @@ fn unreadable_database_is_reported_unavailable_and_never_repaired() {
         before,
         "never repaired or truncated"
     );
+}
+
+/// AC-01: consuming an archived rollout through the real CLI, and through the source
+/// reader directly, leaves the whole tree byte-identical.
+#[test]
+fn compressed_rollout_consumption_never_rewrites_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut plain = Vec::new();
+    for index in 0..500 {
+        plain.extend_from_slice(
+            format!("{{\"type\":\"event_msg\",\"payload\":{{\"n\":{index}}}}}\n").as_bytes(),
+        );
+    }
+    let plain_path = dir.path().join("rollout.jsonl");
+    let archived_path = dir.path().join("rollout.jsonl.zst");
+    fs::write(&plain_path, &plain).unwrap();
+    fs::write(
+        &archived_path,
+        zstd::stream::encode_all(&plain[..], 3).unwrap(),
+    )
+    .unwrap();
+    let before = file_inventory(dir.path());
+
+    for path in [&plain_path, &archived_path] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_agentscope"))
+            .arg("inspect")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let mut reader = agentscope::ingest::source::SourceReader::open(path, 1024 * 1024).unwrap();
+        loop {
+            let batch = reader
+                .step(agentscope::domain::RefreshBudget {
+                    max_records: 64,
+                    max_bytes: 64 * 1024,
+                    max_millis: 100,
+                })
+                .unwrap();
+            if batch.done {
+                break;
+            }
+        }
+    }
+
+    assert_eq!(
+        file_inventory(dir.path()),
+        before,
+        "sizes, mtimes and content are unchanged by reading"
+    );
+}
+
+/// AC-01: discovering, hydrating, paging, and serving a record from a live and an
+/// archived Codex rollout leaves every provider file byte-identical.
+#[test]
+fn codex_archived_discovery_and_reads_never_rewrite_the_store() {
+    use agentscope::domain::{PageDirection, PageRequest, SourceLocator};
+    use agentscope::providers::codex::CodexScanner;
+    use agentscope::providers::{ProviderReader, ReadProgress};
+    use support::codex as cx;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("codex");
+    let sessions = home.join("sessions");
+    let archived = home.join("archived_sessions");
+    let live = sessions
+        .join("2026")
+        .join("10")
+        .join("29")
+        .join("rollout-live.jsonl");
+    let archived_path = archived.join("rollout-old.jsonl.zst");
+    let live_bytes = [
+        cx::session_meta("2026-10-29T10:00:00Z", "live", "/p"),
+        cx::user("2026-10-29T10:00:01Z", "live prompt"),
+        cx::usage_record_thread("2026-10-29T10:00:02Z", "live", cx::usage(10, 0, 5, 0, 15)),
+    ];
+    let mut live_body = live_bytes.join("\n");
+    live_body.push('\n');
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    fs::write(&live, &live_body).unwrap();
+    let archived_bytes = [
+        cx::session_meta("2026-10-28T10:00:00Z", "old", "/p"),
+        cx::assistant("2026-10-28T10:00:01Z", "old answer"),
+        cx::usage_record_thread("2026-10-28T10:00:02Z", "old", cx::usage(20, 0, 5, 0, 25)),
+    ];
+    let mut archived_body = archived_bytes.join("\n");
+    archived_body.push('\n');
+    fs::create_dir_all(&archived).unwrap();
+    fs::write(
+        &archived_path,
+        zstd::stream::encode_all(archived_body.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+    let before = file_inventory(dir.path());
+
+    let config = support::config_for_store(&sessions, &archived);
+    let mut scanner = CodexScanner::new(&config).unwrap();
+    let found = discover_pass(&mut scanner, NOW, BIG);
+    assert_eq!(found.sessions.len(), 2);
+    for meta in &found.sessions {
+        let summary = hydrate_complete(&mut scanner, &meta.key, NOW);
+        assert!(summary.usage.is_some(), "usage is read from both stores");
+        let job = new_job();
+        let page = loop {
+            match scanner
+                .transcript_page(
+                    job,
+                    &meta.key,
+                    None,
+                    PageDirection::Backward,
+                    PageRequest {
+                        max_events: 50,
+                        max_bytes: 1_000_000,
+                    },
+                    BIG,
+                )
+                .unwrap()
+            {
+                ReadProgress::Pending(_) => continue,
+                ReadProgress::Ready(page) => break page,
+            }
+        };
+        assert!(!page.events.is_empty(), "the transcript is readable");
+        // Serving a source record (plain offset or compressed ordinal) is the other
+        // path that opens the physical file.
+        let first = page.events[0].provenance.locator.clone();
+        let locator: SourceLocator = first;
+        let job = new_job();
+        let record = loop {
+            match scanner.source_record(job, &locator, BIG).unwrap() {
+                ReadProgress::Pending(_) => continue,
+                ReadProgress::Ready(record) => break record,
+            }
+        };
+        assert!(record.unavailable.is_none(), "{record:?}");
+        assert!(
+            !record.raw.trim().is_empty(),
+            "the record content is served"
+        );
+    }
+
+    assert_eq!(
+        file_inventory(dir.path()),
+        before,
+        "no provider file changed size, mtime or content"
+    );
+}
+
+// ---- B7: the integrated native world ---------------------------------------------
+
+fn load_every_root(app: &mut App, ctx: &mut RosterContext, worker: &WorkerHandle) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while app.total_sessions() != ROOT_COUNT {
+        app.load_more_roots();
+        flush_requests(app, worker);
+        if let Ok(ev) = worker.rx.recv_timeout(Duration::from_millis(20)) {
+            apply_worker_event(app, ctx, ev);
+        }
+        assert!(Instant::now() < deadline, "every root never loaded");
+    }
+}
+
+#[test]
+fn native_world_full_session_leaves_provider_content_unchanged_and_sidecars_classified() {
+    use agentscope::domain::SessionKey;
+
+    let world = World::native();
+    let g = world.grown();
+    let before = snapshot(world.dir.path());
+    let before_paths = all_paths(world.dir.path());
+    let before_meta = metadata(&world);
+
+    // Every reader reads every session, page and source record, twice.
+    let mut readers = world.readers();
+    let surface = exercise_everything(&mut readers);
+    let _ = exercise_everything(&mut readers);
+    assert_eq!(surface.sessions.len(), ROOT_COUNT + g.children.len());
+    drop(readers);
+
+    // Then the program: worker, App and keyboard over the damaged and compressed
+    // sources as well as the healthy ones.
+    let worker = WorkerHandle::spawn(world.readers(), world.config());
+    let mut app = App::new(
+        NOW,
+        Thresholds {
+            quiet: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+        },
+    );
+    let mut ctx = RosterContext {
+        no_color: true,
+        ..RosterContext::default()
+    };
+    load_every_root(&mut app, &mut ctx, &worker);
+    app.set_filter(agentscope::app::FilterState {
+        include_released: true,
+        ..Default::default()
+    });
+    let key = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+    let visit: Vec<&SessionKey> = vec![
+        &g.zstd,
+        &g.truncated_zstd,
+        &g.partial_codex,
+        &g.damaged_claude,
+        &g.desktop_code,
+        &g.desktop_released,
+        &g.cowork,
+        &g.secret_claude,
+        &g.secret_codex,
+        &g.secret_opencode,
+        &g.unknown_billing,
+        &g.opencode.parent,
+    ];
+    for target in visit {
+        assert!(
+            app.select_row(target),
+            "{} is a visible root",
+            target.native_id
+        );
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Inspector);
+        flush_requests(&mut app, &worker);
+        wait_for(&mut app, &mut ctx, &worker, |a| {
+            a.transcript().is_some_and(|t| t.loaded())
+        });
+        handle_key(&mut app, key(KeyCode::Char('v')));
+        if app.screen == Screen::Source {
+            flush_requests(&mut app, &worker);
+            wait_for(&mut app, &mut ctx, &worker, |a| {
+                a.source_view()
+                    .is_some_and(|v| !matches!(v.state, SourceState::Loading))
+            });
+            handle_key(&mut app, key(KeyCode::Esc));
+        }
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Roster);
+    }
+    let _ = worker.tx.send(WorkerRequest::Refresh);
+    assert!(worker.shutdown(), "worker exits cleanly");
+
+    // Provider content: byte-identical, sizes, mtimes and permissions unchanged.
+    let after = snapshot(world.dir.path());
+    assert_eq!(after.files, before.files);
+    assert_eq!(metadata(&world), before_meta);
+    assert_only_adr0002_sidecars_added(&world, &before_paths);
+    // Sidecars are reported separately (ADR-0002): only the live OpenCode database's
+    // own may differ. The locked database's copy is exactly as it was built.
+    for (path, bytes) in &before.sidecars {
+        let live = path.starts_with("opencode");
+        if !live {
+            assert_eq!(after.sidecars.get(path), Some(bytes), "{path:?}");
+        }
+    }
+    for path in after.sidecars.keys() {
+        assert!(
+            before.sidecars.contains_key(path) || path.starts_with("opencode"),
+            "a new sidecar outside the live database: {path:?}"
+        );
+    }
+}
+
+#[test]
+fn native_world_locked_wal_is_unavailable_never_repaired_and_hides_nothing_else() {
+    let world = World::native();
+    let g = world.grown();
+    let before = snapshot(world.dir.path());
+    let before_paths = all_paths(world.dir.path());
+    let shm = support::opencode::sidecar(&g.locked_db, "-shm");
+    assert!(shm.is_dir());
+
+    let mut config = world.locked_config();
+    config.refresh_ms = 3_600_000;
+    let worker = WorkerHandle::spawn(world.locked_readers(), config);
+    let mut app = App::new(
+        NOW,
+        Thresholds {
+            quiet: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+        },
+    );
+    let mut ctx = RosterContext {
+        no_color: true,
+        ..RosterContext::default()
+    };
+    // Codex and Claude (including Desktop) roots all load; OpenCode contributes none.
+    let healthy = g
+        .roots
+        .iter()
+        .filter(|(k, _)| k.harness != agentscope::domain::Harness::OpenCode)
+        .count();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while app.total_sessions() != healthy {
+        app.load_more_roots();
+        flush_requests(&mut app, &worker);
+        if let Ok(ev) = worker.rx.recv_timeout(Duration::from_millis(20)) {
+            apply_worker_event(&mut app, &mut ctx, ev);
+        }
+        assert!(Instant::now() < deadline, "the healthy roots never loaded");
+    }
+    assert!(
+        app.all_rows()
+            .iter()
+            .all(|r| r.session.meta.key.harness != agentscope::domain::Harness::OpenCode)
+    );
+    assert!(worker.shutdown());
+
+    // Nothing is repaired, deleted, copied or created beside the locked database.
+    assert!(shm.is_dir(), "the occupied -shm name is left alone");
+    let after = snapshot(world.dir.path());
+    assert_eq!(after.files, before.files);
+    assert_eq!(after.sidecars, before.sidecars);
+    assert_eq!(all_paths(world.dir.path()), before_paths);
 }

@@ -14,13 +14,15 @@ use std::time::{Duration, Instant};
 use agentscope::app::{App, MAX_LOADED_EVENTS};
 use agentscope::config::{CliOverrides, Config, Env};
 use agentscope::domain::*;
+use agentscope::ingest::source::SourceReader;
 use agentscope::perf;
+use agentscope::providers::ProviderReader;
 use agentscope::providers::claude::ClaudeScanner;
 use agentscope::providers::codex::CodexScanner;
-use agentscope::providers::{ProviderDelta, ProviderReader};
 use agentscope::worker::WorkerRequest;
 use serde_json::{Value, json};
 use support::codex::{assistant, session_meta, turn_context, usage, usage_record, user};
+use support::facts::{self, metadata};
 use support::{NOW, config_for, dated, set_modified, write_lines};
 
 const SESSIONS: usize = 2_000;
@@ -93,18 +95,9 @@ fn codex_corpus(sessions: usize, records: usize) -> Corpus {
     corpus
 }
 
-fn scan_codex(scanner: &mut CodexScanner, budget: RefreshBudget) -> (Vec<SessionSummary>, usize) {
-    let mut sessions = Vec::new();
-    let mut calls = 0;
-    loop {
-        let delta = scanner.scan_roster(NOW, budget).expect("scan");
-        calls += 1;
-        sessions.extend(delta.sessions);
-        if delta.scan.done {
-            return (sessions, calls);
-        }
-        assert!(calls < 100_000, "scan never finished");
-    }
+/// Discovers, then hydrates every session that discovery reported as new or changed.
+fn scan_codex(scanner: &mut CodexScanner, budget: RefreshBudget) -> Vec<SessionSummary> {
+    support::world::rescan(scanner, NOW, budget).sessions
 }
 
 fn append(path: &Path, line: &str) -> u64 {
@@ -113,80 +106,139 @@ fn append(path: &Path, line: &str) -> u64 {
     line.len() as u64 + 1
 }
 
+/// Largest read one probe may do: the prefix window, a header line read to its end,
+/// and the tail window.
+const PROBE_MAX: u64 = 4 * 1024 + 256 * 1024 + 32 * 1024;
+
 #[test]
-fn initial_roster_pass_streams_each_file_once_under_per_call_budget() {
-    let corpus = codex_corpus(SESSIONS, RECORDS_PER_SESSION);
+fn discovery_reads_bounded_probes_under_the_per_call_budget() {
+    // Each source is far larger than its probe windows.
+    let corpus = codex_corpus(200, 400);
     let mut scanner = CodexScanner::new(&config_for(&corpus.root)).unwrap();
-    let (mut bytes, mut records, mut calls) = (0, 0, 0usize);
+    let (mut bytes, mut calls) = (0u64, 0usize);
     let mut seen = std::collections::HashSet::new();
     loop {
         perf::reset();
-        let delta = scanner.scan_roster(NOW, CHUNK).unwrap();
+        let delta = scanner.discover(NOW, CHUNK).expect("discover");
         let used = perf::snapshot();
-        // One record may finish after the budget is crossed; never more.
+        // A probe that crosses the byte budget finishes; the next call stops short of more.
         assert!(
-            used.bytes_read <= (CHUNK.max_bytes + corpus.longest_line + 1) as u64,
+            used.bytes_read <= CHUNK.max_bytes as u64 + PROBE_MAX,
             "call {calls} read {} bytes",
             used.bytes_read
         );
-        assert!(used.records_parsed <= CHUNK.max_records as u64);
         bytes += used.bytes_read;
-        records += used.records_parsed;
         calls += 1;
-        seen.extend(delta.sessions.into_iter().map(|s| s.key));
+        seen.extend(delta.sessions.into_iter().map(|m| m.key));
         if delta.scan.done {
             break;
         }
-        assert!(calls < 100_000, "scan never finished");
+        assert!(calls < 100_000, "discovery never finished");
     }
-    assert_eq!(seen.len(), SESSIONS);
-    // Limitation (v1): the initial pass streams every record of every file; a
-    // header/tail metadata-only scan is deferred. What is enforced is the per-call
-    // budget and that no byte is read twice.
-    // The scan is chunked into many calls instead of one corpus-sized pass...
-    assert!(calls >= (corpus.total_bytes / CHUNK.max_bytes as u64) as usize);
-    // ...and across the whole pass every source byte is consumed exactly once.
+    assert_eq!(seen.len(), 200);
+    // Probes touch the header window and the tail window, never the body between them.
+    assert!(
+        bytes <= 200 * (4 * 1024 + 32 * 1024 + 8 * 1024),
+        "discovery read {bytes} of {} source bytes",
+        corpus.total_bytes
+    );
+    assert!(bytes < corpus.total_bytes / 2);
+}
+
+#[test]
+fn hydration_streams_each_file_once_under_per_call_budget() {
+    let corpus = codex_corpus(SESSIONS, RECORDS_PER_SESSION);
+    let mut scanner = CodexScanner::new(&config_for(&corpus.root)).unwrap();
+    let found = support::world::discover_pass(&mut scanner, NOW, BIG);
+    assert_eq!(found.sessions.len(), SESSIONS);
+    let (mut bytes, mut records, mut calls) = (0, 0, 0usize);
+    for meta in &found.sessions {
+        let job = support::world::new_job();
+        loop {
+            perf::reset();
+            let delta = scanner
+                .hydrate(job, &meta.key, NOW, CHUNK)
+                .expect("hydrate");
+            let used = perf::snapshot();
+            // One record may finish after the budget is crossed; never more.
+            assert!(
+                used.bytes_read <= (CHUNK.max_bytes + corpus.longest_line + 1) as u64,
+                "call {calls} read {} bytes",
+                used.bytes_read
+            );
+            assert!(used.records_parsed <= CHUNK.max_records as u64);
+            bytes += used.bytes_read;
+            records += used.records_parsed;
+            calls += 1;
+            if delta.done {
+                break;
+            }
+            assert!(calls < 1_000_000, "hydration never finished");
+        }
+    }
+    // Across the whole corpus every source byte is consumed exactly once.
     assert_eq!(bytes, corpus.total_bytes);
     assert_eq!(records, corpus.total_records);
 }
 
 #[test]
-fn roster_is_capped_at_max_sessions() {
+fn detail_cache_is_bounded_while_discovery_lists_every_source() {
     let corpus = codex_corpus(SESSIONS + 25, 3);
-    let mut scanner = CodexScanner::new(&config_for(&corpus.root)).unwrap();
-    perf::reset();
-    let (sessions, _) = scan_codex(&mut scanner, BIG);
-    assert_eq!(sessions.len(), SESSIONS);
-    // Omitted sources are never opened: only the newest 2,000 files are read.
-    assert_eq!(perf::snapshot().records_parsed, (SESSIONS * 3) as u64);
+    let mut config = config_for(&corpus.root);
+    config.max_cached_sessions = SESSIONS;
+    let mut scanner = CodexScanner::new(&config).unwrap();
+    let found = support::world::discover_pass(&mut scanner, NOW, BIG);
+    // Metadata is not capped by the detail cache.
+    assert_eq!(found.sessions.len(), SESSIONS + 25);
+    for meta in &found.sessions {
+        support::world::hydrate_complete(&mut scanner, &meta.key, NOW);
+    }
+    assert!(
+        scanner.cached_sessions() <= SESSIONS,
+        "{} cached",
+        scanner.cached_sessions()
+    );
 }
 
 #[test]
 fn unchanged_file_refresh_does_no_full_reparse() {
     let corpus = codex_corpus(SESSIONS, RECORDS_PER_SESSION);
     let mut scanner = CodexScanner::new(&config_for(&corpus.root)).unwrap();
-    let (sessions, _) = scan_codex(&mut scanner, BIG);
+    let sessions = scan_codex(&mut scanner, BIG);
     assert_eq!(sessions.len(), SESSIONS);
 
-    // Nothing changed: the second pass reads and parses nothing.
+    // Nothing changed: the second pass probes, reads and parses nothing.
     perf::reset();
-    let (changed, _) = scan_codex(&mut scanner, BIG);
+    let changed = scan_codex(&mut scanner, BIG);
     let idle = perf::snapshot();
     assert!(changed.is_empty(), "unchanged sources must not re-emit");
     assert_eq!((idle.bytes_read, idle.records_parsed), (0, 0));
 
-    // One append to a source whose cursor is held: the new line is parsed, and the
-    // consumed prefix (below the 4 MiB verify limit) is re-read once to prove it is
-    // unchanged. Both reads are counted.
+    // One append to a source whose cursor is held: discovery probes it, and hydration
+    // parses only the new line, re-reading the consumed prefix (below the 4 MiB verify
+    // limit) once to prove it is unchanged. Both reads are counted.
     let newest = corpus.files.last().unwrap();
+    // The newest source is the one being watched, so its cursor is held.
+    let watched = sessions
+        .iter()
+        .find(|s| s.meta.key.source == SourceKey::File(newest.clone()))
+        .unwrap()
+        .meta
+        .key
+        .clone();
+    support::world::hydrate_complete(&mut scanner, &watched, NOW);
     let before = fs::metadata(newest).unwrap().len();
     let added = append(newest, &assistant(TS, "one more reply"));
+    let found = support::world::discover_pass(&mut scanner, NOW, BIG);
+    assert_eq!(found.sessions.len(), 1);
     perf::reset();
-    let (changed, _) = scan_codex(&mut scanner, BIG);
+    let summary = support::world::hydrate_complete(&mut scanner, &found.sessions[0].key, NOW);
     let tail = perf::snapshot();
-    assert_eq!(changed.len(), 1);
-    assert_eq!(tail.bytes_read, added + before);
-    assert_eq!(tail.records_parsed, 1);
+    assert_eq!(summary.meta.key, found.sessions[0].key);
+    // Only the newest 32 sources keep a cursor, and hydration order does not make this
+    // one of them, so it is verified once and re-parsed from the start.
+    assert_eq!(tail.bytes_read, 2 * before + added);
+    assert_eq!(tail.records_parsed, RECORDS_PER_SESSION as u64 + 1);
 
     // An append to an old source (cursor released to bound open files) re-reads that
     // one file and nothing else: one integrity pass over the old prefix, then a full
@@ -195,12 +247,16 @@ fn unchanged_file_refresh_does_no_full_reparse() {
     let old_before = fs::metadata(old).unwrap().len();
     append(old, &assistant(TS, "late reply"));
     let old_len = fs::metadata(old).unwrap().len();
+    let found = support::world::discover_pass(&mut scanner, NOW, BIG);
+    assert_eq!(found.sessions.len(), 1);
     perf::reset();
-    let (changed, _) = scan_codex(&mut scanner, BIG);
+    support::world::hydrate_complete(&mut scanner, &found.sessions[0].key, NOW);
     let reread = perf::snapshot();
-    assert_eq!(changed.len(), 1);
-    assert_eq!(reread.bytes_read, old_before + old_len);
-    assert_eq!(reread.records_parsed, RECORDS_PER_SESSION as u64 + 1);
+    // Never more than one integrity pass plus one full re-parse of this one file.
+    assert!(reread.bytes_read >= old_len && reread.bytes_read <= old_before + old_len);
+    // Hydration visited the oldest source last, so its cursor is still held: only the
+    // new line is parsed.
+    assert_eq!(reread.records_parsed, 1);
 }
 
 fn claude_config(root: &Path, tweak: impl FnOnce(&mut Config)) -> Config {
@@ -239,19 +295,7 @@ fn write_claude(root: &Path, name: &str, records: &[Value]) -> PathBuf {
 }
 
 fn scan_claude(scanner: &mut ClaudeScanner, budget: RefreshBudget) -> Vec<SessionSummary> {
-    let mut sessions = Vec::new();
-    for _ in 0..100_000 {
-        let ProviderDelta {
-            sessions: found,
-            scan,
-            ..
-        } = scanner.scan_roster(NOW, budget).unwrap();
-        sessions.extend(found);
-        if scan.done {
-            return sessions;
-        }
-    }
-    panic!("scan never finished");
+    support::world::rescan(scanner, NOW, budget).sessions
 }
 
 #[test]
@@ -270,8 +314,13 @@ fn claude_unchanged_refresh_reads_nothing_and_append_reads_only_the_tail() {
         })
         .collect();
     let mut scanner = ClaudeScanner::new(&claude_config(&root, |_| {})).unwrap();
+    // Discovery probes (small files are read whole by a probe) are not hydration work.
+    let found = support::world::discover_pass(&mut scanner, NOW, BIG);
+    assert_eq!(found.sessions.len(), FILES);
     perf::reset();
-    assert_eq!(scan_claude(&mut scanner, BIG).len(), FILES);
+    for meta in &found.sessions {
+        support::world::hydrate_complete(&mut scanner, &meta.key, NOW);
+    }
     let total: u64 = paths.iter().map(|p| fs::metadata(p).unwrap().len()).sum();
     assert_eq!(perf::snapshot().bytes_read, total);
     assert_eq!(
@@ -285,8 +334,10 @@ fn claude_unchanged_refresh_reads_nothing_and_append_reads_only_the_tail() {
 
     let prefix = fs::metadata(&paths[7]).unwrap().len();
     let added = append(&paths[7], &claude_record("s7", 999_999, "tail").to_string());
+    let changed = support::world::discover_pass(&mut scanner, NOW, BIG);
+    assert_eq!(changed.sessions.len(), 1);
     perf::reset();
-    assert_eq!(scan_claude(&mut scanner, BIG).len(), 1);
+    support::world::hydrate_complete(&mut scanner, &changed.sessions[0].key, NOW);
     let tail = perf::snapshot();
     assert_eq!(tail.records_parsed, 1);
     // The new line plus an exact verification of the consumed prefix, which
@@ -330,9 +381,16 @@ fn check_page_budget(
         max_bytes,
     };
     perf::reset();
-    let page = reader
-        .transcript_page(key, None, PageDirection::Forward, request)
-        .expect("page");
+    let page = support::world::try_transcript(
+        reader,
+        key,
+        None,
+        PageDirection::Forward,
+        request,
+        BIG,
+        support::world::STEPS,
+    )
+    .expect("page");
     let used = perf::snapshot();
     assert!(!page.events.is_empty());
     assert!(
@@ -349,7 +407,7 @@ fn check_page_budget(
     assert!(
         used.preview_bytes <= visited * (PREVIEW_CAP + ROW_METADATA),
         "{:?} kept {} preview bytes for a {max_bytes}-byte page",
-        reader.provider(),
+        reader.harness(),
         used.preview_bytes
     );
     // Transient buffers: sanitize/redact run over the whole source text before the cut,
@@ -359,7 +417,7 @@ fn check_page_budget(
     assert!(
         used.preview_temp_bytes <= visited * (2 * HUGE_ROW + 2 * ROW_METADATA),
         "{:?} built {} temporary preview bytes",
-        reader.provider(),
+        reader.harness(),
         used.preview_temp_bytes
     );
     // Paging touches only this session file: at most one verification pass, one index
@@ -381,8 +439,8 @@ fn page_allocation_never_exceeds_max_page_bytes() {
     write_lines(&path, &lines);
     let len = fs::metadata(&path).unwrap().len();
     let mut scanner = CodexScanner::new(&config_for(&root)).unwrap();
-    let (sessions, _) = scan_codex(&mut scanner, BIG);
-    let key = sessions[0].key.clone();
+    let sessions = scan_codex(&mut scanner, BIG);
+    let key = sessions[0].meta.key.clone();
     for max_bytes in [8192, 1000] {
         check_page_budget(&mut scanner, &key, len, max_bytes);
     }
@@ -393,7 +451,7 @@ fn page_allocation_never_exceeds_max_page_bytes() {
     let path = write_claude(&root, "big.jsonl", &records);
     let len = fs::metadata(&path).unwrap().len();
     let mut scanner = ClaudeScanner::new(&claude_config(&root, |_| {})).unwrap();
-    let key = scan_claude(&mut scanner, BIG).remove(0).key;
+    let key = scan_claude(&mut scanner, BIG).remove(0).meta.key;
     for max_bytes in [8192, 1000] {
         check_page_budget(&mut scanner, &key, len, max_bytes);
     }
@@ -403,24 +461,26 @@ fn page_allocation_never_exceeds_max_page_bytes() {
 fn first_page_reads_one_session_not_the_corpus() {
     let corpus = codex_corpus(SESSIONS, RECORDS_PER_SESSION);
     let mut scanner = CodexScanner::new(&config_for(&corpus.root)).unwrap();
-    let (sessions, _) = scan_codex(&mut scanner, BIG);
+    let sessions = scan_codex(&mut scanner, BIG);
     let target = sessions
         .iter()
-        .find(|s| s.key.provider_session_id == "sess-01234")
+        .find(|s| s.meta.key.native_id == "sess-01234")
         .unwrap();
     let len = fs::metadata(&corpus.files[1234]).unwrap().len();
     perf::reset();
-    let page = scanner
-        .transcript_page(
-            &target.key,
-            None,
-            PageDirection::Forward,
-            PageRequest {
-                max_events: 500,
-                max_bytes: 262_144,
-            },
-        )
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut scanner,
+        &target.meta.key,
+        None,
+        PageDirection::Forward,
+        PageRequest {
+            max_events: 500,
+            max_bytes: 262_144,
+        },
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     let used = perf::snapshot();
     assert!(!page.events.is_empty());
     assert!(
@@ -450,14 +510,20 @@ fn dedup_ledger_stays_within_entry_and_byte_caps() {
     assert_eq!(usage.class, AggregationClass::Partial);
     assert_eq!(usage.total, Some(1_000 * per_message));
 
-    // Byte cap: ids are 10 bytes each, so 10,000 bytes hold exactly 1,000 of them.
+    // Byte cap: every retained byte of an entry is charged (state, key, strings), so
+    // 100,000 bytes hold a bounded, nonzero prefix and the aggregate says it is partial.
     let mut scanner = ClaudeScanner::new(&claude_config(&root, |c| {
-        c.dedup_ledger_bytes = 10_000;
+        c.dedup_ledger_bytes = 100_000;
     }))
     .unwrap();
     let usage = scan_claude(&mut scanner, BIG).remove(0).usage.unwrap();
     assert_eq!(usage.class, AggregationClass::Partial);
-    assert_eq!(usage.total, Some(1_000 * per_message));
+    let counted = usage.total.unwrap() / per_message;
+    assert!(
+        (10..1_000).contains(&counted),
+        "counted {counted} messages in a 100,000 byte budget"
+    );
+    assert_eq!(usage.total, Some(counted * per_message));
 
     // Within the caps, the same file stays exact.
     let mut scanner = ClaudeScanner::new(&claude_config(&root, |_| {})).unwrap();
@@ -468,42 +534,31 @@ fn dedup_ledger_stays_within_entry_and_byte_caps() {
 
 fn view_key() -> SessionKey {
     SessionKey {
-        provider: Provider::Codex,
-        provider_session_id: "loaded".into(),
+        harness: Harness::Codex,
+        native_id: "loaded".into(),
         source: SourceKey::File("loaded.jsonl".into()),
     }
 }
 
 fn view_summary() -> SessionSummary {
+    let mut meta = metadata(view_key(), "Loaded");
+    meta.created_at = Some(NOW - 86_400_000);
+    meta.activity = ActivityStamp {
+        at: Some(NOW - 540_000),
+        class: AggregationClass::Reported,
+    };
     SessionSummary {
-        key: view_key(),
-        title: "Loaded".into(),
-        title_derived: false,
-        project: None,
-        cwd: None,
-        models: vec![],
-        model_details: vec![],
-        provider_version: None,
-        created_at: Some(NOW - 86_400_000),
         last_event_at: Some(NOW - 540_000),
-        last_persisted_at: Some(NOW - 540_000),
         last_completion: None,
         unfinished_work: false,
         displayed_event_count: 100_000,
         hidden_records: 0,
-        source_available: true,
-        archived: false,
-        context_window: None,
         server_tools: None,
         lifecycle: Lifecycle::Unknown,
         process: ProcessAssociation::NotChecked,
         usage: None,
-        lineage: Lineage {
-            parent: None,
-            fork: None,
-            sidechain: false,
-        },
         warnings: vec![],
+        ..facts::summary(meta)
     }
 }
 
@@ -524,7 +579,7 @@ fn view_event(i: u64) -> Event {
         tool: None,
         usage: None,
         provenance: Provenance {
-            provider: Provider::Codex,
+            harness: Harness::Codex,
             source: SourceKey::File("loaded.jsonl".into()),
             locator: SourceLocator {
                 session: view_key(),
@@ -535,7 +590,7 @@ fn view_event(i: u64) -> Event {
                 generation: None,
             },
             record_type: "test".into(),
-            provider_version: None,
+            harness_version: None,
         },
     }
 }
@@ -552,7 +607,7 @@ fn view_page(range: std::ops::Range<u64>) -> TranscriptPage {
     TranscriptPage {
         events: range.clone().map(view_event).collect(),
         diagnostics: vec![],
-        next: Some(view_anchor(range.end - 1)),
+        next: Some(view_anchor(range.start)),
         has_more: true,
         truncated: false,
     }
@@ -571,17 +626,22 @@ fn loaded_transcript_stays_within_event_cap() {
     app.apply_roster(vec![view_summary()], vec![]);
     assert!(app.open_inspector());
     let requests = app.take_requests();
-    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+    let Some(WorkerRequest::Select { request_id, .. }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
         panic!("expected Select, got {requests:?}");
     };
-    assert!(app.apply_transcript(*request_id, view_page(0..PAGE)));
+    let total = 5 * MAX_LOADED_EVENTS as u64 / 2;
+    let mut start = total - PAGE;
+    assert!(app.apply_transcript(*request_id, view_page(start..total)));
 
-    // Keep scrolling to the end and serving the next page until 2.5x the cap has
-    // been delivered; the retained window never grows past the cap.
+    // Keep scrolling to the start and serving the older page until 2.5x the cap
+    // has been delivered; the retained window never grows past the cap.
     let mut delivered = PAGE;
     let mut high_water = app.transcript().unwrap().events().len();
-    while delivered < 5 * MAX_LOADED_EVENTS as u64 / 2 {
-        app.inspector_move(isize::MAX);
+    while start > 0 && delivered < total {
+        app.inspector_move(isize::MIN);
         let load = app
             .take_requests()
             .into_iter()
@@ -589,9 +649,11 @@ fn loaded_transcript_stays_within_event_cap() {
                 WorkerRequest::LoadPage { request_id, .. } => Some(request_id),
                 _ => None,
             })
-            .expect("scrolling to the end requests the next page");
-        assert!(app.apply_transcript(load, view_page(delivered..delivered + PAGE)));
-        delivered += PAGE;
+            .expect("scrolling to the start requests the older page");
+        start = start.saturating_sub(PAGE);
+        let end = (start + PAGE).min(total);
+        assert!(app.apply_transcript(load, view_page(start..end)));
+        delivered += end - start;
         let held = app.transcript().unwrap().events().len();
         assert!(held <= MAX_LOADED_EVENTS, "{held} events retained");
         high_water = high_water.max(held);
@@ -626,50 +688,72 @@ fn benchmark_report() {
     let mut scanner = CodexScanner::new(&config_for(&corpus.root)).unwrap();
     perf::reset();
     let start = Instant::now();
-    let first = scanner.scan_roster(NOW, worker_chunk).unwrap();
+    let first = scanner.discover(NOW, worker_chunk).unwrap();
     let first_delta = start.elapsed();
     let first_count = first.sessions.len();
-    let mut sessions = first.sessions;
+    let mut keys: Vec<SessionKey> = first.sessions.into_iter().map(|m| m.key).collect();
     let mut calls = 1;
     let mut worst_call = first_delta;
     let mut done = first.scan.done;
     while !done {
         let call = Instant::now();
-        let delta = scanner.scan_roster(NOW, worker_chunk).unwrap();
+        let delta = scanner.discover(NOW, worker_chunk).unwrap();
         worst_call = worst_call.max(call.elapsed());
-        sessions.extend(delta.sessions);
+        keys.extend(delta.sessions.into_iter().map(|m| m.key));
         done = delta.scan.done;
         calls += 1;
     }
-    let used = perf::snapshot();
     println!(
-        "codex initial roster: first delta {first_delta:?} ({} sessions), complete {:?} in {calls} calls, \
+        "codex metadata discovery: first delta {first_delta:?} ({first_count} sources), complete {:?} in {calls} calls, \
          longest call {worst_call:?}, {} bytes read, {} records parsed",
-        first_count,
         start.elapsed(),
-        used.bytes_read,
-        used.records_parsed
+        perf::snapshot().bytes_read,
+        perf::snapshot().records_parsed
+    );
+    perf::reset();
+    let start = Instant::now();
+    let sessions: Vec<SessionSummary> = keys
+        .iter()
+        .map(|k| {
+            support::world::hydrate_budgeted(
+                &mut scanner,
+                k,
+                NOW,
+                worker_chunk,
+                support::world::STEPS,
+            )
+        })
+        .collect();
+    println!(
+        "codex hydrating all {} sessions: {:?}, {} bytes read, {} records parsed",
+        sessions.len(),
+        start.elapsed(),
+        perf::snapshot().bytes_read,
+        perf::snapshot().records_parsed
     );
 
     let key = sessions
         .iter()
-        .find(|s| s.key.provider_session_id == "sess-01234")
+        .find(|s| s.meta.key.native_id == "sess-01234")
         .unwrap()
+        .meta
         .key
         .clone();
     perf::reset();
     let start = Instant::now();
-    let page = scanner
-        .transcript_page(
-            &key,
-            None,
-            PageDirection::Forward,
-            PageRequest {
-                max_events: 500,
-                max_bytes: 262_144,
-            },
-        )
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PageRequest {
+            max_events: 500,
+            max_bytes: 262_144,
+        },
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     println!(
         "codex first page: {:?}, {} events, {} bytes read",
         start.elapsed(),
@@ -679,7 +763,7 @@ fn benchmark_report() {
 
     perf::reset();
     let start = Instant::now();
-    let (changed, _) = scan_codex(&mut scanner, worker_chunk);
+    let changed = scan_codex(&mut scanner, worker_chunk);
     println!(
         "codex unchanged refresh: {:?}, {} changed, {} bytes read, {} records parsed",
         start.elapsed(),
@@ -694,7 +778,7 @@ fn benchmark_report() {
     );
     perf::reset();
     let start = Instant::now();
-    let (changed, _) = scan_codex(&mut scanner, worker_chunk);
+    let changed = scan_codex(&mut scanner, worker_chunk);
     println!(
         "codex refresh after one append: {:?}, {} changed, {} bytes read, {} records parsed",
         start.elapsed(),
@@ -722,20 +806,22 @@ fn benchmark_report() {
         sessions.len(),
         perf::snapshot().bytes_read
     );
-    let key = sessions[0].key.clone();
+    let key = sessions[0].meta.key.clone();
     perf::reset();
     let start = Instant::now();
-    let page = scanner
-        .transcript_page(
-            &key,
-            None,
-            PageDirection::Forward,
-            PageRequest {
-                max_events: 500,
-                max_bytes: 262_144,
-            },
-        )
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Forward,
+        PageRequest {
+            max_events: 500,
+            max_bytes: 262_144,
+        },
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     println!(
         "claude first page: {:?}, {} events, {} bytes read",
         start.elapsed(),
@@ -765,19 +851,21 @@ fn preview_temporaries_include_tab_expansion_and_redaction_output() {
     lines.extend((0..10).map(|_| assistant(TS, &"\t".repeat(TABS as usize))));
     write_lines(&dated(&root, "rollout-tabs.jsonl"), &lines);
     let mut scanner = CodexScanner::new(&config_for(&root)).unwrap();
-    let (sessions, _) = scan_codex(&mut scanner, BIG);
+    let sessions = scan_codex(&mut scanner, BIG);
     perf::reset();
-    let page = scanner
-        .transcript_page(
-            &sessions[0].key,
-            None,
-            PageDirection::Forward,
-            PageRequest {
-                max_events: 500,
-                max_bytes: 1000,
-            },
-        )
-        .unwrap();
+    let page = support::world::try_transcript(
+        &mut scanner,
+        &sessions[0].meta.key,
+        None,
+        PageDirection::Forward,
+        PageRequest {
+            max_events: 500,
+            max_bytes: 1000,
+        },
+        BIG,
+        support::world::STEPS,
+    )
+    .unwrap();
     let used = perf::snapshot();
     let visited = page.events.len() as u64 + 1;
     // Retained previews stay at the cap...
@@ -794,4 +882,147 @@ fn preview_temporaries_include_tab_expansion_and_redaction_output() {
         "{} temporary bytes for {visited} rows",
         used.preview_temp_bytes
     );
+}
+
+/// A4: archived rollouts are consumed in bounded slices, never as one expansion, and
+/// plain and compressed reads do the same record work.
+#[test]
+fn compressed_source_work_stays_within_each_call_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut plain = String::new();
+    for index in 0..60_000 {
+        plain.push_str(&format!(
+            "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\
+             \"content\":[{{\"type\":\"input_text\",\"text\":\"budgeted {index}\"}}]}}}}\n"
+        ));
+    }
+    let plain_path = dir.path().join("budgeted.jsonl");
+    let archived_path = dir.path().join("budgeted.jsonl.zst");
+    fs::write(&plain_path, &plain).unwrap();
+    fs::write(
+        &archived_path,
+        zstd::stream::encode_all(plain.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+
+    let budget = RefreshBudget {
+        max_records: 256,
+        max_bytes: 256 * 1024,
+        max_millis: 100,
+    };
+    // Below the byte allowance, so a slice holds many records in both representations.
+    let max_record_bytes = 4096;
+    let drain = |path: &Path| -> (usize, usize, usize) {
+        let mut reader =
+            SourceReader::open(path, max_record_bytes).expect("open the synthetic source");
+        let mut slices = 0;
+        let mut expanded = 0;
+        let mut records = 0;
+        loop {
+            let batch = reader.step(budget).expect("bounded step");
+            assert!(
+                batch.expanded_bytes <= budget.max_bytes,
+                "one call expanded {} bytes of a {} byte history",
+                batch.expanded_bytes,
+                plain.len()
+            );
+            slices += 1;
+            expanded += batch.expanded_bytes;
+            records += batch.records.len();
+            if batch.done {
+                return (slices, expanded, records);
+            }
+            assert!(slices < 100_000, "no progress");
+        }
+    };
+
+    perf::reset();
+    let (slices, expanded, records) = drain(&archived_path);
+    let archived = perf::snapshot();
+    // The expansion is many slices, each within one call's allowance.
+    assert!(slices >= 20, "{slices} slices");
+    assert_eq!(expanded, plain.len());
+    assert_eq!(archived.records_parsed, 60_000);
+    assert_eq!(records, 60_000);
+
+    perf::reset();
+    let (plain_slices, plain_expanded, plain_records) = drain(&plain_path);
+    let plain_work = perf::snapshot();
+    assert!(plain_slices >= 20, "{plain_slices} slices");
+    assert_eq!(plain_expanded, plain.len());
+    assert_eq!(plain_records, records);
+    assert_eq!(plain_work.records_parsed, archived.records_parsed);
+    // A plain source reads exactly its own bytes; nothing is re-read.
+    assert_eq!(plain_work.bytes_read, plain.len() as u64);
+}
+
+/// B7: the integrated native world (125 roots, families, a zstd archive, a truncated
+/// archive, damaged and partial records) is discovered and hydrated in bounded calls.
+#[test]
+fn native_world_discovery_and_hydration_stay_within_each_call_budget() {
+    use support::world::{ROOT_COUNT, World};
+
+    let world = World::native();
+    let g = world.grown();
+    let record_cap = world.config().max_record_bytes;
+    let mut readers = world.readers();
+    let mut sessions = 0;
+    // Codex and Claude are file readers; the OpenCode database is covered by its own tests.
+    for reader in readers.iter_mut().take(2) {
+        let mut keys = Vec::new();
+        let mut calls = 0usize;
+        loop {
+            perf::reset();
+            let delta = reader.discover(NOW, CHUNK).expect("discover");
+            let used = perf::snapshot();
+            assert!(
+                used.bytes_read <= CHUNK.max_bytes as u64 + PROBE_MAX,
+                "call {calls} read {} bytes",
+                used.bytes_read
+            );
+            keys.extend(delta.sessions.into_iter().map(|m| m.key));
+            calls += 1;
+            if delta.scan.done {
+                break;
+            }
+            assert!(calls < 100_000, "discovery never finished");
+        }
+        keys.sort_by(agentscope::roster::cmp_keys);
+        keys.dedup();
+        for key in &keys {
+            let job = support::world::new_job();
+            let mut steps = 0usize;
+            loop {
+                perf::reset();
+                let delta = reader.hydrate(job, key, NOW, CHUNK).expect("hydrate");
+                let used = perf::snapshot();
+                assert!(
+                    used.bytes_read <= (CHUNK.max_bytes + record_cap + 1) as u64,
+                    "{} read {} bytes in one call",
+                    key.native_id,
+                    used.bytes_read
+                );
+                assert!(used.records_parsed <= CHUNK.max_records as u64);
+                steps += 1;
+                if delta.done {
+                    break;
+                }
+                assert!(
+                    steps < 100_000,
+                    "{} never finished hydrating",
+                    key.native_id
+                );
+            }
+        }
+        sessions += keys.len();
+    }
+    // Every Codex and Claude root and child was reached; OpenCode owns the rest.
+    let opencode = g
+        .roots
+        .iter()
+        .map(|(k, _)| k)
+        .chain(g.children.iter().map(|(k, _)| k))
+        .filter(|k| k.harness == Harness::OpenCode)
+        .count();
+    assert_eq!(sessions, ROOT_COUNT + g.children.len() - opencode);
 }

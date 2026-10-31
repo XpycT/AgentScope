@@ -1,7 +1,11 @@
+use std::path::Path;
 use std::time::Duration;
+
+mod support;
 
 use agentscope::domain::*;
 use agentscope::status::synthesize;
+use support::facts::{self, file_key, metadata};
 
 fn matched() -> ProcessAssociation {
     ProcessAssociation::Matched {
@@ -24,11 +28,7 @@ fn thresholds() -> Thresholds {
 }
 
 fn key() -> SessionKey {
-    SessionKey {
-        provider: Provider::Codex,
-        provider_session_id: "s".into(),
-        source: SourceKey::File("a".into()),
-    }
+    file_key(Harness::Codex, "s", Path::new("a"))
 }
 
 fn summary(
@@ -38,35 +38,18 @@ fn summary(
     unfinished: bool,
     source_available: bool,
 ) -> SessionSummary {
+    let mut meta = metadata(key(), "t");
+    meta.activity = ActivityStamp {
+        at: Some(last),
+        class: AggregationClass::Reported,
+    };
+    meta.source_available = source_available;
     SessionSummary {
-        key: key(),
-        title: "t".into(),
-        title_derived: false,
-        project: None,
-        cwd: None,
-        models: vec![],
-        model_details: vec![],
-        provider_version: None,
-        created_at: None,
         last_event_at: Some(last),
-        last_persisted_at: Some(last),
         last_completion: completion,
         unfinished_work: unfinished,
-        displayed_event_count: 0,
-        hidden_records: 0,
-        source_available,
-        archived: false,
-        context_window: None,
-        server_tools: None,
-        lifecycle: Lifecycle::Unknown,
         process,
-        usage: None,
-        lineage: Lineage {
-            parent: None,
-            fork: None,
-            sidechain: false,
-        },
-        warnings: vec![],
+        ..facts::summary(meta)
     }
 }
 
@@ -189,7 +172,7 @@ fn explicit_failure_and_cancel_win_over_process_state() {
         synthesize(&s, now, &thresholds()).label,
         StatusLabel::Cancelled
     );
-    s.source_available = false;
+    s.meta.source_available = false;
     assert_eq!(
         synthesize(&s, now, &thresholds()).label,
         StatusLabel::Unavailable
@@ -206,7 +189,7 @@ fn unmatched_quiet_and_unknown() {
     );
     let mut none = summary(unmatched(), 0, None, false, true);
     none.last_event_at = None;
-    none.last_persisted_at = None;
+    none.meta.activity.at = None;
     assert_eq!(
         synthesize(&none, now, &thresholds()).label,
         StatusLabel::Unknown
@@ -271,9 +254,9 @@ fn debug_does_not_leak_previews() {
     assert!(!format!("{text:?}").contains("SENTINEL_SECRET"));
     assert!(!format!("{text:#?}").contains("SENTINEL_SECRET"));
     let mut s = summary(unmatched(), 0, None, false, true);
-    s.title = "SENTINEL_TITLE".into();
-    s.cwd = Some("/SENTINEL_CWD".into());
-    s.project = Some("SENTINEL_PROJECT".into());
+    s.meta.title = "SENTINEL_TITLE".into();
+    s.meta.cwd = Some("/SENTINEL_CWD".into());
+    s.meta.project = Some("SENTINEL_PROJECT".into());
     let dbg = format!("{s:?}");
     assert!(!dbg.contains("SENTINEL"), "{dbg}");
 }

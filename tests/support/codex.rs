@@ -19,6 +19,66 @@ pub fn session_meta_with(ts: &str, extra: Value) -> String {
     record(ts, "session_meta", extra)
 }
 
+/// A spawned child's identity header: the child's own id, the root thread it
+/// belongs to, and the immediate parent's thread id.
+pub fn child_session_meta(
+    ts: &str,
+    id: &str,
+    root: &str,
+    parent: &str,
+    boundary: Option<u64>,
+    version: &str,
+) -> String {
+    let mut payload = json!({
+        "id": id,
+        "session_id": root,
+        "parent_thread_id": parent,
+        "cwd": "/p",
+        "originator": "codex_cli_rs",
+        "cli_version": version,
+        "thread_source": "subagent",
+        "history_mode": "paginated",
+        "source": {"subagent": {"thread_spawn": {
+            "parent_thread_id": parent,
+            "depth": 1,
+            "agent_nickname": id,
+            "agent_role": "explorer"
+        }}}
+    });
+    if let Some(boundary) = boundary {
+        payload["subagent_history_start_ordinal"] = json!(boundary);
+    }
+    record(ts, "session_meta", payload)
+}
+
+/// A guardian review thread: a recorded parent, a review role, no spawn.
+pub fn guardian_session_meta(ts: &str, id: &str, root: &str, parent: &str) -> String {
+    record(
+        ts,
+        "session_meta",
+        json!({
+            "id": id,
+            "session_id": root,
+            "parent_thread_id": parent,
+            "cwd": "/p",
+            "originator": "codex_cli_rs",
+            "cli_version": "0.159.2",
+            "thread_source": "guardian_review",
+            "history_mode": "paginated",
+            "source": {"subagent": {"other": "guardian"}}
+        }),
+    )
+}
+
+/// A usage record naming the thread that made the request.
+pub fn usage_record_thread(ts: &str, thread_id: &str, thread: Value) -> String {
+    record(
+        ts,
+        "token_usage_record",
+        json!({"thread_id": thread_id, "thread_token_usage": thread, "usage": thread}),
+    )
+}
+
 pub fn turn_context(ts: &str, model: &str, cwd: &str) -> String {
     record(ts, "turn_context", json!({"model": model, "cwd": cwd}))
 }

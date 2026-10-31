@@ -1,59 +1,31 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+mod support;
 
 use agentscope::domain::*;
 use agentscope::processes::{
     ProcessError, ProcessInfo, ProcessSnapshot, associate, association_from_observation,
     candidates, identity_matches, observe_processes,
 };
+use support::facts::{self, file_key, metadata};
 
 fn matches(program: &str, args: &[&str]) -> bool {
     let provider = match program {
-        "codex" => Provider::Codex,
-        "claude" => Provider::Claude,
-        _ => Provider::OpenCode,
+        "codex" => Harness::Codex,
+        "claude" => Harness::Claude,
+        _ => Harness::OpenCode,
     };
     let mut argv = vec![program];
     argv.extend_from_slice(args);
     identity_matches(provider, &argv, "01a1") || identity_matches(provider, &argv, "ses_01a1")
 }
 
-fn session(provider: Provider, id: &str, cwd: Option<&str>) -> SessionSummary {
-    SessionSummary {
-        key: SessionKey {
-            provider,
-            provider_session_id: id.into(),
-            source: SourceKey::File("a".into()),
-        },
-        title: "t".into(),
-        title_derived: false,
-        project: None,
-        cwd: cwd.map(PathBuf::from),
-        models: vec![],
-        model_details: vec![],
-        provider_version: None,
-        created_at: None,
-        last_event_at: None,
-        last_persisted_at: None,
-        last_completion: None,
-        unfinished_work: false,
-        displayed_event_count: 0,
-        hidden_records: 0,
-        source_available: true,
-        archived: false,
-        context_window: None,
-        server_tools: None,
-        lifecycle: Lifecycle::Unknown,
-        process: ProcessAssociation::NotChecked,
-        usage: None,
-        lineage: Lineage {
-            parent: None,
-            fork: None,
-            sidechain: false,
-        },
-        warnings: vec![],
-    }
+fn session(harness: Harness, id: &str, cwd: Option<&str>) -> SessionSummary {
+    let mut meta = metadata(file_key(harness, id, Path::new("a")), "t");
+    meta.cwd = cwd.map(PathBuf::from);
+    facts::summary(meta)
 }
 
 fn proc(pid: u32, exe: &str, cwd: Option<&str>, argv: Option<&[&str]>) -> ProcessInfo {
@@ -85,12 +57,12 @@ fn matches_only_identity_bearing_arguments() {
     assert!(matches("opencode", &["--session=ses_01a1"]));
     // Windows executable suffix and node wrapper.
     assert!(identity_matches(
-        Provider::Codex,
+        Harness::Codex,
         &["C:\\bin\\codex.exe", "resume", "01a1"],
         "01a1"
     ));
     assert!(identity_matches(
-        Provider::OpenCode,
+        Harness::OpenCode,
         &["node", "/x/bin/opencode", "-s", "ses_01a1"],
         "ses_01a1"
     ));
@@ -118,7 +90,7 @@ fn session_id_inside_prompt_or_reference_is_not_a_match() {
     // Right arguments but a different program must not match.
     assert!(!matches("node", &["resume", "01a1"]));
     assert!(!identity_matches(
-        Provider::Claude,
+        Harness::Claude,
         &["codex", "resume", "01a1"],
         "01a1"
     ));
@@ -126,7 +98,7 @@ fn session_id_inside_prompt_or_reference_is_not_a_match() {
 
 #[test]
 fn candidates_never_become_matched_by_name_or_cwd() {
-    let s = session(Provider::Codex, "01a1", Some("/work/proj"));
+    let s = session(Harness::Codex, "01a1", Some("/work/proj"));
     let snapshot = snap(vec![
         proc(10, "/usr/bin/codex", Some("/work/proj"), Some(&["codex"])),
         proc(
@@ -147,15 +119,41 @@ fn candidates_never_become_matched_by_name_or_cwd() {
         associate(&s, &snapshot),
         ProcessAssociation::Candidates { count: 2 }
     );
-    assert_eq!(candidates(Provider::Codex, &snapshot).len(), 2);
+    assert_eq!(candidates(Harness::Codex, &snapshot).len(), 2);
 
     let none = snap(vec![proc(13, "vim", Some("/work/proj"), Some(&["vim"]))]);
     assert_eq!(associate(&s, &none), ProcessAssociation::Unmatched);
 }
 
 #[test]
+fn new_harnesses_stay_candidates_until_an_identity_argument_is_supported() {
+    for (harness, exe) in [
+        (Harness::Omp, "omp"),
+        (Harness::Hermes, "hermes"),
+        (Harness::Pi, "pi"),
+    ] {
+        let s = session(harness, "s1", None);
+        for args in [
+            &["resume", "s1"][..],
+            &["--session", "s1"],
+            &["--resume", "s1"],
+        ] {
+            let mut argv = vec![exe];
+            argv.extend_from_slice(args);
+            assert!(!identity_matches(harness, &argv, "s1"), "{exe} {args:?}");
+        }
+        let snapshot = snap(vec![proc(20, exe, None, Some(&[exe, "--session", "s1"]))]);
+        assert_eq!(
+            associate(&s, &snapshot),
+            ProcessAssociation::Candidates { count: 1 },
+            "{exe}"
+        );
+    }
+}
+
+#[test]
 fn match_picks_oldest_process_and_reports_start_time() {
-    let s = session(Provider::Codex, "01a1", None);
+    let s = session(Harness::Codex, "01a1", None);
     let snapshot = snap(vec![
         proc(30, "codex", None, Some(&["codex", "resume", "01a1"])),
         proc(
@@ -176,7 +174,7 @@ fn match_picks_oldest_process_and_reports_start_time() {
 
 #[test]
 fn permission_failure_is_unavailable_not_not_found() {
-    let s = session(Provider::Codex, "01a1", None);
+    let s = session(Harness::Codex, "01a1", None);
     let failed: Result<ProcessSnapshot, ProcessError> = Err(ProcessError::Unavailable);
     assert_eq!(
         association_from_observation(&s, &failed),
@@ -242,12 +240,8 @@ fn observer_matches_spawned_binary_with_synthetic_session_id() {
         .spawn()
         .unwrap();
     let pid = child.id();
-    let s = session(Provider::Codex, id, None);
-    let other = session(
-        Provider::Codex,
-        "019d0000-ffff-7abc-8def-0123456789ab",
-        None,
-    );
+    let s = session(Harness::Codex, id, None);
+    let other = session(Harness::Codex, "019d0000-ffff-7abc-8def-0123456789ab", None);
     let deadline = Instant::now() + Duration::from_secs(20);
     let (mut got, mut got_other) = (
         ProcessAssociation::NotChecked,
@@ -293,17 +287,17 @@ fn option_values_never_carry_identity_flags() {
 fn runtime_script_must_be_the_provider_program() {
     let id = "ses_01a1";
     assert!(!identity_matches(
-        Provider::OpenCode,
+        Harness::OpenCode,
         &["node", "/tmp/other.js", "opencode", "--session", id],
         id
     ));
     assert!(!identity_matches(
-        Provider::OpenCode,
+        Harness::OpenCode,
         &["node", "-e", "x", "opencode", "--session", id],
         id
     ));
     assert!(identity_matches(
-        Provider::OpenCode,
+        Harness::OpenCode,
         &[
             "node",
             "--require",
@@ -315,12 +309,12 @@ fn runtime_script_must_be_the_provider_program() {
         id
     ));
     assert!(identity_matches(
-        Provider::OpenCode,
+        Harness::OpenCode,
         &["bun", "run", "/y/opencode", "-s", id],
         id
     ));
     // Such an invocation is still a visible candidate.
-    let s = session(Provider::OpenCode, id, None);
+    let s = session(Harness::OpenCode, id, None);
     let snapshot = snap(vec![proc(
         9,
         "node",
@@ -380,7 +374,7 @@ fn attached_eval_switches_are_not_scripts() {
     for ev in ["--eval=1", "--print=1", "-e1", "-pe", "-p"] {
         assert!(
             !identity_matches(
-                Provider::OpenCode,
+                Harness::OpenCode,
                 &[
                     "node",
                     "--require",

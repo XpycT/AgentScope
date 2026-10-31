@@ -1,7 +1,15 @@
+use agentscope::domain::{LocatorKind, RefreshBudget};
 use agentscope::ingest::jsonl::{JsonlCursor, Record};
+use agentscope::ingest::source::{SourceItem, SourceReader};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+
+const BIG: RefreshBudget = RefreshBudget {
+    max_records: 100_000,
+    max_bytes: 100_000_000,
+    max_millis: 60_000,
+};
 
 fn temp() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -237,4 +245,121 @@ fn oversized_line_without_terminator_reports_incomplete_after_draining() {
         }
     }
     assert!(cursor.next_record().unwrap().is_none());
+}
+
+/// The source reader frames exactly what the cursor frames, so plain rollouts keep
+/// their byte offsets and per-record behaviour through the shared line framer.
+#[test]
+fn source_reader_frames_what_the_plain_cursor_frames() {
+    const MAX: usize = 8;
+    let (_dir, path) = temp();
+    append(&path, b"{\"a\":1}\n");
+    append(&path, b"nope\n");
+    append(&path, b"0123456789012\n");
+    append(&path, b"{\"b\":2}\r\n");
+    append(&path, b"{\"tail");
+
+    let mut cursor = JsonlCursor::open(path.clone(), MAX).unwrap();
+    let mut expected = Vec::new();
+    let mut cursor_skips = 0usize;
+    loop {
+        match cursor.next_record().unwrap() {
+            Some(Record::Skipping { .. }) => cursor_skips += 1,
+            Some(Record::Json { offset, value }) => expected.push((offset, Item::Json(value))),
+            Some(Record::Invalid { offset }) => expected.push((offset, Item::Invalid)),
+            Some(Record::TooLarge { offset }) => expected.push((offset, Item::TooLarge)),
+            Some(Record::Incomplete { offset }) => expected.push((offset, Item::Incomplete)),
+            None => break,
+        }
+    }
+
+    let mut reader = SourceReader::open(&path, MAX).unwrap();
+    let mut actual = Vec::new();
+    let mut skips = 0usize;
+    loop {
+        let batch = reader.step(BIG).unwrap();
+        for record in batch.records {
+            let LocatorKind::FileOffset { path: file, offset } = record.locator else {
+                panic!("plain sources are addressed by byte offset");
+            };
+            assert_eq!(file, path);
+            match record.item {
+                SourceItem::Json(value) => actual.push((offset, Item::Json(value))),
+                SourceItem::Invalid => actual.push((offset, Item::Invalid)),
+                SourceItem::TooLarge => actual.push((offset, Item::TooLarge)),
+                SourceItem::Incomplete => actual.push((offset, Item::Incomplete)),
+                SourceItem::Skipping => skips += 1,
+                SourceItem::Damaged(damage) => panic!("plain source damaged: {damage}"),
+            }
+        }
+        if batch.done {
+            break;
+        }
+    }
+    assert_eq!(
+        skips, cursor_skips,
+        "both readers chunk the drain identically"
+    );
+    assert_eq!(actual, expected);
+    // Two records, one invalid line, one oversized line, and the partial tail.
+    assert_eq!(actual.len(), 5);
+}
+
+#[test]
+fn source_reader_appends_without_invalidation_and_reports_a_shrunk_source() {
+    let (_dir, path) = temp();
+    append(&path, b"{\"a\":1}\n");
+    let mut reader = SourceReader::open(&path, 1024).unwrap();
+    let first = reader.step(BIG).unwrap();
+    assert_eq!(first.records.len(), 1);
+    assert!(!first.invalidated);
+    assert!(first.done);
+
+    // Growth is not a replacement: the same generation continues at byte 8.
+    append(&path, b"{\"b\":2}\n");
+    let appended = reader.step(BIG).unwrap();
+    assert!(!appended.invalidated);
+    assert_eq!(appended.records[0].ordinal, 1);
+    assert!(matches!(
+        &appended.records[0].locator,
+        LocatorKind::FileOffset { offset: 8, .. }
+    ));
+
+    // A shrink restarts the cursor and starts a new generation.
+    fs::write(&path, b"{\"c\":3}\n").unwrap();
+    let replaced = reader.step(BIG).unwrap();
+    assert!(replaced.invalidated);
+    assert_eq!(replaced.records[0].generation, 1);
+    assert_eq!(replaced.records[0].ordinal, 0);
+    assert_eq!(reader.generation(), 1);
+}
+
+enum Item {
+    Json(serde_json::Value),
+    Invalid,
+    TooLarge,
+    Incomplete,
+}
+
+impl PartialEq for Item {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Json(a), Self::Json(b)) => a == b,
+            (Self::Invalid, Self::Invalid)
+            | (Self::TooLarge, Self::TooLarge)
+            | (Self::Incomplete, Self::Incomplete) => true,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for Item {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json(_) => f.write_str("Json"),
+            Self::Invalid => f.write_str("Invalid"),
+            Self::TooLarge => f.write_str("TooLarge"),
+            Self::Incomplete => f.write_str("Incomplete"),
+        }
+    }
 }

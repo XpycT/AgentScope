@@ -5,11 +5,11 @@ use std::fs;
 use std::path::Path;
 
 use agentscope::domain::{
-    Provider, RefreshBudget, SessionKey, SessionLink, SessionSummary, SourceKey, Warning,
+    Harness, RefreshBudget, SessionKey, SessionLink, SessionSummary, SourceKey, Warning,
     WarningKind,
 };
-use agentscope::providers::ProviderError;
 use agentscope::providers::opencode::{OpenCodeScanner, Schema, detect_schema, open_read_only};
+use agentscope::providers::{ProviderError, ProviderReader};
 use support::NOW;
 use support::opencode::*;
 
@@ -32,9 +32,9 @@ fn scan(scanner: &mut OpenCodeScanner, budget: RefreshBudget) -> Scan {
         warnings: vec![],
     };
     loop {
-        let delta = scanner.scan_roster(NOW, budget).expect("scan");
+        let delta = support::world::rescan(scanner, NOW, budget);
         for s in delta.sessions {
-            out.sessions.insert(s.key.provider_session_id.clone(), s);
+            out.sessions.insert(s.meta.key.native_id.clone(), s);
         }
         out.removed.extend(delta.removed);
         out.warnings.extend(delta.warnings);
@@ -85,14 +85,20 @@ fn opens_read_only_with_authorizer_and_rejects_sensitive_tables() {
         .query_row("SELECT id FROM session_v2", [], |r| r.get(0))
         .expect("allowed select");
     assert_eq!(id, "ses_1");
+    let agent: Option<String> = conn
+        .query_row("SELECT agent FROM session_v2", [], |r| r.get(0))
+        .expect("allowed agent select");
+    assert_eq!(agent, None);
 
-    // Sensitive tables, share URLs, message content, schema writes and pragmas are denied.
+    // Sensitive tables, share URLs, non-allowlisted columns, message content, schema
+    // writes and pragmas are denied.
     for sql in [
         "SELECT * FROM account",
         "SELECT secret FROM control_account",
         "SELECT secret FROM credential",
         "SELECT share_url FROM session_share",
         "SELECT share_url FROM session_v2",
+        "SELECT metadata FROM session_v2",
         "SELECT * FROM session_v2",
         "SELECT seq FROM session_message",
         "INSERT INTO project(id, name) VALUES ('x', 'y')",
@@ -197,7 +203,7 @@ fn selects_v2_then_legacy_then_unsupported() {
     assert!(
         out.warnings
             .iter()
-            .any(|w| w.key.kind == WarningKind::Unsupported && w.key.provider == Provider::OpenCode)
+            .any(|w| w.key.kind == WarningKind::Unsupported && w.key.harness == Harness::OpenCode)
     );
 }
 
@@ -239,15 +245,16 @@ fn legacy_fallback_when_v2_is_empty_warns() {
     let out = scan(&mut scanner_for(&db), BIG);
     let s = &out.sessions["old"];
     assert_eq!(
-        s.key.source,
+        s.meta.key.source,
         SourceKey::DbRow {
+            database: db.clone(),
             table: "session".into(),
             id: "old".into()
         }
     );
-    assert_eq!(s.last_persisted_at, Some(30));
+    assert_eq!(s.meta.activity.at, Some(30));
     assert!(
-        matches!(&s.lineage.parent, Some(SessionLink::Resolved(k)) if k.provider_session_id == "older")
+        matches!(&s.meta.lineage.parent, Some(SessionLink::Resolved(k)) if k.native_id == "older")
     );
     assert!(
         out.warnings
@@ -284,62 +291,63 @@ fn maps_title_directory_model_lineage_archived_and_time_updated() {
     assert_eq!(out.sessions.len(), 2);
 
     let p = &out.sessions["ses_parent"];
-    assert_eq!(p.key.provider, Provider::OpenCode);
+    assert_eq!(p.meta.key.harness, Harness::OpenCode);
     assert_eq!(
-        p.key.source,
+        p.meta.key.source,
         SourceKey::DbRow {
+            database: db.clone(),
             table: "session_v2".into(),
             id: "ses_parent".into()
         }
     );
-    assert_eq!(p.title, "Parent title");
-    assert!(!p.title_derived);
-    assert_eq!(p.cwd.as_deref(), Some(Path::new("/work/alpha")));
-    assert_eq!(p.project.as_deref(), Some("Project One"));
-    assert_eq!(p.models, vec!["gpt-5".to_string()]);
-    assert_eq!(p.provider_version.as_deref(), Some("2.0.29"));
-    assert_eq!(p.created_at, Some(100));
+    assert_eq!(p.meta.title, "Parent title");
+    assert!(!p.meta.title_derived);
+    assert_eq!(p.meta.cwd.as_deref(), Some(Path::new("/work/alpha")));
+    assert_eq!(p.meta.project.as_deref(), Some("Project One"));
+    assert_eq!(p.meta.model.as_ref().map(|m| m.id.as_str()), Some("gpt-5"));
+    assert_eq!(p.meta.harness_version.as_deref(), Some("2.0.29"));
+    assert_eq!(p.meta.created_at, Some(100));
     assert_eq!(
-        p.last_persisted_at,
+        p.meta.activity.at,
         Some(900),
         "stale session row uses newest message time_updated"
     );
-    assert!(!p.archived);
-    assert!(p.source_available);
-    assert!(p.lineage.parent.is_none() && p.lineage.fork.is_none());
+    assert!(!p.meta.archived);
+    assert!(p.meta.source_available);
+    assert!(p.meta.lineage.parent.is_none() && p.meta.lineage.fork.is_none());
     assert!(p.usage.is_none());
 
     let c = &out.sessions["ses_child"];
     assert_eq!(
-        c.title, "ses_child",
+        c.meta.title, "ses_child",
         "no provider title falls back to the session id"
     );
     assert_eq!(
-        c.project.as_deref(),
+        c.meta.project.as_deref(),
         Some("beta-dir"),
         "project falls back to the directory basename"
     );
-    assert!(c.archived);
-    assert_eq!(c.last_persisted_at, Some(300));
-    assert!(c.models.is_empty());
-    match &c.lineage.parent {
+    assert!(c.meta.archived);
+    assert_eq!(c.meta.activity.at, Some(300));
+    assert!(c.meta.model.is_none());
+    match &c.meta.lineage.parent {
         Some(SessionLink::Resolved(k)) => {
-            assert_eq!(k, &p.key);
+            assert_eq!(k, &p.meta.key);
         }
         other => panic!("parent: {other:?}"),
     }
     assert_eq!(
-        c.lineage.fork,
+        c.meta.lineage.fork,
         Some(SessionLink::Unresolved("ses_ghost".into()))
     );
-    assert!(!c.lineage.sidechain);
+    assert!(!c.meta.lineage.sidechain);
 
     // Sensitive text never reaches the roster.
     let dump = format!(
         "{:?}",
         out.sessions
             .values()
-            .map(|s| (&s.title, &s.project, &s.warnings))
+            .map(|s| (&s.meta.title, &s.meta.project, &s.warnings))
             .collect::<Vec<_>>()
     );
     assert!(!dump.contains("SECRET"));
@@ -354,7 +362,7 @@ fn in_place_message_update_advances_last_persisted_at() {
     insert_message(&writer, "m", "s", 110, 120);
     let mut scanner = scanner_for(&db);
     let first = scan(&mut scanner, BIG);
-    assert_eq!(first.sessions["s"].last_persisted_at, Some(200));
+    assert_eq!(first.sessions["s"].meta.activity.at, Some(200));
 
     // Unchanged database: nothing is re-emitted.
     assert!(scan(&mut scanner, BIG).sessions.is_empty());
@@ -367,14 +375,14 @@ fn in_place_message_update_advances_last_persisted_at() {
         )
         .unwrap();
     let second = scan(&mut scanner, BIG);
-    assert_eq!(second.sessions["s"].last_persisted_at, Some(5000));
+    assert_eq!(second.sessions["s"].meta.activity.at, Some(5000));
     assert!(second.removed.is_empty());
 
     // Rows disappearing are reported as removed once a pass completes.
     writer.execute("DELETE FROM session_v2", []).unwrap();
     let third = scan(&mut scanner, BIG);
     assert_eq!(third.removed.len(), 1);
-    assert_eq!(third.removed[0].provider_session_id, "s");
+    assert_eq!(third.removed[0].native_id, "s");
 }
 
 #[test]
@@ -419,10 +427,10 @@ fn roster_pages_within_budget_and_honours_session_cap() {
     let mut calls = 0;
     let mut ids = vec![];
     loop {
-        let d = scanner.scan_roster(NOW, small).unwrap();
+        let d = scanner.discover(NOW, small).unwrap();
         calls += 1;
         assert!(d.sessions.len() <= 2);
-        ids.extend(d.sessions.iter().map(|s| s.key.provider_session_id.clone()));
+        ids.extend(d.sessions.iter().map(|s| s.key.native_id.clone()));
         if d.scan.done {
             break;
         }
@@ -447,7 +455,7 @@ fn live_writer_with_existing_shm_sees_wal_only_rows() {
 
     let out = scan(&mut scanner_for(&db), BIG);
     assert!(out.sessions.contains_key("wal_only"));
-    assert!(out.sessions["wal_only"].source_available);
+    assert!(out.sessions["wal_only"].meta.source_available);
     assert_eq!(file_bytes(&db), main_before, "main database untouched");
 
     // The live writer keeps working while the reader is open.
@@ -582,21 +590,79 @@ fn model_keeps_id_for_pricing_and_provider_variant_for_display() {
         let model = model_json("gpt-5", "openai", "high");
         let mut s = Session::new("a", 1, 3);
         s.model = Some(&model);
+        s.agent = Some("build");
         insert_session(&w, &s);
         let mut bare = Session::new("b", 1, 2);
         bare.model = Some("plain-model");
         insert_session(&w, &bare);
+        // A variant that is not an observed thinking level stays raw, never effort.
+        let default = model_json("gpt-5", "openai", "default");
+        let mut d = Session::new("d", 1, 4);
+        d.model = Some(&default);
+        insert_session(&w, &d);
+        // A custom/unknown model may reuse an effort-looking variant for something
+        // else: the raw value stays, effort is Unknown.
+        let custom = model_json("my-custom-model", "openai", "high");
+        let mut c = Session::new("c", 1, 6);
+        c.model = Some(&custom);
+        insert_session(&w, &c);
+        // No provider: Unknown route, never a default vendor or effort.
+        let unrecorded = model_json("gpt-5", "", "high");
+        let mut u = Session::new("u", 1, 5);
+        u.model = Some(&unrecorded);
+        insert_session(&w, &u);
     }
     let out = scan(&mut scanner_for(&db), BIG);
     let a = &out.sessions["a"];
-    assert_eq!(a.models, vec!["gpt-5".to_string()]);
-    assert_eq!(a.model_details.len(), 1);
-    assert_eq!(a.model_details[0].id, "gpt-5");
-    assert_eq!(a.model_details[0].provider.as_deref(), Some("openai"));
-    assert_eq!(a.model_details[0].variant.as_deref(), Some("high"));
+    assert_eq!(a.meta.model.as_ref().map(|m| m.id.as_str()), Some("gpt-5"));
+    assert_eq!(a.meta.model.as_ref().unwrap().id, "gpt-5");
+    assert_eq!(
+        a.meta.model.as_ref().unwrap().provider.as_deref(),
+        Some("openai")
+    );
+    assert_eq!(
+        a.meta.model.as_ref().unwrap().variant.as_deref(),
+        Some("high"),
+        "the raw variant is retained"
+    );
+    assert_eq!(
+        a.meta.model.as_ref().unwrap().effort.as_deref(),
+        Some("high"),
+        "an observed thinking level is also an effort"
+    );
+    assert_eq!(a.meta.lineage.agent_type.as_deref(), Some("build"));
     let b = &out.sessions["b"];
-    assert_eq!(b.models, vec!["plain-model".to_string()]);
-    assert_eq!(b.model_details[0].provider, None);
+    assert_eq!(
+        b.meta.model.as_ref().map(|m| m.id.as_str()),
+        Some("plain-model")
+    );
+    assert_eq!(b.meta.model.as_ref().unwrap().provider, None);
+    assert_eq!(b.meta.model.as_ref().unwrap().effort, None);
+    let d = &out.sessions["d"];
+    assert_eq!(
+        d.meta.model.as_ref().unwrap().variant.as_deref(),
+        Some("default"),
+        "an unrecognized variant is never promoted to effort"
+    );
+    assert_eq!(d.meta.model.as_ref().unwrap().effort, None);
+    let c = &out.sessions["c"];
+    assert_eq!(
+        c.meta.model.as_ref().unwrap().variant.as_deref(),
+        Some("high"),
+        "a custom model's raw variant is retained"
+    );
+    assert_eq!(
+        c.meta.model.as_ref().unwrap().effort,
+        None,
+        "an unknown model route never promotes a variant to effort"
+    );
+    let u = &out.sessions["u"];
+    assert_eq!(u.meta.model.as_ref().unwrap().provider, None);
+    assert_eq!(
+        u.meta.model.as_ref().unwrap().variant.as_deref(),
+        Some("high")
+    );
+    assert_eq!(u.meta.model.as_ref().unwrap().effort, None);
 }
 
 #[test]
@@ -607,28 +673,19 @@ fn cap_displaced_sessions_are_evicted_across_refreshes() {
     insert_session(&writer, &Session::new("a", 1, 10));
     insert_session(&writer, &Session::new("b", 1, 20));
     let mut cfg = config_for_db(&db);
-    cfg.max_sessions = 2;
+    cfg.max_cached_sessions = 2;
     let mut scanner = OpenCodeScanner::new(&cfg).unwrap();
     let first = scan(&mut scanner, BIG);
     assert_eq!(first.sessions.len(), 2);
     assert!(first.removed.is_empty());
 
-    // A newer session displaces the oldest; it still exists but leaves the roster.
+    // Metadata is not capped by the detail cache: the new session is listed and
+    // nothing is displaced.
     insert_session(&writer, &Session::new("c", 1, 30));
     let second = scan(&mut scanner, BIG);
     assert!(second.sessions.contains_key("c"));
-    let removed: Vec<_> = second
-        .removed
-        .iter()
-        .map(|k| k.provider_session_id.as_str())
-        .collect();
-    assert_eq!(removed, ["a"]);
-    assert!(
-        second
-            .warnings
-            .iter()
-            .any(|w| w.count == 1 && w.message.contains("max_sessions"))
-    );
+    assert!(second.removed.is_empty());
+    assert!(scanner.cached_sessions() <= 2);
 
     // Retained set stays at the cap and is stable.
     let third = scan(&mut scanner, BIG);
@@ -640,12 +697,8 @@ fn cap_displaced_sessions_are_evicted_across_refreshes() {
         .unwrap();
     let fourth = scan(&mut scanner, BIG);
     assert!(fourth.sessions.contains_key("a"));
-    let removed: Vec<_> = fourth
-        .removed
-        .iter()
-        .map(|k| k.provider_session_id.as_str())
-        .collect();
-    assert_eq!(removed, ["b"]);
+    assert!(fourth.removed.is_empty(), "no session is ever displaced");
+    assert!(scanner.cached_sessions() <= 2);
 }
 
 fn seeded(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -678,7 +731,7 @@ fn exhausted_record_byte_and_time_budgets_read_nothing_and_never_finish() {
         },
     ] {
         let mut scanner = scanner_for(&db);
-        let d = scanner.scan_roster(NOW, budget).unwrap();
+        let d = scanner.discover(NOW, budget).unwrap();
         assert!(d.sessions.is_empty(), "{budget:?}");
         assert!(!d.scan.done, "{budget:?}");
         assert_eq!(d.scan.scanned, 0);
@@ -699,11 +752,10 @@ fn byte_budget_bounds_a_page_but_always_progresses() {
     let mut calls = 0;
     let mut seen = 0;
     loop {
-        let d = scanner.scan_roster(NOW, tiny).unwrap();
+        let d = scanner.discover(NOW, tiny).unwrap();
         calls += 1;
-        assert_eq!(
-            d.sessions.len(),
-            1,
+        assert!(
+            d.sessions.len() <= 1,
             "one row per call under a 1-byte budget"
         );
         seen += d.sessions.len();
@@ -729,8 +781,8 @@ fn oversized_text_columns_are_bounded_at_the_query() {
     }
     let out = scan(&mut scanner_for(&db), BIG);
     let s = &out.sessions["big"];
-    assert!(s.title.len() <= 1024, "title {}", s.title.len());
-    assert!(s.cwd.as_ref().unwrap().as_os_str().len() <= 4096);
+    assert!(s.meta.title.len() <= 1024, "title {}", s.meta.title.len());
+    assert!(s.meta.cwd.as_ref().unwrap().as_os_str().len() <= 4096);
 }
 
 /// Column names verified read-only (schema only, no row content) against a local
@@ -769,7 +821,13 @@ CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT, se
     );
     let out = scan(&mut scanner_for(&db), BIG);
     assert_eq!(
-        out.sessions["s"].model_details[0].provider.as_deref(),
+        out.sessions["s"]
+            .meta
+            .model
+            .as_ref()
+            .unwrap()
+            .provider
+            .as_deref(),
         Some("p")
     );
 }
@@ -833,22 +891,21 @@ fn long_ids_sharing_a_prefix_stay_distinct_and_page_correctly() {
     };
     let mut seen = vec![];
     loop {
-        let d = scanner.scan_roster(NOW, one).unwrap();
-        seen.extend(d.sessions.into_iter().map(|s| s.key));
+        let d = support::world::rescan(&mut scanner, NOW, one);
+        seen.extend(d.sessions.into_iter().map(|s| s.meta.key));
         if d.scan.done {
             break;
         }
     }
     assert_eq!(seen.len(), 5, "no collision, no skipped row");
-    let got: std::collections::HashSet<_> =
-        seen.iter().map(|k| k.provider_session_id.clone()).collect();
+    let got: std::collections::HashSet<_> = seen.iter().map(|k| k.native_id.clone()).collect();
     assert_eq!(got.len(), 5);
     for id in &ids {
         assert!(got.contains(id), "exact id preserved");
     }
     let out = scan(&mut scanner_for(&db), BIG);
-    match &out.sessions["child"].lineage.parent {
-        Some(SessionLink::Resolved(k)) => assert_eq!(k.provider_session_id, ids[2]),
+    match &out.sessions["child"].meta.lineage.parent {
+        Some(SessionLink::Resolved(k)) => assert_eq!(k.native_id, ids[2]),
         other => panic!("{other:?}"),
     }
 }
@@ -895,9 +952,293 @@ fn long_model_json_is_whole_or_unknown_never_a_fragment() {
     }
     let out = scan(&mut scanner_for(&db), BIG);
     let a = &out.sessions["a"];
-    assert_eq!(a.models, vec!["gpt-5".to_string()]);
-    assert_eq!(a.model_details[0].provider.as_deref(), Some("openai"));
-    assert!(a.model_details[0].variant.as_ref().unwrap().len() <= 1024);
-    assert!(out.sessions["b"].models.is_empty());
-    assert!(out.sessions["c"].models.is_empty());
+    assert_eq!(a.meta.model.as_ref().map(|m| m.id.as_str()), Some("gpt-5"));
+    assert_eq!(
+        a.meta.model.as_ref().unwrap().provider.as_deref(),
+        Some("openai")
+    );
+    assert!(
+        a.meta
+            .model
+            .as_ref()
+            .unwrap()
+            .variant
+            .as_ref()
+            .unwrap()
+            .len()
+            <= 1024
+    );
+    assert!(out.sessions["b"].meta.model.is_none());
+    assert!(out.sessions["c"].meta.model.is_none());
+}
+
+/// Live-WAL smoke through the real adapter, app state and renderer: parent/nested
+/// expansion facts, provider below harness, effort below model, and a confirmed
+/// tool link opening the nested child.
+#[test]
+fn live_wal_family_provider_effort_and_confirmed_link_smoke() {
+    use agentscope::app::App;
+    use agentscope::domain::Thresholds;
+    use agentscope::ui::{RosterContext, render};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::time::Duration;
+
+    let dir = tmp();
+    let db = dir.path().join("opencode.db");
+    let writer = create_v2(&db); // WAL, autocheckpoint off, writer kept open.
+    let model = model_json("gpt-5", "openai", "high");
+    {
+        let mut parent = Session::new("ses_parent", 100, 900);
+        parent.model = Some(&model);
+        parent.agent = Some("build");
+        parent.tokens = Some([1_000, 400, 0, 0, 0]);
+        parent.cost = Some(0.25);
+        insert_session(&writer, &parent);
+        let mut child = Session::new("ses_nested", 150, 500);
+        child.parent_id = Some("ses_parent");
+        child.tokens = Some([200, 80, 0, 0, 0]);
+        child.cost = Some(0.05);
+        insert_session(&writer, &child);
+        let mut fork = Session::new("ses_fork", 300, 700);
+        fork.fork_id = Some("ses_parent");
+        fork.tokens = Some([30, 5, 0, 0, 0]);
+        fork.cost = Some(0.002);
+        insert_session(&writer, &fork);
+        writer
+            .execute(
+                "INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
+                 VALUES ('m1', 'ses_parent', 'assistant', 0, 110, 110, ?1)",
+                [serde_json::json!({
+                    "content": [{
+                        "type": "tool",
+                        "id": "c1",
+                        "name": "subagent",
+                        "state": {
+                            "status": "completed",
+                            "input": {"agent": "explore"},
+                            "content": [{"type": "text", "text": "done"}],
+                            "metadata": {"sessionID": "ses_nested"}
+                        }
+                    }],
+                    "model": {"id": "gpt-5", "providerID": "openai", "variant": "high"}
+                })
+                .to_string()],
+            )
+            .expect("tool message");
+    }
+
+    let mut config = config_for_db(&db);
+    config.process_enabled = false;
+    let mut scanner = OpenCodeScanner::new(&config).unwrap();
+    let sessions = scan(&mut scanner, BIG).sessions;
+    assert_eq!(sessions.len(), 3);
+
+    // Direct facts remain separate; the fork is a root with its reset counters.
+    assert_eq!(
+        sessions["ses_parent"].usage.as_ref().unwrap().total,
+        Some(1_400)
+    );
+    assert_eq!(
+        sessions["ses_nested"].usage.as_ref().unwrap().total,
+        Some(280)
+    );
+    assert_eq!(sessions["ses_fork"].usage.as_ref().unwrap().total, Some(35));
+    assert!(sessions["ses_fork"].meta.lineage.parent.is_none());
+
+    // The v2 tool shape confirms the nested child; the app resolves it.
+    let parent = &sessions["ses_parent"];
+    let nested = &sessions["ses_nested"];
+    let page = support::world::try_transcript(
+        &mut scanner,
+        &parent.meta.key,
+        None,
+        agentscope::domain::PageDirection::Forward,
+        support::world::PAGE,
+        BIG,
+        support::world::STEPS,
+    )
+    .expect("parent transcript");
+    let tool = page
+        .events
+        .iter()
+        .find_map(|e| e.tool.as_ref())
+        .expect("tool event");
+    assert_eq!(
+        tool.child_session,
+        Some(SessionLink::Unresolved("ses_nested".into()))
+    );
+
+    let now = support::NOW;
+    let mut app = App::new(
+        now,
+        Thresholds {
+            quiet: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+        },
+    );
+    app.apply_roster(sessions.values().cloned().collect(), vec![]);
+    assert_eq!(app.total_sessions(), 3);
+    assert_eq!(
+        app.resolved_tool_child(&parent.meta.key, tool),
+        Some(SessionLink::Resolved(nested.meta.key.clone()))
+    );
+    assert!(app.session(&nested.meta.key).is_some());
+
+    // Open the parent, load its transcript through the app's request, and inspect
+    // the details screen that carries the confirmed link.
+    while app.selected_key().as_ref() != Some(&parent.meta.key) {
+        assert!(app.selected_index().is_some());
+        app.move_selection(1);
+    }
+    assert!(app.open_inspector());
+    let request_id = app
+        .take_requests()
+        .iter()
+        .find_map(|r| match r {
+            agentscope::worker::WorkerRequest::Select { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .expect("select request");
+    assert!(app.apply_transcript(request_id, page));
+    let ctx = RosterContext {
+        no_color: true,
+        ..RosterContext::default()
+    };
+    let draw = |app: &App| {
+        let mut t = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        t.draw(|f| render(f, app, &ctx)).unwrap();
+        t.backend()
+            .buffer()
+            .content()
+            .chunks(160)
+            .map(|r| r.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // Session info first: provider below harness, effort below model.
+    assert!(app.open_session_info());
+    let info = draw(&app);
+    assert_eq!(
+        app.resolved_parent(&nested.meta.key),
+        Some(SessionLink::Resolved(parent.meta.key.clone()))
+    );
+    for needle in [
+        "Provider: OpenCode",
+        "Billing provider: openai",
+        "Model: gpt-5",
+        "Effort: high",
+        "Agent: build",
+    ] {
+        assert!(info.contains(needle), "missing {needle:?}:\n{info}");
+    }
+    // Provider sits below the harness; effort sits below the model.
+    let provider_at = info.find("Provider: OpenCode").unwrap();
+    let billing_at = info.find("Billing provider: openai").unwrap();
+    let model_at = info.find("Model: gpt-5").unwrap();
+    let effort_at = info.find("Effort: high").unwrap();
+    assert!(provider_at < billing_at && billing_at < model_at && model_at < effort_at);
+
+    // Details shows the confirmed link; `o` opens the child session rather than
+    // leaving the parent transcript on screen.
+    app.close_overlay();
+    assert!(app.open_details());
+    let details = draw(&app);
+    assert!(
+        details.contains("Child session: resolved — OpenCode ses_nested"),
+        "confirmed link is visible:\n{details}"
+    );
+    agentscope::ui::handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::NONE,
+        ),
+    );
+    assert_eq!(app.screen, agentscope::app::Screen::Inspector);
+    assert_eq!(app.selected_key().as_ref(), Some(&nested.meta.key));
+    assert_eq!(app.transcript().unwrap().key(), &nested.meta.key);
+    assert!(
+        app.take_requests().iter().any(|r| matches!(
+            r,
+            agentscope::worker::WorkerRequest::Select { key, .. } if key == &nested.meta.key
+        )),
+        "the child transcript is requested"
+    );
+
+    // A schema-changing live source keeps valid sessions readable: an unrelated
+    // future column and a new row appear after the scanner already ran.
+    writer
+        .execute("ALTER TABLE session_v2 ADD COLUMN future_note TEXT", [])
+        .unwrap();
+    writer
+        .execute(
+            "UPDATE session_v2 SET future_note = 'ignored' WHERE id = 'ses_parent'",
+            [],
+        )
+        .unwrap();
+    insert_session(&writer, &Session::new("ses_later", 400, 950));
+    let refreshed = scan(&mut scanner, BIG).sessions;
+    assert!(refreshed.contains_key("ses_later"));
+    let parent_after = support::world::hydrate_complete(&mut scanner, &parent.meta.key, now);
+    assert_eq!(
+        parent_after.usage.as_ref().unwrap().total,
+        Some(1_400),
+        "an extra column does not disturb an existing row"
+    );
+}
+
+#[test]
+fn user_price_overrides_never_authorize_effort_inference() {
+    use agentscope::pricing::{PriceCard, PriceOverride, PriceSchedule, Rates};
+
+    let dir = tmp();
+    let db = dir.path().join("opencode.db");
+    {
+        let w = create_v2(&db);
+        let custom = model_json("my-custom-model", "openai", "high");
+        let mut c = Session::new("custom", 1, 3);
+        c.model = Some(&custom);
+        insert_session(&w, &c);
+        let bundled = model_json("gpt-5", "openai", "high");
+        let mut b = Session::new("bundled", 1, 2);
+        b.model = Some(&bundled);
+        insert_session(&w, &b);
+    }
+    // A user-configured price for the unknown model must not become model-format
+    // evidence: raw variant stays, effort remains Unknown.
+    let schedule = PriceSchedule::bundled()
+        .expect("bundled catalog")
+        .with_overrides(vec![PriceOverride {
+            card: PriceCard::new(
+                "openai",
+                "my-custom-model",
+                Rates {
+                    input: Some(1.0),
+                    output: Some(2.0),
+                    ..Rates::default()
+                },
+            ),
+        }])
+        .expect("user price override");
+    let mut config = config_for_db(&db);
+    config.pricing = schedule;
+    let mut scanner = OpenCodeScanner::new(&config).expect("scanner");
+    let out = scan(&mut scanner, BIG);
+
+    let custom = out.sessions["custom"].meta.model.as_ref().unwrap();
+    assert_eq!(custom.variant.as_deref(), Some("high"), "raw variant kept");
+    assert_eq!(
+        custom.effort, None,
+        "a user price entry is not capability evidence"
+    );
+    assert_eq!(custom.provider.as_deref(), Some("openai"));
+
+    let bundled = out.sessions["bundled"].meta.model.as_ref().unwrap();
+    assert_eq!(bundled.variant.as_deref(), Some("high"));
+    assert_eq!(
+        bundled.effort.as_deref(),
+        Some("high"),
+        "a bundled evidenced route still maps"
+    );
 }

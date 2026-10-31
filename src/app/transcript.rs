@@ -121,6 +121,11 @@ pub struct Transcript {
     reload_capped: bool,
     /// Summary at the last probe; a different summary triggers a new count.
     probed: Option<SessionSummary>,
+    /// Event id a restarted transcript should return to when it is still present
+    /// in the re-read history. Opening a different session does not set it.
+    resume: Option<String>,
+    /// Events scanned while chasing `resume`; recovery is bounded by the window cap.
+    resume_scanned: usize,
     /// True once any page has been applied.
     loaded: bool,
     search: TranscriptSearch,
@@ -147,6 +152,8 @@ impl Transcript {
             latest_total: probed.as_ref().map_or(0, |s| s.displayed_event_count),
             reload_capped: false,
             probed,
+            resume: None,
+            resume_scanned: 0,
             loaded: false,
             search: TranscriptSearch::default(),
         }
@@ -234,10 +241,14 @@ impl Transcript {
         self.new_events
     }
 
-    /// Carry user-visible state (expansion) over to a replacement transcript.
+    /// Carry user-visible state (expansion) and the reading position over to a
+    /// replacement transcript. The event identity is resolved after the newest
+    /// page arrives; when it moved beyond the window it is chased backward.
     pub(super) fn carry_over(&mut self, previous: &Transcript) {
         self.expanded = previous.expanded.clone();
         self.search.set_query(previous.search.query());
+        self.resume = previous.selected_event().map(|e| e.id.clone());
+        self.resume_scanned = 0;
     }
 
     /// The active transcript search query (empty when none).
@@ -306,7 +317,9 @@ impl Transcript {
     }
 
     pub(super) fn select_request(&mut self, request_id: u64) -> WorkerRequest {
-        self.begin(request_id, PageKind::Initial);
+        // Opening a transcript starts at its newest entry; `Select` loads the
+        // newest page backward from the tail.
+        self.begin(request_id, PageKind::Tail);
         WorkerRequest::Select {
             request_id,
             key: self.key.clone(),
@@ -379,8 +392,15 @@ impl Transcript {
         }
         let kind = self.failed?;
         match kind {
-            PageKind::Initial => Some(self.select_request(request_id)),
-            PageKind::Tail => Some(self.tail_request(request_id)),
+            PageKind::Initial | PageKind::Tail => {
+                // Selecting again re-establishes both the worker selection and
+                // the newest page load.
+                self.begin(request_id, PageKind::Tail);
+                Some(WorkerRequest::Select {
+                    request_id,
+                    key: self.key.clone(),
+                })
+            }
             // The reading position was out of reach: the user's retry is an
             // explicit jump to the newest page.
             PageKind::Reload if self.reload_capped => Some(self.tail_request(request_id)),
@@ -420,6 +440,51 @@ impl Transcript {
         }
     }
 
+    /// After a fresh tail load, return to the event a restarted transcript was
+    /// reading. If it is older than the window, `next_load` walks backward.
+    fn resume_selection(&mut self) {
+        let Some(id) = self.resume.clone() else {
+            return;
+        };
+        if let Some(i) = self.index_of(&id) {
+            self.selected = i;
+            self.resume = None;
+        } else if self.older.is_none() {
+            // The event no longer exists in the re-read history.
+            self.resume = None;
+        }
+    }
+
+    /// While chasing a restart anchor, replace the window with each older page
+    /// instead of prepending it. The newest events are not needed on the way to
+    /// an older reading position, and discarding them keeps recovery within the
+    /// window cap instead of retaining the whole history.
+    fn recover_older(&mut self, page: TranscriptPage, continuation: Option<PageAnchor>) {
+        self.resume_scanned = self.resume_scanned.saturating_add(page.events.len());
+        // Forward pages are exclusive: continue from the retained page's last
+        // event so the next forward page starts with the discarded window's first
+        // event, not after it.
+        let newer = page.events.last().map(anchor_of_event);
+        self.replace(page, PageDirection::Backward);
+        self.older = continuation;
+        self.newer = newer;
+        self.selected = self.events.len().saturating_sub(1);
+        if self.resume.is_some() {
+            if let Some(i) = self.resume.as_ref().and_then(|id| self.index_of(id)) {
+                self.selected = i;
+                self.resume = None;
+            } else if self.older.is_none() || self.resume_scanned >= MAX_LOADED_EVENTS {
+                // The anchor is farther back than one window can hold, or it no
+                // longer exists. Stay on the nearest reachable page and stop
+                // walking; the user can page manually from here.
+                self.resume = None;
+                if self.events.len() > NEAR_EDGE * 2 {
+                    self.selected = self.events.len() / 2;
+                }
+            }
+        }
+    }
+
     /// The page to fetch next, if a reload is mid-way, or the selection is near
     /// a window edge, and no load is in flight.
     pub(super) fn next_load(&mut self, request_id: u64) -> Option<WorkerRequest> {
@@ -429,6 +494,18 @@ impl Transcript {
         if let Some(anchor) = self.reload.as_ref().map(|r| r.anchor.clone()) {
             self.begin(request_id, PageKind::Reload);
             return Some(self.backward_request(request_id, anchor));
+        }
+        // A restarted transcript returns to its reading anchor, one page at a time.
+        if self.resume.is_some() {
+            if self.resume_scanned >= MAX_LOADED_EVENTS {
+                self.resume = None;
+                return None;
+            }
+            if let Some(anchor) = self.older.clone() {
+                self.begin(request_id, PageKind::Older);
+                return Some(self.backward_request(request_id, Some(anchor)));
+            }
+            self.resume = None;
         }
         let (kind, anchor, direction) = if self.selected < NEAR_EDGE && self.older.is_some() {
             (PageKind::Older, self.older.clone(), PageDirection::Backward)
@@ -576,28 +653,16 @@ impl Transcript {
             None
         };
         match pending.kind {
-            PageKind::Initial => {
-                self.replace(page, PageDirection::Forward);
-                self.older = None;
-                self.newer = continuation;
-                self.selected = 0;
-                if self.newer.is_none() {
-                    self.newest_refreshed();
-                } else {
-                    // Opened away from the tail: the newest observed event is the
-                    // window end; a baseline count (below) discounts later history.
-                    self.new_events = 0;
-                    self.count_pending = None;
-                    self.mark = self.newer.clone().map(|a| (a, 0));
-                    self.baseline_pending = self.mark.is_some();
-                }
-            }
+            PageKind::Initial => self.apply_initial(page, continuation),
             PageKind::Tail => {
+                // `Select` asks the worker for `Backward/None`, so this page is
+                // always the newest window, even when it holds a single event.
                 self.replace(page, PageDirection::Backward);
                 self.older = continuation;
                 self.newer = None;
                 self.selected = self.events.len().saturating_sub(1);
                 self.newest_refreshed();
+                self.resume_selection();
             }
             PageKind::Newer => {
                 self.append(page);
@@ -608,13 +673,35 @@ impl Transcript {
                 self.drop_front();
             }
             PageKind::Older => {
-                self.prepend(page);
-                self.older = continuation;
-                self.drop_back();
+                if self.resume.is_some() {
+                    self.recover_older(page, continuation);
+                } else {
+                    self.prepend(page);
+                    self.older = continuation;
+                    self.drop_back();
+                    self.resume_selection();
+                }
             }
             PageKind::Reload => self.apply_reload(page, continuation),
         }
         true
+    }
+
+    fn apply_initial(&mut self, page: TranscriptPage, continuation: Option<PageAnchor>) {
+        self.replace(page, PageDirection::Forward);
+        self.older = None;
+        self.newer = continuation;
+        self.selected = 0;
+        if self.newer.is_none() {
+            self.newest_refreshed();
+        } else {
+            // Opened away from the tail: the newest observed event is the
+            // window end; a baseline count (below) discounts later history.
+            self.new_events = 0;
+            self.count_pending = None;
+            self.mark = self.newer.clone().map(|a| (a, 0));
+            self.baseline_pending = self.mark.is_some();
+        }
     }
 
     fn fail_oversized(&mut self, kind: PageKind) {
@@ -868,6 +955,14 @@ fn trim_chunks(chunks: &mut Vec<Chunk>, keep: usize) {
         }
     }
 }
+fn anchor_of_event(event: &Event) -> PageAnchor {
+    PageAnchor {
+        timestamp: event.timestamp,
+        source_order: event.source_order,
+        stable_id: event.id.clone(),
+    }
+}
+
 fn edge_of(page: &TranscriptPage, direction: PageDirection) -> Edge {
     match (&page.next, direction) {
         (Some(a), PageDirection::Forward) => Edge::Last(a.clone()),
