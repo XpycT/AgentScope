@@ -5,7 +5,7 @@ use std::time::Duration;
 
 mod support;
 
-use agentscope::app::{App, Panel, RosterItem, Screen};
+use agentscope::app::{ACTIVITY_DEBOUNCE_MS, App, Panel, RosterItem, Screen};
 use agentscope::domain::*;
 use agentscope::ui::{KeyAction, RosterContext, apply_worker_event, handle_key, render};
 use agentscope::worker::{WorkerEvent, WorkerRequest};
@@ -851,7 +851,7 @@ fn tab_swaps_list_and_preview_on_narrow_terminals_and_keeps_the_selection() {
         "Tab swaps panes, it does not navigate"
     );
     let swapped = draw(&app, 90, 25);
-    assert!(swapped.contains("Preview"), "{swapped}");
+    assert!(swapped.contains("LAST ACTIVITY"), "{swapped}");
     assert!(
         swapped.contains("Scanner refactor"),
         "the selected session's preview:\n{swapped}"
@@ -895,7 +895,7 @@ fn resizing_between_sizes_keeps_selection_and_a_swapped_preview_only_while_narro
         if w >= 150 {
             assert!(!app.preview_replaces_list(), "the swap ends once both fit");
             assert!(
-                screen.contains("STATUS") && screen.contains("Preview"),
+                screen.contains("STATUS") && screen.contains("LAST ACTIVITY"),
                 "{screen}"
             );
         } else {
@@ -1238,16 +1238,59 @@ fn mouse_is_ignored_for_hidden_modified_and_stale_geometry() {
     assert_eq!(moved.selected_key(), before);
 }
 
+/// Give the selected session enough recent activity that the preview's
+/// scrolling block overflows a 160x20 terminal.
+fn seed_long_preview_activity(app: &mut App) {
+    let Some(key) = app.selected_key() else {
+        return;
+    };
+    app.take_requests();
+    app.settle_selection(0);
+    app.settle_selection(ACTIVITY_DEBOUNCE_MS);
+    let id = app
+        .take_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            WorkerRequest::PreviewTail { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .expect("the selection reads its latest activity");
+    let mut tool = event(&key, 10, EventKind::Tool, "");
+    tool.text = None;
+    tool.tool = Some(ToolInteraction {
+        name: "exec".into(),
+        call_id: None,
+        input: Some(text(&format!(r#"{{"command":"{}"}}"#, "a".repeat(200)))),
+        output: None,
+        status: ToolStatus::Completed,
+        exit_code: None,
+        started_at: None,
+        completed_at: None,
+        orphan: false,
+        child_session: None,
+    });
+    let reply = event(&key, 11, EventKind::AssistantMessage, &"reply ".repeat(20));
+    let page = TranscriptPage {
+        events: vec![tool, reply],
+        diagnostics: vec![],
+        next: None,
+        has_more: false,
+        truncated: false,
+    };
+    assert!(app.apply_activity(id, key, page));
+}
+
 #[test]
 fn the_wheel_scrolls_the_preview_independently_of_the_list() {
     let area = Rect::new(0, 0, 160, 20);
     let mut app = new_app();
     let mut ctx = ctx();
     discover(&mut app, &mut ctx, 1);
+    seed_long_preview_activity(&mut app);
     handle_event(&mut app, TermEvent::Resize(160, 20), area);
     let before = app.selected_key();
     let screen = draw(&app, 160, 20);
-    assert!(screen.contains("Preview"), "{screen}");
+    assert!(screen.contains("LAST ACTIVITY"), "{screen}");
 
     let layout = RosterLayout::for_area(area);
     let preview = layout.preview.expect("preview column");
@@ -1274,6 +1317,7 @@ fn the_wheel_scrolls_the_preview_independently_of_the_list() {
     assert_eq!(app.preview_scroll(), 0, "a new selection starts at the top");
 
     // `J`/`K` scroll the preview from the keyboard.
+    assert!(app.select_row(&key_of(Harness::Codex, "codex-1")));
     draw(&app, 160, 20);
     ch(&mut app, 'J');
     assert_eq!(app.preview_scroll(), 1);

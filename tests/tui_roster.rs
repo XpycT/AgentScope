@@ -3,7 +3,7 @@ use std::time::Duration;
 
 mod support;
 
-use agentscope::app::{App, RosterItem};
+use agentscope::app::{ACTIVITY_DEBOUNCE_MS, App, RosterItem};
 use agentscope::domain::*;
 use agentscope::roster::DiscoveryLimit;
 use agentscope::ui::{
@@ -579,10 +579,13 @@ fn the_preview_takes_45_columns_from_150_and_never_below() {
     );
 
     let split = text(&draw(&app, &ctx(true), 160, 40));
-    assert!(split.contains("Preview"), "{split}");
-    assert!(split.contains("Billing provider: openai"), "{split}");
+    assert!(split.contains("LAST ACTIVITY"), "{split}");
+    assert!(
+        split.contains("RipperGame · gpt-5.5 · high · openai"),
+        "{split}"
+    );
     let narrow = text(&draw(&app, &ctx(true), 149, 40));
-    assert!(!narrow.contains("Preview"), "{narrow}");
+    assert!(!narrow.contains("LAST ACTIVITY"), "{narrow}");
 
     let small = RosterLayout::for_area(Rect::new(0, 0, 59, 19));
     assert!(!small.usable() && small.columns.is_empty());
@@ -1065,15 +1068,400 @@ fn layouts_render_at_60x20_100x30_150x40() {
 fn preview_of(summary: SessionSummary) -> String {
     let mut app = app();
     app.apply_roster(vec![summary], vec![]);
-    let mut terminal = Terminal::new(TestBackend::new(200, 60)).unwrap();
+    text(&preview_buffer(&app, true))
+}
+
+/// The preview rendered against `app`, on a terminal large enough that no
+/// section is clipped.
+fn preview_buffer(app: &App, no_color: bool) -> Buffer {
+    preview_buffer_at(app, no_color, 200, 60)
+}
+
+fn preview_buffer_at(app: &App, no_color: bool, width: u16, height: u16) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
-        .draw(|f| render_preview(f, &app, &ctx(true), f.area()))
+        .draw(|f| render_preview(f, app, &ctx(no_color), f.area()))
         .unwrap();
-    text(terminal.backend().buffer())
+    terminal.backend().buffer().clone()
+}
+
+/// A session with a known token breakdown, so the bar has every share.
+fn categorized(mut summary: SessionSummary) -> SessionSummary {
+    summary.usage.as_mut().expect("usage").categories = TokenCategories {
+        input: Some(10_000),
+        cache_read: Some(40_000),
+        cache_write: Some(5_000),
+        output: Some(3_000),
+        ..TokenCategories::default()
+    };
+    summary
+}
+
+fn preview_app(summary: SessionSummary) -> (App, SessionKey) {
+    let mut app = app();
+    let key = summary.meta.key.clone();
+    app.apply_roster(vec![summary], vec![]);
+    app.take_requests();
+    (app, key)
+}
+
+/// Settle the selection and return the activity request it issued.
+fn begin_activity(app: &mut App) -> u64 {
+    app.settle_selection(0);
+    app.settle_selection(ACTIVITY_DEBOUNCE_MS);
+    app.take_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            WorkerRequest::PreviewTail { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .expect("the settled selection reads its latest activity")
+}
+
+fn event_base(key: &SessionKey, id: &str, at: Timestamp) -> Event {
+    Event {
+        id: id.into(),
+        session: key.clone(),
+        timestamp: Some(at),
+        source_order: 0,
+        kind: EventKind::AssistantMessage,
+        actor: Actor::Assistant,
+        text: None,
+        tool: None,
+        usage: None,
+        provenance: Provenance {
+            harness: key.harness,
+            source: key.source.clone(),
+            locator: SourceLocator {
+                session: key.clone(),
+                kind: LocatorKind::FileOffset {
+                    path: "activity.jsonl".into(),
+                    offset: 0,
+                },
+                generation: None,
+            },
+            record_type: "test".into(),
+            harness_version: None,
+        },
+    }
+}
+
+fn reply_event(key: &SessionKey, at: Timestamp, text: &str) -> Event {
+    let mut event = event_base(key, "reply", at);
+    event.text = Some(BoundedText {
+        preview: text.into(),
+        byte_len: text.len(),
+        truncated: false,
+        locator: None,
+    });
+    event
+}
+
+fn tool_event(key: &SessionKey, at: Timestamp, input: &str) -> Event {
+    let mut event = event_base(key, "tool", at);
+    event.kind = EventKind::Tool;
+    event.tool = Some(ToolInteraction {
+        name: "exec".into(),
+        call_id: None,
+        input: Some(BoundedText {
+            preview: input.into(),
+            byte_len: input.len(),
+            truncated: false,
+            locator: None,
+        }),
+        output: None,
+        status: ToolStatus::Completed,
+        exit_code: None,
+        started_at: None,
+        completed_at: None,
+        orphan: false,
+        child_session: None,
+    });
+    event
+}
+
+fn activity_page(events: Vec<Event>, has_more: bool) -> TranscriptPage {
+    let next = events.first().map(|event| PageAnchor {
+        timestamp: event.timestamp,
+        source_order: event.source_order,
+        stable_id: event.id.clone(),
+    });
+    TranscriptPage {
+        events,
+        diagnostics: vec![],
+        next,
+        has_more,
+        truncated: false,
+    }
 }
 
 #[test]
-fn partial_category_costs_show_a_subtotal_and_missing_coverage_not_a_total() {
+fn preview_pins_header_numbers_and_bar() {
+    let mut s = categorized(rich(Harness::Codex, "p", "Inventory API"));
+    s.usage.as_mut().unwrap().total = Some(91_000);
+    let mut app = app();
+    app.apply_roster(vec![s], vec![]);
+    let buf = preview_buffer_at(&app, true, 60, 10);
+    let lines = lines_of(&buf);
+    let first = &lines[0];
+    assert!(
+        first.contains("[CDX]") && first.contains("Inventory API"),
+        "{first}"
+    );
+    let at = first.find("Inventory API").expect("title");
+    assert!(
+        buf.content()[at].modifier.contains(Modifier::BOLD),
+        "the title is bold"
+    );
+    assert!(
+        lines[1].contains("RipperGame · gpt-5.5 · high · openai"),
+        "{}",
+        lines[1]
+    );
+    let out = lines.join("\n");
+    for want in [
+        "recent",
+        "recent writes; process unmatched",
+        "91k reported",
+        "~$0.23",
+        "84.2 tok/s",
+        "cache read 40k",
+        "input 10k",
+        "cache write 5.0k",
+    ] {
+        assert!(out.contains(want), "missing {want:?}:\n{out}");
+    }
+    assert!(
+        !out.contains("output 3k"),
+        "the legend keeps the top three:\n{out}"
+    );
+
+    // Scrolling moves only the sections below the pinned block.
+    let _ = preview_buffer_at(&app, true, 60, 10); // records the scroll extent
+    app.scroll_preview(100);
+    let scrolled = text(&preview_buffer_at(&app, true, 60, 10));
+    assert!(
+        scrolled
+            .lines()
+            .next()
+            .is_some_and(|l| l.contains("Inventory API")),
+        "{scrolled}"
+    );
+    for want in ["91k reported", "LAST ACTIVITY", "Enter open"] {
+        assert!(
+            scrolled.contains(want),
+            "scrolled past pinned {want:?}:\n{scrolled}"
+        );
+    }
+}
+
+#[test]
+fn preview_shows_last_activity_states() {
+    let (mut app, key) = preview_app(rich(Harness::Codex, "a", "Activity"));
+    let id = begin_activity(&mut app);
+    let out = text(&preview_buffer(&app, true));
+    let at = out.find("LAST ACTIVITY").expect("section header");
+    assert!(
+        out[at..]
+            .lines()
+            .nth(1)
+            .is_some_and(|line| line.trim() == "…"),
+        "loading shows an ellipsis:\n{out}"
+    );
+
+    let page = activity_page(
+        vec![
+            tool_event(&key, NOW - 2_000, r#"{"command":"cargo test"}"#),
+            reply_event(&key, NOW - 1_000, "the reply is wrapped here"),
+        ],
+        false,
+    );
+    assert!(app.apply_activity(id, key.clone(), page));
+    let out = text(&preview_buffer(&app, true));
+    assert!(out.contains("✓ exec cargo test"), "{out}");
+    assert!(out.contains("▌ the reply is wrapped here"), "{out}");
+    assert!(!out.contains("no reply in recent events"), "{out}");
+
+    let (mut app, key) = preview_app(rich(Harness::Codex, "t", "Tool only"));
+    let id = begin_activity(&mut app);
+    assert!(app.apply_activity(
+        id,
+        key.clone(),
+        activity_page(
+            vec![tool_event(&key, NOW - 1_000, r#"{"command":"cargo test"}"#)],
+            false,
+        )
+    ));
+    let out = text(&preview_buffer(&app, true));
+    assert!(out.contains("no reply in recent events"), "{out}");
+
+    let (mut app, key) = preview_app(rich(Harness::Codex, "n", "Nothing"));
+    let id = begin_activity(&mut app);
+    assert!(app.apply_activity(id, key, activity_page(vec![], false)));
+    let out = text(&preview_buffer(&app, true));
+    assert!(out.contains("no activity recorded"), "{out}");
+
+    let (mut app, _) = preview_app(rich(Harness::Codex, "f", "Failed"));
+    let id = begin_activity(&mut app);
+    app.load_failed(id);
+    let out = text(&preview_buffer(&app, true));
+    assert!(out.contains("couldn't read latest activity"), "{out}");
+}
+
+#[test]
+fn preview_reply_keeps_line_breaks_and_stops_at_three_rows() {
+    let (mut app, key) = preview_app(rich(Harness::Codex, "r", "Reply lines"));
+    let id = begin_activity(&mut app);
+    let reply = format!("one\ntwo\n{}OMITTED", "X".repeat(70));
+    assert!(app.apply_activity(
+        id,
+        key.clone(),
+        activity_page(vec![reply_event(&key, NOW - 1_000, &reply)], false)
+    ));
+    // Narrow enough that the long third line wraps: the first three rendered
+    // reply rows are kept and the tail is dropped.
+    let out = text(&preview_buffer_at(&app, true, 30, 40));
+    assert!(out.contains("▌ one"), "{out}");
+    assert!(out.contains("▌ two"), "{out}");
+    let shown = out.lines().filter(|line| line.starts_with("▌ ")).count();
+    assert_eq!(shown, 3, "only three reply rows:\n{out}");
+    assert!(!out.contains("OMITTED"), "the tail is not shown:\n{out}");
+}
+
+#[test]
+fn preview_effort_stays_quiet_in_color_mode() {
+    for effort in ["high", "max"] {
+        let mut s = rich(Harness::Codex, "e", "Effort");
+        s.meta.model = Some(model("gpt-5.5", Some("openai"), Some(effort)));
+        let mut app = app();
+        app.apply_roster(vec![s], vec![]);
+        let buf = preview_buffer(&app, false);
+        let (x, y) = locate_left(&buf, effort, buf.area.width);
+        let width = buf.area.width as usize;
+        assert_eq!(
+            buf.content()[y as usize * width + x as usize].fg,
+            Color::DarkGray,
+            "{effort} is part of the quiet metadata line"
+        );
+    }
+}
+
+#[test]
+fn preview_token_bar_has_no_color_fallback() {
+    let mut app = app();
+    app.apply_roster(vec![categorized(rich(Harness::Codex, "b", "Bar"))], vec![]);
+    let plain = text(&preview_buffer(&app, true));
+    let bar = plain
+        .lines()
+        .find(|line| ['#', '=', '-', '+'].iter().all(|ch| line.contains(*ch)))
+        .unwrap_or_else(|| panic!("no fallback bar:\n{plain}"));
+    for ch in ['#', '=', '-', '+'] {
+        assert!(bar.contains(ch), "the bar is missing {ch:?}: {bar}");
+    }
+
+    let colored = preview_buffer(&app, false);
+    let fg: Vec<Color> = colored
+        .content()
+        .iter()
+        .filter(|cell| cell.symbol() == "█")
+        .map(|cell| cell.fg)
+        .collect();
+    for color in [Color::Blue, Color::Green, Color::Yellow, Color::Magenta] {
+        assert!(fg.contains(&color), "the bar is missing {color:?}");
+    }
+}
+
+#[test]
+fn preview_never_prints_unknown_word() {
+    let mut s = session(
+        Harness::Codex,
+        "u",
+        "No facts",
+        12,
+        None,
+        ProcessAssociation::NotChecked,
+    );
+    s.meta.project = None;
+    s.meta.model = None;
+    s.usage = None;
+    let out = preview_of(s);
+    assert!(
+        !out.to_lowercase().contains("unknown"),
+        "the preview never prints the word:\n{out}"
+    );
+    assert!(!out.contains("$0.00"), "no fake price:\n{out}");
+    assert!(out.contains('—'), "absent values keep their glyph:\n{out}");
+}
+
+#[test]
+fn preview_parent_link_only_when_resolved() {
+    let parent = rich(Harness::Claude, "parent", "Parent work");
+    let parent_key = parent.meta.key.clone();
+    let with = |link: SessionLink| {
+        let mut child = rich(Harness::Codex, "child", "Child work");
+        child.meta.lineage.parent = Some(link);
+        let key = child.meta.key.clone();
+        let mut app = app();
+        app.apply_roster(vec![child, parent.clone()], vec![]);
+        assert!(app.select_row(&key));
+        text(&preview_buffer(&app, true))
+    };
+
+    let out = with(SessionLink::Resolved(parent_key));
+    assert!(out.contains("child of Parent work"), "{out}");
+
+    let out = with(SessionLink::Ambiguous);
+    assert!(out.contains("parent ambiguous"), "{out}");
+    assert!(!out.contains("child of"), "{out}");
+
+    let out = with(SessionLink::Unresolved("ghost".into()));
+    assert!(out.contains("parent not found"), "{out}");
+    assert!(!out.contains("child of"), "{out}");
+
+    let missing = SessionKey {
+        harness: Harness::Pi,
+        native_id: "not-loaded".into(),
+        source: SourceKey::File("missing.jsonl".into()),
+    };
+    let out = with(SessionLink::Resolved(missing));
+    assert!(
+        !out.contains("child of")
+            && !out.contains("parent ambiguous")
+            && !out.contains("parent not found"),
+        "an unloaded parent has no name to show:\n{out}"
+    );
+}
+
+#[test]
+fn preview_shows_old_model_speed_note() {
+    let mut s = rich(Harness::Codex, "o", "Old model");
+    s.metrics.speed.latest.as_mut().unwrap().model = Some(model("gpt-4.1", Some("openai"), None));
+    let mut app = app();
+    app.apply_roster(vec![s], vec![]);
+    let buf = preview_buffer(&app, false);
+    let out = text(&buf);
+    assert!(out.contains("old gpt-4.1"), "{out}");
+    assert!(out.contains("3m ago"), "{out}");
+    let (x, y) = locate_left(&buf, "84.2", buf.area.width);
+    let width = buf.area.width as usize;
+    assert_eq!(
+        buf.content()[y as usize * width + x as usize].fg,
+        Color::DarkGray,
+        "a stale speed is quiet"
+    );
+}
+
+#[test]
+fn preview_absent_speed_has_no_unit() {
+    let mut s = rich(Harness::Codex, "s", "No speed");
+    s.metrics.speed.latest = None;
+    let out = preview_of(s);
+    assert!(!out.contains("tok/s"), "no unit without a rate:\n{out}");
+    assert!(out.contains('—'), "the absent glyph stays:\n{out}");
+}
+
+#[test]
+fn partial_cost_keeps_a_lower_bound_and_never_reads_as_free() {
     let mut s = rich(Harness::Claude, "p", "Partial cost");
     s.usage = Some(UsageSummary {
         total: Some(91_000),
@@ -1107,8 +1495,6 @@ fn partial_category_costs_show_a_subtotal_and_missing_coverage_not_a_total() {
         out.contains("$0.12+"),
         "known subtotal, marked as a lower bound:\n{out}"
     );
-    assert!(out.contains("partial 3/4"), "{out}");
-    assert!(out.contains("Unpriced coverage: output"), "{out}");
     assert!(
         !out.contains("~$"),
         "no complete estimate is claimed:\n{out}"
@@ -1126,8 +1512,8 @@ fn unknown_speed_is_not_zero_and_an_old_model_keeps_its_qualifier() {
     let mut none = rich(Harness::Codex, "n", "No speed");
     none.metrics.speed.latest = None;
     let out = preview_of(none);
-    assert!(out.contains("Latest speed: —"), "{out}");
-    assert!(!out.contains("0.0 tok/s"), "{out}");
+    assert!(out.contains('—') && !out.contains("tok/s"), "{out}");
+    assert!(!out.contains("0.0"), "{out}");
 
     let mut zero = rich(Harness::Codex, "z", "Zero speed");
     zero.metrics
@@ -1137,10 +1523,7 @@ fn unknown_speed_is_not_zero_and_an_old_model_keeps_its_qualifier() {
         .unwrap()
         .tokens_per_second = 0.0;
     let out = preview_of(zero);
-    assert!(
-        out.contains("Latest speed: —") && !out.contains("0.0 tok/s"),
-        "{out}"
-    );
+    assert!(out.contains('—') && !out.contains("tok/s"), "{out}");
 
     let mut old = rich(Harness::Codex, "o", "Old model");
     old.metrics.speed.latest.as_mut().unwrap().model = Some(model("gpt-4.1", Some("openai"), None));
@@ -1160,7 +1543,7 @@ fn context_percentage_needs_a_known_window() {
     unknown.metrics.context.used = Some(215_000);
     unknown.metrics.context.capacity = None;
     let out = preview_of(unknown);
-    assert!(out.contains("Unknown (window not recorded)"), "{out}");
+    assert!(out.contains("215k recorded"), "{out}");
     assert!(!out.contains('%'), "no percentage without a window:\n{out}");
 
     let mut known = rich(Harness::Codex, "k", "Known window");
@@ -1168,83 +1551,7 @@ fn context_percentage_needs_a_known_window() {
     known.metrics.context.capacity = Some(1_000_000);
     let out = preview_of(known);
     assert!(out.contains("21% of window"), "{out}");
-}
-
-fn compaction(scope: CompactionScope, summary: Option<&str>) -> CompactionObservation {
-    let s = rich(Harness::Codex, "c", "c");
-    let key = s.meta.key.clone();
-    CompactionObservation {
-        id: "c1".into(),
-        timestamp: Some(NOW - 60_000),
-        method: Some("auto".into()),
-        trigger: Some("limit".into()),
-        summary: summary.map(|t| BoundedText {
-            preview: t.into(),
-            byte_len: t.len(),
-            truncated: false,
-            locator: None,
-        }),
-        before_tokens: Some(2_000),
-        after_tokens: Some(500),
-        duration_ms: None,
-        usage: None,
-        scope,
-        provenance: Provenance {
-            harness: Harness::Codex,
-            source: key.source.clone(),
-            locator: SourceLocator {
-                session: key,
-                kind: LocatorKind::FileOffset {
-                    path: "c.jsonl".into(),
-                    offset: 0,
-                },
-                generation: None,
-            },
-            record_type: "compaction".into(),
-            harness_version: None,
-        },
-    }
-}
-
-#[test]
-fn compaction_event_cost_and_context_reduction_are_separate_facts() {
-    let mut s = rich(Harness::Codex, "e", "Event scope");
-    s.metrics.compactions = CompactionSummary {
-        observed: 1,
-        history_complete: true,
-        known_cost_usd: None,
-        cost_scope: CompactionScope::Event,
-        unpriced: 1,
-        latest: Some(compaction(CompactionScope::Event, None)),
-    };
-    let out = preview_of(s);
-    assert!(out.contains("context 2,000 → 500 (removed 1,500)"), "{out}");
-    assert!(
-        out.contains("Event cost: not recorded for this event"),
-        "{out}"
-    );
-
-    // An aggregate cost is never attributed to the single latest event.
-    let mut agg = rich(Harness::Codex, "g", "Aggregate scope");
-    agg.metrics.compactions = CompactionSummary {
-        observed: 2,
-        history_complete: true,
-        known_cost_usd: Some(1.5),
-        cost_scope: CompactionScope::Aggregate,
-        unpriced: 0,
-        latest: Some(compaction(CompactionScope::Aggregate, None)),
-    };
-    let out = preview_of(agg);
-    assert!(
-        out.contains("$1.50 aggregate (not attributed per event)"),
-        "{out}"
-    );
-    assert!(
-        out.contains("session aggregate only, not attributed to this event"),
-        "{out}"
-    );
-    let event_line = out.lines().find(|l| l.contains("Event cost:")).unwrap();
-    assert!(!event_line.contains("$1.50"), "{event_line}");
+    assert!(out.contains("215k of 1.0M"), "{out}");
 }
 
 #[test]

@@ -544,7 +544,7 @@ fn new_metadata_is_display_safe() {
     let beside = screen_text_at(&app, &ctx, 160, 40);
     assert_clean("roster preview", &beside);
     assert!(
-        beside.contains("Preview") && beside.contains("password="),
+        beside.contains("LAST ACTIVITY") && beside.contains("password="),
         "{beside}"
     );
     app.set_viewport_width(100);

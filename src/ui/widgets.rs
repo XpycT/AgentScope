@@ -288,6 +288,11 @@ impl Palette {
         Self { no_color }
     }
 
+    /// True when every style must rely on text alone, with no color cue.
+    pub fn is_no_color(&self) -> bool {
+        self.no_color
+    }
+
     fn colored(&self, color: Color) -> Style {
         if self.no_color {
             Style::default()
