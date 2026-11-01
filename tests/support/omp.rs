@@ -184,3 +184,121 @@ pub fn write_raw(root: &Path, bucket: &str, name: &str, body: &[u8]) -> PathBuf 
     fs::write(&path, body).expect("write fixture");
     path
 }
+
+// ---------------------------------------------------------------------------
+// Producer-shaped call records (pi-catalog `Usage`, pi-ai `AssistantMessage`)
+// ---------------------------------------------------------------------------
+
+/// A producer-shaped `Usage` with every counter explicit. `saved` is the saved
+/// `cost.total` (OMP's own, ambiguous number; never trusted).
+pub fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64, saved: f64) -> Value {
+    json!({
+        "input": input, "output": output, "cacheRead": cache_read, "cacheWrite": cache_write,
+        "totalTokens": input + output + cache_read + cache_write,
+        "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": saved}
+    })
+}
+
+/// Adds the additive provider-side orchestration counters to a `usage` object.
+pub fn with_orchestration(mut usage: Value, input: u64, output: u64, cache_read: u64) -> Value {
+    usage["orchestration"] = json!({"input": input, "output": output, "cacheRead": cache_read});
+    usage["totalTokens"] =
+        json!(usage["totalTokens"].as_u64().unwrap_or(0) + input + output + cache_read);
+    usage
+}
+
+/// A producer-shaped assistant call billed through the `acme` route and model `m`.
+pub fn call(id: &str, parent: Option<&str>, response: Option<&str>, usage: Value) -> Value {
+    let mut message = json!({
+        "role": "assistant", "content": [{"type": "text", "text": "ok"}],
+        "api": "anthropic-messages", "provider": "acme", "model": "m",
+        "stopReason": "stop", "timestamp": NOW, "usage": usage
+    });
+    if let Some(response) = response {
+        message["responseId"] = json!(response);
+    }
+    entry(id, parent, "message", json!({"message": message}))
+}
+
+/// Sets a message-level field (`duration`, `serviceTier`, `contextSnapshot`, ...).
+pub fn with_message(mut call: Value, key: &str, value: Value) -> Value {
+    call["message"][key] = value;
+    call
+}
+
+/// A producer-shaped context snapshot on a call.
+pub fn with_snapshot(call: Value, prompt: u64, removed: Option<u64>) -> Value {
+    let mut snapshot = json!({"promptTokens": prompt, "nonMessageTokens": 1200});
+    if let Some(removed) = removed {
+        snapshot["historyRewriteTokensRemoved"] = json!(removed);
+    }
+    with_message(call, "contextSnapshot", snapshot)
+}
+
+/// A `model_usage` entry on the `acme` route and model `m`.
+pub fn aux(id: &str, parent: Option<&str>, purpose: &str, usage: Value) -> Value {
+    entry(
+        id,
+        parent,
+        "model_usage",
+        json!({"purpose": purpose, "role": "smol", "api": "anthropic-messages",
+               "provider": "acme", "model": "m", "stopReason": "stop", "usage": usage}),
+    )
+}
+
+/// A `task` result quoting what a child cost (the producer's own number).
+pub fn task_result(id: &str, parent: Option<&str>, agent_id: &str, quoted: f64) -> Value {
+    entry(
+        id,
+        parent,
+        "message",
+        json!({"message": {"role": "toolResult", "toolName": "task", "toolCallId": "call-1",
+                           "content": [{"type": "text", "text": "done"}],
+                           "details": {"results": [{"id": agent_id, "agent": "scout",
+                                                    "usage": {"cost": {"total": quoted}}}]},
+                           "timestamp": NOW}}),
+    )
+}
+
+pub fn thinking_level(id: &str, parent: Option<&str>, level: &str, configured: &str) -> Value {
+    entry(
+        id,
+        parent,
+        "thinking_level_change",
+        json!({"thinkingLevel": level, "configured": configured}),
+    )
+}
+
+pub fn model_change(id: &str, parent: Option<&str>, selector: &str) -> Value {
+    entry(
+        id,
+        parent,
+        "model_change",
+        json!({"model": selector, "role": "default"}),
+    )
+}
+
+pub fn service_tier_change(id: &str, parent: Option<&str>, tier: &str) -> Value {
+    entry(
+        id,
+        parent,
+        "service_tier_change",
+        json!({"serviceTier": {"anthropic": tier}}),
+    )
+}
+
+/// Overrides an entry's ISO timestamp.
+pub fn at(mut entry: Value, iso: &str) -> Value {
+    entry["timestamp"] = json!(iso);
+    entry
+}
+
+/// Appends records to an existing session file.
+pub fn append(path: &Path, entries: &[Value]) {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open");
+    file.write_all(&lines(entries)).expect("append");
+}

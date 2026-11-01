@@ -204,6 +204,20 @@ impl OmpTree {
         OmpInsert::Inserted
     }
 
+    /// The active leaf's entry ID, `None` for an empty file or a cleared leaf. The
+    /// branch must be intact, exactly as for [`OmpTree::active_path`].
+    pub fn active_leaf_id(&self) -> Result<Option<&str>, OmpTreeError> {
+        let path = self.active_path()?;
+        if path.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.last.as_ref().and_then(|(_, id, leaf)| match leaf {
+            ActiveLeaf::Cleared => None,
+            ActiveLeaf::Absent => Some(id.as_str()),
+            ActiveLeaf::Set(target) => Some(target.as_str()),
+        }))
+    }
+
     /// Ordinals of the active branch, root first. Empty for an empty file or a
     /// cleared leaf.
     pub fn active_path(&self) -> Result<Vec<u64>, OmpTreeError> {

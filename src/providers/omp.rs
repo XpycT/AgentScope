@@ -13,9 +13,12 @@
 //!
 //! [`ProviderReader`]: crate::providers::ProviderReader
 
+pub mod hydration;
 pub mod links;
 pub mod metadata;
+pub mod ownership;
 pub mod tree;
+pub mod usage;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -29,14 +32,19 @@ use crate::domain::{
 };
 use crate::providers::{DiscoveryDelta, ProviderError};
 
+pub use hydration::OmpHydration;
 pub use links::resolve_omp_links;
 pub use metadata::{OmpHeader, parse_header, parse_title_slot};
+pub use ownership::{OmpOwnership, owned_request};
 pub use tree::{ActiveLeaf, OmpEntryHeader, OmpInsert, OmpTree, OmpTreeError};
+pub use usage::map_omp_usage;
 
 /// Artifact directory levels below a bucket that are walked.
 const MAX_DEPTH: usize = 9;
 /// Entries of one directory that are examined.
 const DIR_CAP: usize = 16 * 1024;
+/// Default ceiling of usage-bearing entries kept as ownership evidence.
+const DEFAULT_EVIDENCE_ENTRIES: usize = 100_000;
 
 struct Level {
     dir: PathBuf,
@@ -236,6 +244,14 @@ pub struct OmpCatalog {
     /// confirmed deletion still reaches the roster. Bounded; checked with a
     /// metadata call only, never read.
     forgotten: HashMap<PathBuf, SessionKey>,
+    /// Relationship facts of every source, as of the last publish (or seeded).
+    links: HashMap<SessionKey, ownership::SourceLinks>,
+    /// `member -> (logical root, position)` over `links`.
+    member_of: HashMap<SessionKey, (SessionKey, usize)>,
+    /// Usage-bearing entry IDs per source, the evidence that decides ownership.
+    evidence: HashMap<SessionKey, ownership::Evidence>,
+    evidence_len: usize,
+    evidence_cap: usize,
 }
 
 fn warn_limit(max_sources: usize) -> Warning {
@@ -286,7 +302,18 @@ impl OmpCatalog {
             invalidated: Vec::new(),
             pending_removed: Vec::new(),
             forgotten: HashMap::new(),
+            links: HashMap::new(),
+            member_of: HashMap::new(),
+            evidence: HashMap::new(),
+            evidence_len: 0,
+            evidence_cap: DEFAULT_EVIDENCE_ENTRIES,
         }
+    }
+
+    /// Caps the usage-bearing entries kept as ownership evidence across all sources.
+    pub fn with_evidence_limit(mut self, entries: usize) -> Self {
+        self.evidence_cap = entries;
+        self
     }
 
     fn weight(meta: &SessionMetadata, path: &Path) -> usize {
@@ -428,6 +455,12 @@ impl OmpCatalog {
             .map(|p| self.known[p].header.as_ref())
             .collect();
         links::resolve_aligned(&mut metas, &headers);
+        self.set_links(
+            metas
+                .iter()
+                .map(|meta| (meta.key.clone(), ownership::SourceLinks::of(meta)))
+                .collect(),
+        );
         let mut changed = Vec::new();
         for (path, meta) in paths.into_iter().zip(metas) {
             if let Some(known) = self.known.get_mut(&path)
