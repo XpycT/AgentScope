@@ -105,6 +105,13 @@ pub enum WorkerRequest {
         key: SessionKey,
         anchor: Option<PageAnchor>,
     },
+    /// Read the newest (or one older) page for the preview's last-activity
+    /// block. Never shares the open transcript's job.
+    PreviewTail {
+        request_id: u64,
+        key: SessionKey,
+        anchor: Option<PageAnchor>,
+    },
     /// Abandon a queued or running load; its adapter state is released.
     CancelLoad {
         request_id: u64,
@@ -145,6 +152,12 @@ pub enum WorkerEvent {
     },
     Transcript {
         request_id: u64,
+        page: TranscriptPage,
+    },
+    /// One page of the preview's last-activity read.
+    PreviewTail {
+        request_id: u64,
+        key: SessionKey,
         page: TranscriptPage,
     },
     /// The selected session changed in place; the visible page must be reloaded.
@@ -291,6 +304,10 @@ enum Purpose {
         key: SessionKey,
         anchor: Option<PageAnchor>,
     },
+    PreviewTail {
+        key: SessionKey,
+        anchor: Option<PageAnchor>,
+    },
 }
 
 impl Purpose {
@@ -299,7 +316,8 @@ impl Purpose {
             Self::Page { key, .. }
             | Self::Count { key, .. }
             | Self::Preview { key }
-            | Self::Details { key, .. } => key,
+            | Self::Details { key, .. }
+            | Self::PreviewTail { key, .. } => key,
             Self::Source { locator } => &locator.session,
         }
     }
@@ -656,6 +674,11 @@ impl Worker {
                 key,
                 anchor,
             } => self.push_load(request_id, Purpose::Details { key, anchor }),
+            WorkerRequest::PreviewTail {
+                request_id,
+                key,
+                anchor,
+            } => self.push_load(request_id, Purpose::PreviewTail { key, anchor }),
             WorkerRequest::CancelLoad { request_id } => {
                 // A load detached into the servicing loop is not in the queue; remember
                 // the cancellation so it is honoured before it runs, requeues or publishes.
@@ -780,7 +803,9 @@ impl Worker {
                 w.page_is_stale(load.request_id, key)
             }
             Purpose::Preview { .. } => w.preview_is_stale(load.request_id),
-            Purpose::Source { .. } | Purpose::Details { .. } => false,
+            // The preview tail belongs to the row under the cursor, not to the
+            // open transcript; only an explicit cancel abandons it.
+            Purpose::PreviewTail { .. } | Purpose::Source { .. } | Purpose::Details { .. } => false,
         };
         if stale(self, &load) {
             self.release(&load);
@@ -807,6 +832,7 @@ impl Worker {
             Source(Result<ReadProgress<SourceRecord>, ProviderError>),
             Details(Result<ReadProgress<SessionDetailPage>, ProviderError>),
             Preview(Result<crate::providers::HydrationDelta, ProviderError>),
+            Tail(Result<ReadProgress<TranscriptPage>, ProviderError>),
         }
         let reader = &mut self.readers[i];
         self.running = Some(request_id);
@@ -837,6 +863,16 @@ impl Worker {
             Purpose::Preview { key } => {
                 Answer::Preview(guard(|| reader.hydrate(job, key, now, CHUNK_BUDGET)))
             }
+            Purpose::PreviewTail { key, anchor } => Answer::Tail(guard(|| {
+                reader.transcript_page(
+                    job,
+                    key,
+                    anchor.clone(),
+                    PageDirection::Backward,
+                    page_request,
+                    CHUNK_BUDGET,
+                )
+            })),
         };
 
         // Newer requests may have arrived while the adapter ran.
@@ -914,6 +950,19 @@ impl Worker {
                 Err(ProviderError::Unavailable(_)) => Next::Retry,
                 Err(err) => Next::Failed(Some(err)),
             },
+            Answer::Tail(result) => match result {
+                Ok(ReadProgress::Ready(page)) => {
+                    self.emit(WorkerEvent::PreviewTail {
+                        request_id,
+                        key: key.clone(),
+                        page,
+                    });
+                    Next::Done
+                }
+                Ok(ReadProgress::Pending(p)) => Next::Pending(p),
+                Err(ProviderError::Unavailable(_)) => Next::Retry,
+                Err(err) => Next::Failed(Some(err)),
+            },
         };
         match next {
             Next::Done => None,
@@ -941,6 +990,7 @@ impl Worker {
                         Purpose::Source { .. } => "source",
                         Purpose::Preview { .. } => "hydrate",
                         Purpose::Details { .. } => "details",
+                        Purpose::PreviewTail { .. } => "activity",
                         _ => "transcript",
                     };
                     let warning = failure_warning(key.harness, label, &err);

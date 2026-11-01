@@ -11,7 +11,7 @@ use agentscope::domain::*;
 use agentscope::processes::{ProcessInfo, ProcessSnapshot};
 use agentscope::providers::{
     DiscoveryDelta, HydrationDelta, ProviderError, ProviderReader, ReadJobId, ReadProgress,
-    SourceRecord,
+    SourceRecord, WorkProgress,
 };
 use agentscope::worker::{WorkerEvent, WorkerHandle, WorkerRequest};
 use support::facts::{self, metadata};
@@ -33,11 +33,13 @@ struct Script {
     refreshes: VecDeque<Result<Delta, ProviderError>>,
     /// Summaries hydration answers with, by key.
     known: HashMap<SessionKey, SessionSummary>,
-    pages: VecDeque<Result<TranscriptPage, ProviderError>>,
+    pages: VecDeque<Result<ReadProgress<TranscriptPage>, ProviderError>>,
     refresh_calls: usize,
     hydrate_calls: Vec<SessionKey>,
     cancelled: Vec<(SessionKey, ReadJobId)>,
     page_calls: usize,
+    page_jobs: Vec<ReadJobId>,
+    page_keys: Vec<SessionKey>,
     page_requests: Vec<(Option<PageAnchor>, PageDirection)>,
     page_max_events: Vec<usize>,
     count: usize,
@@ -243,8 +245,8 @@ impl ProviderReader for Fake {
     }
     fn transcript_page(
         &mut self,
-        _job: ReadJobId,
-        _key: &SessionKey,
+        job: ReadJobId,
+        key: &SessionKey,
         anchor: Option<PageAnchor>,
         direction: PageDirection,
         request: PageRequest,
@@ -256,12 +258,13 @@ impl ProviderReader for Fake {
         }
         let mut s = self.script.lock().unwrap();
         s.page_calls += 1;
+        s.page_jobs.push(job);
+        s.page_keys.push(key.clone());
         s.page_requests.push((anchor, direction));
         s.page_max_events.push(request.max_events);
         s.pages
             .pop_front()
-            .unwrap_or_else(|| Ok(empty_page()))
-            .map(ReadProgress::Ready)
+            .unwrap_or_else(|| Ok(ReadProgress::Ready(empty_page())))
     }
     fn count_events_after(
         &mut self,
@@ -1197,8 +1200,10 @@ fn cancelling_details_releases_only_that_job_and_the_transcript_completes() {
     {
         let mut s = script.lock().unwrap();
         s.known.insert(k.clone(), a);
-        s.pages.push_back(Ok(event_page(&k, "e0")));
-        s.pages.push_back(Ok(event_page(&k, "fresh")));
+        s.pages
+            .push_back(Ok(ReadProgress::Ready(event_page(&k, "e0"))));
+        s.pages
+            .push_back(Ok(ReadProgress::Ready(event_page(&k, "fresh"))));
     }
     let (f, entered, gate) = gated(Harness::Codex, &script);
     let h = spawn(f);
@@ -1298,5 +1303,145 @@ fn a_preview_rehydrates_after_its_cached_summary_was_evicted() {
         calls.iter().filter(|key| *key == &a.meta.key).count() >= 2,
         "A is hydrated again from its metadata, not lost with the summary"
     );
+    assert!(h.shutdown());
+}
+
+#[test]
+fn preview_tail_returns_newest_page_with_own_job() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, gate_rx) = mpsc::channel();
+    let mut f = fake(Harness::Codex, &script);
+    f.page_gate = Some((entered_tx, gate_rx));
+    let h = spawn(f);
+    let k = key(Harness::Codex, "a");
+    until(&h, finished(1));
+
+    // The transcript read for the same key is inside its slice.
+    select(&h, 1, &k);
+    entered.recv_timeout(WAIT).unwrap();
+    // The preview tail is queued behind it, then gets its own slice.
+    h.tx.send(WorkerRequest::PreviewTail {
+        request_id: 2,
+        key: k.clone(),
+        anchor: None,
+    })
+    .unwrap();
+    release.send(()).unwrap();
+    until(&h, |e| {
+        matches!(e, WorkerEvent::Transcript { request_id: 1, .. })
+    });
+    entered.recv_timeout(WAIT).unwrap();
+    // A further tail is queued and cancelled while the second one runs, so the
+    // cancellation reaches the queued load rather than a detached slice.
+    h.tx.send(WorkerRequest::PreviewTail {
+        request_id: 3,
+        key: k.clone(),
+        anchor: None,
+    })
+    .unwrap();
+    h.tx.send(WorkerRequest::CancelLoad { request_id: 3 })
+        .unwrap();
+    release.send(()).unwrap();
+    let events = until(&h, |e| {
+        matches!(e, WorkerEvent::PreviewTail { request_id: 2, .. })
+    });
+    assert!(matches!(
+        events.last(),
+        Some(WorkerEvent::PreviewTail { key: got, .. }) if got == &k
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::PreviewTail { request_id: 3, .. })),
+        "a cancelled tail never answers"
+    );
+
+    // The transcript continuation still works after the tail job was released.
+    h.tx.send(WorkerRequest::LoadPage {
+        request_id: 4,
+        key: k.clone(),
+        anchor: Some(anchor(1)),
+        direction: PageDirection::Backward,
+    })
+    .unwrap();
+    entered.recv_timeout(WAIT).unwrap();
+    release.send(()).unwrap();
+    until(&h, |e| {
+        matches!(e, WorkerEvent::Transcript { request_id: 4, .. })
+    });
+
+    let s = script.lock().unwrap();
+    assert_eq!(s.page_jobs.len(), 3);
+    assert_ne!(
+        s.page_jobs[0], s.page_jobs[1],
+        "the tail must not share the transcript's job"
+    );
+    assert_eq!(s.page_requests[1], (None, PageDirection::Backward));
+    assert_eq!(
+        s.page_requests[2],
+        (Some(anchor(1)), PageDirection::Backward)
+    );
+    assert_eq!(s.cancelled.len(), 1);
+    assert_eq!(s.cancelled[0].0, k);
+    assert_ne!(s.cancelled[0].1, s.page_jobs[0]);
+    assert_ne!(s.cancelled[0].1, s.page_jobs[1]);
+    assert!(s.page_keys.iter().all(|seen| seen == &k));
+    drop(s);
+    assert!(h.shutdown());
+}
+
+#[test]
+fn preview_tail_pending_is_requeued_until_done() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    let k = key(Harness::Codex, "a");
+    {
+        let mut s = script.lock().unwrap();
+        s.pages.push_back(Ok(ReadProgress::Pending(WorkProgress {
+            records: 2,
+            expanded_bytes: 8,
+        })));
+        s.pages
+            .push_back(Ok(ReadProgress::Ready(event_page(&k, "reply"))));
+    }
+    let h = spawn(fake(Harness::Codex, &script));
+    until(&h, finished(1));
+    h.tx.send(WorkerRequest::PreviewTail {
+        request_id: 9,
+        key: k.clone(),
+        anchor: None,
+    })
+    .unwrap();
+    let events = until(&h, |e| {
+        matches!(e, WorkerEvent::PreviewTail { request_id: 9, .. })
+    });
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            WorkerEvent::LoadProgress {
+                request_id: 9,
+                records: 2,
+                expanded_bytes: 8
+            }
+        )),
+        "pending progress is reported while the tail is retried"
+    );
+    match events.last() {
+        Some(WorkerEvent::PreviewTail { key: got, page, .. }) => {
+            assert_eq!(got, &k);
+            assert_eq!(page.events.first().map(|e| e.id.as_str()), Some("reply"));
+        }
+        other => panic!("expected a completed preview tail, got {other:?}"),
+    }
+    let s = script.lock().unwrap();
+    assert_eq!(s.page_calls, 2, "pending is requeued once, then done");
+    assert_eq!(
+        s.page_requests,
+        vec![
+            (None, PageDirection::Backward),
+            (None, PageDirection::Backward)
+        ]
+    );
+    drop(s);
     assert!(h.shutdown());
 }

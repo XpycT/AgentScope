@@ -5,12 +5,14 @@ use std::time::Duration;
 mod support;
 
 use agentscope::app::{
-    App, FilterState, FilterTarget, GroupTotals, PreviewState, RosterItem, SortMode,
-    UsageAvailability,
+    ACTIVITY_DEBOUNCE_MS, ActivityState, App, FilterState, FilterTarget, GroupTotals, PreviewState,
+    RosterItem, SortMode, UsageAvailability,
 };
 use agentscope::domain::*;
 use agentscope::providers::WorkProgress;
-use agentscope::worker::WorkerRequest;
+use agentscope::roster::RosterSnapshot;
+use agentscope::ui::{RosterContext, apply_worker_event};
+use agentscope::worker::{WorkerEvent, WorkerRequest};
 use support::facts::{self, file_key, metadata};
 
 const NOW: Timestamp = 10_000_000;
@@ -1685,4 +1687,598 @@ fn a_child_selection_is_hydrated_once_and_a_filter_that_drops_it_selects_a_visib
     if let Some(selected) = app.selected_key() {
         assert_eq!(preview_keys(&requests), [selected]);
     }
+}
+
+// ---- Task 5: bounded last-activity read for the preview --------------------
+
+fn empty_page() -> TranscriptPage {
+    TranscriptPage {
+        events: vec![],
+        diagnostics: vec![],
+        next: None,
+        has_more: false,
+        truncated: false,
+    }
+}
+
+fn reply_event(key: &SessionKey, i: u64, text: &str) -> Event {
+    let mut event = event_for(key, i);
+    event.text = Some(BoundedText {
+        preview: text.to_owned(),
+        byte_len: text.len(),
+        truncated: false,
+        locator: None,
+    });
+    event
+}
+
+fn tool_event(key: &SessionKey, i: u64, name: &str, input: &str) -> Event {
+    let mut event = event_for(key, i);
+    event.kind = EventKind::Tool;
+    event.actor = Actor::Assistant;
+    event.text = None;
+    event.tool = Some(ToolInteraction {
+        name: name.to_owned(),
+        call_id: None,
+        input: Some(BoundedText {
+            preview: input.to_owned(),
+            byte_len: input.len(),
+            truncated: false,
+            locator: None,
+        }),
+        output: None,
+        status: ToolStatus::Completed,
+        exit_code: None,
+        started_at: None,
+        completed_at: None,
+        orphan: false,
+        child_session: None,
+    });
+    event
+}
+
+fn activity_page(events: Vec<Event>, has_more: bool) -> TranscriptPage {
+    let next = events.first().map(anchor_of);
+    TranscriptPage {
+        events,
+        diagnostics: vec![],
+        next,
+        has_more,
+        truncated: false,
+    }
+}
+
+/// Drain the queued activity read request, if one was issued.
+fn take_activity_request(app: &mut App) -> Option<u64> {
+    app.take_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            WorkerRequest::PreviewTail { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+}
+
+/// Register the current selection with the debounce and return the request id
+/// the settled selection issues.
+fn request_activity(app: &mut App, at: u64) -> u64 {
+    app.settle_selection(at);
+    app.settle_selection(at + ACTIVITY_DEBOUNCE_MS);
+    take_activity_request(app).expect("the settled selection asks for its activity")
+}
+
+#[test]
+fn activity_requested_once_after_debounce() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let key = a.meta.key.clone();
+    app.apply_roster(vec![a], vec![]);
+    app.take_requests(); // the initial preview hydration
+
+    app.settle_selection(0);
+    assert!(
+        app.take_requests().is_empty(),
+        "a changed selection only starts the timer"
+    );
+    app.settle_selection(149);
+    assert!(app.take_requests().is_empty(), "not yet settled");
+    app.settle_selection(150);
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::PreviewTail {
+            request_id,
+            key: asked,
+            anchor: None,
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected one newest-page activity read, got {requests:?}");
+    };
+    assert_eq!(asked, &key);
+    let _ = request_id;
+    assert_eq!(app.activity(&key), Some(&ActivityState::Loading));
+
+    app.settle_selection(10_000);
+    assert!(
+        app.take_requests().is_empty(),
+        "an unsettled read is not requested twice"
+    );
+}
+
+#[test]
+fn selection_change_cancels_inflight_activity() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let b = session(Harness::Claude, "b", NOW - 2_000);
+    let (ka, kb) = (a.meta.key.clone(), b.meta.key.clone());
+    app.apply_roster(vec![a, b], vec![]);
+    app.take_requests();
+    let first = request_activity(&mut app, 0);
+    assert_eq!(app.activity(&ka), Some(&ActivityState::Loading));
+
+    // Moving the selection abandons A's read immediately, before B is settled.
+    app.move_selection(1);
+    assert_eq!(app.selected_key(), Some(kb.clone()));
+    app.take_requests();
+    app.settle_selection(1_000);
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::CancelLoad {
+            request_id: cancelled,
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected A's read to be released, got {requests:?}");
+    };
+    assert_eq!(cancelled, &first);
+    assert!(
+        app.activity(&ka).is_none(),
+        "the abandoned read has no entry"
+    );
+
+    // B's own timer starts on the same tick and asks only after the debounce.
+    app.settle_selection(1_149);
+    assert!(app.take_requests().is_empty());
+    app.settle_selection(1_150);
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::PreviewTail {
+            request_id: second,
+            key: asked,
+            anchor: None,
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected B's activity read, got {requests:?}");
+    };
+    assert_eq!(asked, &kb);
+    assert_eq!(app.activity(&kb), Some(&ActivityState::Loading));
+
+    // A late page for A cannot land, and cannot request a scan-back page.
+    let late = activity_page(
+        vec![tool_event(&ka, 10, "exec", r#"{"command":"cargo test"}"#)],
+        true,
+    );
+    assert!(!app.apply_activity(first, ka.clone(), late));
+    assert!(app.activity(&ka).is_none());
+    assert!(
+        take_activity_request(&mut app).is_none(),
+        "an abandoned read never scans back"
+    );
+    let _ = second;
+}
+
+#[test]
+fn activity_scans_back_at_most_one_page() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let key = a.meta.key.clone();
+    app.apply_roster(vec![a], vec![]);
+    app.take_requests();
+    let id = request_activity(&mut app, 0);
+
+    let tool = tool_event(&key, 10, "exec", r#"{"command":"cargo test"}"#);
+    let first = TranscriptPage {
+        events: vec![tool.clone()],
+        diagnostics: vec![],
+        next: Some(anchor_of(&tool)),
+        has_more: true,
+        truncated: false,
+    };
+    assert!(app.apply_activity(id, key.clone(), first));
+    assert_eq!(app.activity(&key), Some(&ActivityState::Loading));
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::PreviewTail {
+            request_id,
+            key: asked,
+            anchor: Some(older),
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected one older-page read, got {requests:?}");
+    };
+    assert_eq!(request_id, &id);
+    assert_eq!(asked, &key);
+    assert_eq!(older, &anchor_of(&tool));
+
+    // The older page supplies the reply; the newest page keeps the tool line.
+    let reply = reply_event(&key, 1, "older reply");
+    let second = TranscriptPage {
+        events: vec![reply.clone()],
+        diagnostics: vec![],
+        next: Some(anchor_of(&reply)),
+        has_more: true,
+        truncated: false,
+    };
+    assert!(app.apply_activity(*request_id, key.clone(), second));
+    assert!(
+        app.take_requests().is_empty(),
+        "scan-back is bounded to one older page"
+    );
+    let Some(ActivityState::Ready(activity)) = app.activity(&key) else {
+        panic!(
+            "expected a ready activity state, got {:?}",
+            app.activity(&key)
+        );
+    };
+    assert_eq!(
+        activity.reply.as_ref().map(|text| text.preview.as_str()),
+        Some("older reply")
+    );
+    assert_eq!(
+        activity.tool.as_ref().map(|line| line.name.as_str()),
+        Some("exec")
+    );
+    assert_eq!(activity.at, Some(NOW + 10), "the newest event wins the age");
+}
+
+#[test]
+fn activity_nothing_and_failed_states() {
+    let mut app = app();
+    let mut a = session(Harness::Codex, "a", NOW - 1_000);
+    a.displayed_event_count = 4;
+    let key = a.meta.key.clone();
+    app.apply_roster(vec![a.clone()], vec![]);
+    app.take_requests();
+
+    let id = request_activity(&mut app, 0);
+    assert!(app.apply_activity(id, key.clone(), empty_page()));
+    assert_eq!(app.activity(&key), Some(&ActivityState::Nothing));
+
+    // An append drops the entry, so the next settled selection reads again.
+    a.displayed_event_count = 5;
+    app.apply_roster(vec![a], vec![]);
+    app.take_requests();
+    assert!(app.activity(&key).is_none());
+    app.settle_selection(1_000);
+    let failed_id = take_activity_request(&mut app).expect("a fresh read after the append");
+    app.load_failed(failed_id);
+    assert_eq!(app.activity(&key), Some(&ActivityState::Failed));
+
+    app.settle_selection(10_000);
+    assert!(
+        app.take_requests().is_empty(),
+        "a failed read waits for invalidation, not the next tick"
+    );
+}
+
+#[test]
+fn activity_cache_invalidated_on_roster_change() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let key = a.meta.key.clone();
+    app.apply_roster(vec![a], vec![]);
+    app.take_requests();
+    let id = request_activity(&mut app, 0);
+    assert!(app.apply_activity(
+        id,
+        key.clone(),
+        activity_page(vec![reply_event(&key, 1, "reply")], false)
+    ));
+    assert!(matches!(app.activity(&key), Some(ActivityState::Ready(_))));
+
+    // The same protected session changed in the refreshed roster.
+    app.apply_roster(vec![session(Harness::Codex, "a", NOW - 500)], vec![]);
+    assert!(
+        app.activity(&key).is_none(),
+        "a changed session drops its cached activity"
+    );
+    app.take_requests();
+    app.settle_selection(1_000);
+    assert!(
+        take_activity_request(&mut app).is_some(),
+        "the settled selection reads the changed session again"
+    );
+}
+
+#[test]
+fn activity_cache_invalidated_on_append() {
+    let mut app = app();
+    let mut a = session(Harness::Codex, "a", NOW - 1_000);
+    a.displayed_event_count = 5;
+    let key = a.meta.key.clone();
+    assert!(app.apply_roster_snapshot(support::snapshot(1, vec![a.clone()], done_scan()), vec![]));
+    app.take_requests();
+    let id = request_activity(&mut app, 0);
+    assert!(app.apply_activity(
+        id,
+        key.clone(),
+        activity_page(vec![reply_event(&key, 1, "reply")], false)
+    ));
+    assert!(matches!(app.activity(&key), Some(ActivityState::Ready(_))));
+
+    a.displayed_event_count = 6;
+    assert!(app.apply_roster_snapshot(support::snapshot(2, vec![a], done_scan()), vec![]));
+    assert!(
+        app.activity(&key).is_none(),
+        "a larger displayed event count clears the cached entry"
+    );
+}
+
+#[test]
+fn change_during_inflight_read_discards_late_page() {
+    let mut app = app();
+    let mut a = session(Harness::Codex, "a", NOW - 1_000);
+    a.displayed_event_count = 2;
+    let key = a.meta.key.clone();
+    app.apply_roster(vec![a.clone()], vec![]);
+    app.take_requests();
+    let id = request_activity(&mut app, 0);
+    assert_eq!(app.activity(&key), Some(&ActivityState::Loading));
+
+    a.displayed_event_count = 3;
+    app.apply_roster(vec![a], vec![]);
+    let requests = app.take_requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| matches!(request, WorkerRequest::CancelLoad { request_id } if *request_id == id)),
+        "the in-flight read is released when the fingerprint changes"
+    );
+    assert!(app.activity(&key).is_none());
+
+    let late = activity_page(vec![reply_event(&key, 1, "late reply")], false);
+    assert!(
+        !app.apply_activity(id, key.clone(), late),
+        "a page answering the cancelled read is stale"
+    );
+    assert!(app.activity(&key).is_none());
+}
+
+#[test]
+fn preview_hydration_change_invalidates_activity() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let key = a.meta.key.clone();
+    app.apply_roster(vec![a.clone()], vec![]);
+    let requests = app.take_requests();
+    let preview_id = requests
+        .iter()
+        .find_map(|request| match request {
+            WorkerRequest::HydratePreview { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .expect("the initial preview hydration");
+
+    let id = request_activity(&mut app, 0);
+    assert!(app.apply_activity(
+        id,
+        key.clone(),
+        activity_page(vec![reply_event(&key, 1, "reply")], false)
+    ));
+    assert!(matches!(app.activity(&key), Some(ActivityState::Ready(_))));
+
+    // Hydration can change the fingerprint without a roster refresh.
+    let mut hydrated = a;
+    hydrated.last_event_at = Some(NOW + 5);
+    hydrated.displayed_event_count = 9;
+    assert!(app.apply_preview(preview_id, key.clone(), Arc::new(hydrated), true));
+    assert!(
+        app.activity(&key).is_none(),
+        "the hydrated summary invalidates the cached tail"
+    );
+}
+
+#[test]
+fn activity_cache_evicts_least_recent_beyond_cap() {
+    let mut app = app();
+    let sessions: Vec<SessionSummary> = (0..65)
+        .map(|i| {
+            session(
+                Harness::Codex,
+                &format!("s{i:02}"),
+                NOW - i as Timestamp * 1_000,
+            )
+        })
+        .collect();
+    let keys: Vec<SessionKey> = sessions.iter().map(|s| s.meta.key.clone()).collect();
+    app.apply_roster(sessions, vec![]);
+    app.take_requests();
+
+    // Fill the cache with the first 64 sessions in selection order.
+    for (i, key) in keys.iter().take(64).enumerate() {
+        if i > 0 {
+            app.move_selection(1);
+        }
+        assert_eq!(app.selected_key().as_ref(), Some(key));
+        let at = i as u64 * 1_000;
+        let id = request_activity(&mut app, at);
+        assert!(app.apply_activity(id, key.clone(), empty_page()));
+        assert!(matches!(app.activity(key), Some(ActivityState::Nothing)));
+    }
+
+    // Touch #1 without reading it again.
+    app.move_selection(-63);
+    assert_eq!(app.selected_key().as_ref(), Some(&keys[0]));
+    app.settle_selection(100_000);
+    app.settle_selection(100_150);
+    assert!(
+        take_activity_request(&mut app).is_none(),
+        "a cached entry is not read again"
+    );
+
+    // Inserting the 65th evicts the least recently touched (#2), not #1.
+    app.move_selection(64);
+    assert_eq!(app.selected_key().as_ref(), Some(&keys[64]));
+    let id = request_activity(&mut app, 200_000);
+    assert!(app.apply_activity(id, keys[64].clone(), empty_page()));
+
+    assert!(
+        app.activity(&keys[0]).is_some(),
+        "#1 was touched and survives"
+    );
+    assert!(app.activity(&keys[1]).is_none(), "#2 is evicted");
+    assert!(app.activity(&keys[2]).is_some());
+    assert!(app.activity(&keys[64]).is_some());
+}
+
+#[test]
+fn activity_cancels_when_next_selection_is_cached_or_none() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let b = session(Harness::Claude, "b", NOW - 2_000);
+    let (ka, kb) = (a.meta.key.clone(), b.meta.key.clone());
+    app.apply_roster(vec![a, b], vec![]);
+    app.take_requests();
+
+    // Cache B's activity while B is selected.
+    app.move_selection(1);
+    app.take_requests();
+    let bid = request_activity(&mut app, 0);
+    assert!(app.apply_activity(bid, kb.clone(), empty_page()));
+    assert!(matches!(app.activity(&kb), Some(ActivityState::Nothing)));
+
+    // Start A's read, then return to the already-cached B: A is released even
+    // though B will not start a read of its own.
+    app.move_selection(-1);
+    app.take_requests();
+    let aid = request_activity(&mut app, 1_000);
+    assert_eq!(app.activity(&ka), Some(&ActivityState::Loading));
+    app.move_selection(1);
+    app.take_requests();
+    app.settle_selection(2_000);
+    let requests = app.take_requests();
+    let [WorkerRequest::CancelLoad { request_id }] = requests.as_slice() else {
+        panic!("expected A's read to be released for a cached selection, got {requests:?}");
+    };
+    assert_eq!(request_id, &aid);
+    app.settle_selection(2_150);
+    assert!(
+        app.take_requests().is_empty(),
+        "a cached selection asks for nothing"
+    );
+    assert!(matches!(app.activity(&kb), Some(ActivityState::Nothing)));
+    assert!(app.activity(&ka).is_none());
+
+    // No selection also releases the in-flight read.
+    app.move_selection(-1);
+    app.take_requests();
+    let aid = request_activity(&mut app, 3_000);
+    assert_eq!(app.activity(&ka), Some(&ActivityState::Loading));
+    app.apply_roster(vec![], vec![]);
+    app.take_requests();
+    assert_eq!(app.selected_key(), None);
+    app.settle_selection(4_000);
+    let requests = app.take_requests();
+    let [WorkerRequest::CancelLoad { request_id }] = requests.as_slice() else {
+        panic!("expected the read to be released with no selection, got {requests:?}");
+    };
+    assert_eq!(request_id, &aid);
+    assert!(app.activity(&ka).is_none());
+}
+
+#[test]
+fn activity_invalidation_cancels_inflight_read() {
+    let mut app = app();
+    let a = session(Harness::Codex, "a", NOW - 1_000);
+    let key = a.meta.key.clone();
+    app.apply_roster(vec![a], vec![]);
+    app.take_requests();
+    let id = request_activity(&mut app, 0);
+    assert_eq!(app.activity(&key), Some(&ActivityState::Loading));
+
+    let mut ctx = RosterContext::default();
+    apply_worker_event(
+        &mut app,
+        &mut ctx,
+        WorkerEvent::TranscriptInvalidated { key: key.clone() },
+    );
+    let requests = app.take_requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| matches!(request, WorkerRequest::CancelLoad { request_id } if *request_id == id)),
+        "invalidation releases the worker job, not just the cache entry: {requests:?}"
+    );
+    assert!(app.activity(&key).is_none());
+
+    // The invalidated page is stale and cannot request the scan-back page.
+    let first = activity_page(
+        vec![tool_event(&key, 10, "exec", r#"{"command":"cargo test"}"#)],
+        true,
+    );
+    assert!(!app.apply_activity(id, key.clone(), first));
+    assert!(
+        take_activity_request(&mut app).is_none(),
+        "an invalidated read never scans back"
+    );
+
+    // A replacement read starts once, for the settled selection.
+    app.settle_selection(1_000);
+    let fresh = take_activity_request(&mut app).expect("a replacement read after invalidation");
+    assert_ne!(fresh, id);
+    assert_eq!(app.activity(&key), Some(&ActivityState::Loading));
+}
+
+#[test]
+fn metadata_only_row_hydration_invalidates_activity() {
+    let mut app = app();
+    let mut meta = metadata(key(Harness::Codex, "m"), "metadata only");
+    meta.activity = ActivityStamp {
+        at: Some(NOW - 1_000),
+        class: AggregationClass::Reported,
+    };
+    let mk = meta.key.clone();
+    let snapshot = RosterSnapshot {
+        generation: 1,
+        roots: vec![mk.clone()].into(),
+        metadata: vec![Arc::new(meta.clone())],
+        summaries: vec![],
+        scan: vec![done_scan()],
+        has_more: false,
+        limited: None,
+        refresh_available: false,
+        provisional: false,
+    };
+    assert!(app.apply_roster_snapshot(snapshot, vec![]));
+    assert_eq!(app.selected_key(), Some(mk.clone()));
+    let requests = app.take_requests();
+    let preview_id = requests
+        .iter()
+        .find_map(|request| match request {
+            WorkerRequest::HydratePreview { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .expect("the metadata row asks for hydration");
+
+    let id = request_activity(&mut app, 0);
+    assert!(app.apply_activity(
+        id,
+        mk.clone(),
+        activity_page(vec![reply_event(&mk, 1, "reply")], false)
+    ));
+    assert!(matches!(app.activity(&mk), Some(ActivityState::Ready(_))));
+
+    // The placeholder cut (None, 0), so the first hydration with real facts is
+    // a change even when no earlier summary was ever observed.
+    let hydrated = SessionSummary {
+        last_event_at: Some(NOW),
+        displayed_event_count: 3,
+        ..SessionSummary::unhydrated(meta)
+    };
+    assert!(app.apply_preview(preview_id, mk.clone(), Arc::new(hydrated), true));
+    assert!(
+        app.activity(&mk).is_none(),
+        "the first hydration invalidates the metadata row's cached activity"
+    );
 }

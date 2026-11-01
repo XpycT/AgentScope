@@ -546,7 +546,17 @@ pub fn apply_worker_event(app: &mut App, ctx: &mut RosterContext, event: WorkerE
         WorkerEvent::Transcript { request_id, page } => {
             app.apply_transcript(request_id, page);
         }
-        WorkerEvent::TranscriptInvalidated { key } => app.invalidate_transcript(&key),
+        WorkerEvent::PreviewTail {
+            request_id,
+            key,
+            page,
+        } => {
+            app.apply_activity(request_id, key, page);
+        }
+        WorkerEvent::TranscriptInvalidated { key } => {
+            app.invalidate_transcript(&key);
+            app.invalidate_activity(&key);
+        }
         WorkerEvent::Source { request_id, record } => {
             app.apply_source(request_id, record);
         }
@@ -624,8 +634,9 @@ pub fn run(
         if ctx.error.is_none() && !drain_worker(app, ctx, &worker) {
             worker_stopped(app, ctx);
         }
-        flush_requests(app, &worker);
         let now = now_millis();
+        app.settle_selection(now.max(0) as u64);
+        flush_requests(app, &worker);
         if now - last_clock >= 1000 {
             last_clock = now;
             app.set_now(now);

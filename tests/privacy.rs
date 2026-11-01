@@ -1533,3 +1533,167 @@ fn pi_titles_prompts_and_decoys_never_surface() {
         assert!(!format!("{record:?}").contains("Pi private"));
     }
 }
+
+// ---- Task 5: last-activity cache ingest and diagnostics --------------------
+
+/// The cached activity block is what the preview renders: its text must already
+/// be sanitized and credential-masked at ingest, exactly like a transcript
+/// event's preview.
+#[test]
+fn activity_render_redacts_credentials_and_controls() {
+    use agentscope::app::ACTIVITY_DEBOUNCE_MS;
+    use agentscope::domain::{
+        ActivityStamp, Actor, AggregationClass, BoundedText, EventKind, Provenance, SessionSummary,
+        SourceLocator, ToolInteraction, ToolStatus, TranscriptPage,
+    };
+    use support::facts::{file_key, metadata};
+
+    let key = file_key(
+        Harness::Codex,
+        "activity",
+        std::path::Path::new("activity.jsonl"),
+    );
+    let mut meta = metadata(key.clone(), "activity");
+    meta.activity = ActivityStamp {
+        at: Some(support::NOW),
+        class: AggregationClass::Reported,
+    };
+    let summary = SessionSummary {
+        last_event_at: Some(support::NOW),
+        ..SessionSummary::unhydrated(meta)
+    };
+    let mut app = App::new(
+        support::NOW,
+        Thresholds {
+            quiet: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+        },
+    );
+    app.apply_roster(vec![summary], vec![]);
+    app.take_requests();
+    app.settle_selection(0);
+    app.settle_selection(ACTIVITY_DEBOUNCE_MS);
+    let request_id = app
+        .take_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            WorkerRequest::PreviewTail { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .expect("the settled selection requests its activity");
+
+    let hostile_reply = format!("password={INLINE_SECRET} \u{1b}[2J");
+    let hostile_command = format!("curl -H 'Authorization: Bearer {SENTINEL}' \u{1b}[31m");
+    let event = |id: &str,
+                 source_order: u64,
+                 kind: EventKind,
+                 text: Option<&str>,
+                 tool: Option<ToolInteraction>| Event {
+        id: id.into(),
+        session: key.clone(),
+        timestamp: Some(support::NOW),
+        source_order,
+        kind,
+        actor: Actor::Assistant,
+        text: text.map(|preview| BoundedText {
+            preview: preview.to_owned(),
+            byte_len: preview.len(),
+            truncated: false,
+            locator: None,
+        }),
+        tool,
+        usage: None,
+        provenance: Provenance {
+            harness: Harness::Codex,
+            source: key.source.clone(),
+            locator: SourceLocator {
+                session: key.clone(),
+                kind: agentscope::domain::LocatorKind::FileOffset {
+                    path: "activity.jsonl".into(),
+                    offset: source_order,
+                },
+                generation: None,
+            },
+            record_type: "test".into(),
+            harness_version: None,
+        },
+    };
+    let tool = ToolInteraction {
+        name: "exec\u{1b}[2J".to_owned(),
+        call_id: None,
+        input: Some(BoundedText {
+            preview: serde_json::json!({"command": hostile_command}).to_string(),
+            byte_len: hostile_command.len(),
+            truncated: false,
+            locator: None,
+        }),
+        output: None,
+        status: ToolStatus::Completed,
+        exit_code: None,
+        started_at: None,
+        completed_at: None,
+        orphan: false,
+        child_session: None,
+    };
+    let page = TranscriptPage {
+        events: vec![
+            event("e1", 1, EventKind::Tool, None, Some(tool)),
+            event(
+                "e2",
+                2,
+                EventKind::AssistantMessage,
+                Some(&hostile_reply),
+                None,
+            ),
+        ],
+        diagnostics: vec![],
+        next: None,
+        has_more: false,
+        truncated: false,
+    };
+    assert!(app.apply_activity(request_id, key.clone(), page));
+
+    let Some(agentscope::app::ActivityState::Ready(activity)) = app.activity(&key) else {
+        panic!("expected ready activity, got {:?}", app.activity(&key));
+    };
+    let reply = activity.reply.as_ref().expect("the assistant reply");
+    let line = activity.tool.as_ref().expect("the tool line");
+    assert_clean("activity reply", &reply.preview);
+    assert_clean("activity tool name", &line.name);
+    assert_clean("activity tool summary", &line.summary);
+    assert!(
+        reply.preview.contains("[REDACTED]"),
+        "the credential is masked, not dropped silently: {}",
+        reply.preview
+    );
+    assert!(
+        line.summary.contains("[REDACTED]"),
+        "the tool credential is masked: {}",
+        line.summary
+    );
+}
+
+#[test]
+fn activity_debug_is_content_free() {
+    use agentscope::app::{ActivityState, LastActivity, ToolLine};
+    use agentscope::domain::{BoundedText, ToolStatus};
+
+    let line = ToolLine {
+        name: format!("{SENTINEL}\u{1b}[31m"),
+        status: ToolStatus::Completed,
+        summary: format!("password={INLINE_SECRET}"),
+    };
+    let activity = LastActivity {
+        tool: Some(line.clone()),
+        reply: Some(BoundedText {
+            preview: format!("{SENTINEL} \u{1b}[2J"),
+            byte_len: 10,
+            truncated: false,
+            locator: None,
+        }),
+        at: Some(support::NOW),
+    };
+    assert_clean_debug("ToolLine", &line);
+    assert_clean_debug("LastActivity", &activity);
+    assert_clean_debug("ActivityState", &ActivityState::Ready(activity));
+}

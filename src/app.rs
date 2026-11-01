@@ -17,6 +17,7 @@ use crate::roster::{DiscoveryLimit, RosterSnapshot, cmp_keys};
 use crate::status::synthesize;
 use crate::worker::WorkerRequest;
 
+mod activity;
 mod input;
 mod overlay;
 mod preview;
@@ -24,6 +25,10 @@ mod roster;
 mod search;
 mod transcript;
 mod turns;
+pub use activity::{
+    ACTIVITY_CACHE_CAP, ACTIVITY_DEBOUNCE_MS, ActivityCache, ActivityState, ActivityStep,
+    LastActivity, PendingActivity, ToolLine,
+};
 pub use input::{FilterItem, FilterTarget, Panel, ProcessView, SearchScope};
 pub use overlay::{MAX_SOURCE_BYTES, SourceState, SourceView};
 pub use preview::{DetailsState, PreviewState};
@@ -186,6 +191,12 @@ pub struct App {
     preview_generation: u64,
     /// Progress of cached preview facts while hydration continues.
     preview_progress: WorkProgress,
+    /// Cached last-activity reads for the preview pane.
+    activity: ActivityCache,
+    /// Selection the activity debounce is timing; `None` until first settled.
+    activity_selection: Option<SessionKey>,
+    /// When `activity_selection` last changed, in epoch milliseconds.
+    activity_since: u64,
     /// Paged detailed facts of the open session.
     details: DetailsState,
     /// Outstanding child requests by ID, with the generation they were asked in.
@@ -229,6 +240,9 @@ impl App {
             preview: PreviewState::Empty,
             preview_generation: 0,
             preview_progress: WorkProgress::default(),
+            activity: ActivityCache::default(),
+            activity_selection: None,
+            activity_since: 0,
             details: DetailsState::default(),
             child_requests: HashMap::new(),
             roster_view: roster::RosterView::default(),
@@ -254,6 +268,14 @@ impl App {
             hydrated,
             warnings,
         );
+        let fingerprints: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|s| (s.meta.key.clone(), s.last_event_at, s.displayed_event_count))
+            .collect();
+        for (key, last_event_at, count) in fingerprints {
+            self.observe_activity(&key, last_event_at, count);
+        }
     }
 
     /// Apply a worker roster publication. Returns `false` (and changes nothing) for a
@@ -339,6 +361,17 @@ impl App {
             self.preview_generation = 0;
         }
         self.install(sessions, hydrated, warnings);
+        // Every installed row is observed, including metadata-only placeholders:
+        // their first hydration must be able to detect a change against the
+        // unhydrated baseline and invalidate an earlier activity read.
+        let fingerprints: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|s| (s.meta.key.clone(), s.last_event_at, s.displayed_event_count))
+            .collect();
+        for (key, last_event_at, count) in fingerprints {
+            self.observe_activity(&key, last_event_at, count);
+        }
         true
     }
 
@@ -399,6 +432,8 @@ impl App {
         self.child_requests.clear();
         self.preview = PreviewState::Empty;
         self.preview_generation = 0;
+        self.activity = ActivityCache::default();
+        self.activity_selection = None;
         self.details.reset();
         self.visual_selected = None;
         self.rebuild_groups();
@@ -477,6 +512,27 @@ impl App {
             list.next = next;
         }
         self.rebuild(previous);
+        let observed: Vec<_> = self
+            .children
+            .get(parent)
+            .map(|list| {
+                list.metadata
+                    .iter()
+                    .filter_map(|meta| {
+                        self.child_summaries.get(&meta.key).map(|summary| {
+                            (
+                                meta.key.clone(),
+                                summary.last_event_at,
+                                summary.displayed_event_count,
+                            )
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (key, last_event_at, count) in observed {
+            self.observe_activity(&key, last_event_at, count);
+        }
         true
     }
 
@@ -638,6 +694,108 @@ impl App {
             self.preview = PreviewState::Failed { key };
         }
         self.details.fail(request_id);
+        self.activity.fail(request_id);
+    }
+
+    /// Cached last activity of `key`, for the preview's activity block.
+    pub fn activity(&self, key: &SessionKey) -> Option<&ActivityState> {
+        self.activity.get(key)
+    }
+
+    /// Ask for the settled selection's activity once it has not changed for
+    /// [`ACTIVITY_DEBOUNCE_MS`]. Safe to call every UI tick: an entry, a pending
+    /// read, or a selection still moving never asks twice.
+    pub fn settle_selection(&mut self, now_ms: u64) {
+        let Some(key) = self.selected.clone() else {
+            self.activity_selection = None;
+            self.cancel_activity();
+            return;
+        };
+        if self.activity_selection.as_ref() != Some(&key) {
+            // The selection just moved: the previous read can never answer for
+            // it, so it is released now — even when the new row is already
+            // cached and will not start a read of its own.
+            self.cancel_activity();
+            self.activity_selection = Some(key.clone());
+            self.activity_since = now_ms;
+            self.activity.touch(&key);
+            return;
+        }
+        if now_ms.saturating_sub(self.activity_since) < ACTIVITY_DEBOUNCE_MS {
+            return;
+        }
+        if self.activity.get(&key).is_some() {
+            return;
+        }
+        let request_id = self.next_request_id();
+        if let Some(old) = self.activity.begin(request_id, key.clone()) {
+            // The abandoned read must not answer for the new selection.
+            self.outbox
+                .push(WorkerRequest::CancelLoad { request_id: old });
+        }
+        self.outbox.push(WorkerRequest::PreviewTail {
+            request_id,
+            key,
+            anchor: None,
+        });
+    }
+
+    /// Merge one activity page. A `NeedOlder` step asks for exactly one older
+    /// page; a reply that does not answer the pending read changes nothing.
+    pub fn apply_activity(
+        &mut self,
+        request_id: u64,
+        key: SessionKey,
+        page: TranscriptPage,
+    ) -> bool {
+        match self.activity.apply_page(request_id, &key, &page) {
+            ActivityStep::Done => true,
+            ActivityStep::Stale => false,
+            ActivityStep::NeedOlder(anchor) => {
+                // `apply_page` marked the pending read as scanned back, so this
+                // is the only older page the cache will ever ask for.
+                self.outbox.push(WorkerRequest::PreviewTail {
+                    request_id,
+                    key,
+                    anchor: Some(anchor),
+                });
+                true
+            }
+        }
+    }
+
+    /// The session changed in place: drop its cached activity. A late page for
+    /// an in-flight read no longer matches and is ignored, and its worker job is
+    /// cancelled rather than left retrying.
+    pub fn invalidate_activity(&mut self, key: &SessionKey) {
+        let cancelled = self.activity.pending_id(key);
+        self.activity.invalidate(key);
+        if let Some(old) = cancelled {
+            self.outbox
+                .push(WorkerRequest::CancelLoad { request_id: old });
+        }
+    }
+
+    /// Release the in-flight activity read, if any.
+    fn cancel_activity(&mut self) {
+        if let Some(old) = self.activity.cancel_pending() {
+            self.outbox
+                .push(WorkerRequest::CancelLoad { request_id: old });
+        }
+    }
+
+    /// Record a session fingerprint; a change drops stale activity and cancels
+    /// its in-flight read.
+    fn observe_activity(
+        &mut self,
+        key: &SessionKey,
+        last_event_at: Option<Timestamp>,
+        count: usize,
+    ) {
+        if let Some(old) = self.activity.observe(key, last_event_at, count) {
+            self.outbox
+                .push(WorkerRequest::CancelLoad { request_id: old });
+        }
     }
 
     /// Request the newest page of the open session's detailed facts.
@@ -721,6 +879,7 @@ impl App {
 
     fn install_summary(&mut self, summary: Arc<SessionSummary>) {
         let key = summary.meta.key.clone();
+        let (last_event_at, count) = (summary.last_event_at, summary.displayed_event_count);
         let previous = self.selected_root_position();
         if let Some(i) = self.sessions.iter().position(|s| s.meta.key == key) {
             self.sessions[i] = summary.clone();
@@ -733,6 +892,7 @@ impl App {
             *placeholder = summary;
         }
         self.rebuild(previous);
+        self.observe_activity(&key, last_event_at, count);
     }
 
     /// The injected clock value used for status and age display.
