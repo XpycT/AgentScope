@@ -28,5 +28,6 @@ Thumbs.db
 /session-dumps/
 /session-exports/
 /agent-logs/
+/.scratch-*/
 
 # Rust app Cargo.lock is deliberately tracked.
