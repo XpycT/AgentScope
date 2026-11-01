@@ -533,7 +533,7 @@ fn new_metadata_is_display_safe() {
     assert!(app.open_inspector());
     let inspector = screen_text(&app, &ctx);
     assert_clean("inspector", &inspector);
-    assert!(inspector.contains("Model:"), "the model line is rendered");
+    assert!(inspector.contains("model "), "the model line is rendered");
     assert!(app.open_session_info());
     assert_clean("session info", &screen_text(&app, &ctx));
 

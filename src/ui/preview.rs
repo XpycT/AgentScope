@@ -307,7 +307,7 @@ fn context_text(session: &SessionSummary, hydrated: bool) -> String {
     }
 }
 
-fn status_age(session: &SessionSummary, now: Timestamp) -> Option<String> {
+pub(super) fn status_age(session: &SessionSummary, now: Timestamp) -> Option<String> {
     let at = [
         session.meta.activity.at,
         session.last_event_at,

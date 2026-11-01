@@ -4,12 +4,13 @@ use std::time::Duration;
 mod support;
 
 use agentscope::app::{
-    App, MAX_LOADED_EVENTS, NOISE_RECORD_TYPES, RowKind, tool_summary, turn_rows,
+    App, MAX_LOADED_EVENTS, NOISE_RECORD_TYPES, RowKind, Screen, tool_summary, turn_rows,
 };
 use agentscope::domain::*;
 use agentscope::time::format_local;
 use agentscope::ui::{RosterContext, render};
 use agentscope::worker::WorkerRequest;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -250,25 +251,25 @@ fn renders_header_usage_evidence_and_timeline() {
     let evidence = app.session(&key()).unwrap().status.evidence.clone();
     let out = draw(&app, 110, 30);
     for want in [
-        "< Back  CODEX / Inventory API",
-        "Project: RipperGame",
-        "Model: gpt-5.1-codex",
-        "Session: sess-1",
-        "Status: ",
+        "[CDX] Inventory API",
+        "quiet",
         evidence.as_str(),
-        "Tokens: 73,214 reported",
-        "Cost: ~$0.23 estimated",
-        "Context: 475k window",
-        "Process: unmatched — 2 candidates",
-        "user",
+        "project RipperGame",
+        "model gpt-5.1-codex",
+        "2 loaded",
+        "tokens 73k",
+        "cost ~$0.23",
+        "context 475k window",
+        "You",
         "Implement inventory checks",
-        "assistant",
+        "Agent",
         "I will inspect the code.",
         hm(t0).as_str(),
         "Esc back",
     ] {
         assert!(out.contains(want), "missing {want:?} in:\n{out}");
     }
+    assert!(!out.contains("Session: sess-1"), "{out}");
 }
 
 #[test]
@@ -276,11 +277,18 @@ fn renders_reported_context_window_and_server_tool_counts_and_unknown_otherwise(
     let mut app = app_with(summary(1));
     open(&mut app, page(vec![msg(0)], None, false));
     let out = draw(&app, 110, 30);
-    assert!(out.contains("Context: 475k window"), "{out}");
+    assert!(out.contains("context 475k window"), "{out}");
     assert!(
-        out.contains("Server tools: web_search 3 · web_fetch 1"),
-        "{out}"
+        !out.contains("Server tools"),
+        "moved to session info:\n{out}"
     );
+    assert!(app.open_session_info());
+    let info = draw(&app, 140, 40);
+    assert!(
+        info.contains("Server tools: web_search 3 · web_fetch 1"),
+        "{info}"
+    );
+    assert!(app.close_overlay());
 
     let mut bare = summary(1);
     bare.metrics.context.capacity = None;
@@ -288,8 +296,10 @@ fn renders_reported_context_window_and_server_tool_counts_and_unknown_otherwise(
     let mut app = app_with(bare);
     open(&mut app, page(vec![msg(0)], None, false));
     let out = draw(&app, 110, 30);
-    assert!(out.contains("Context: Unknown"), "{out}");
-    assert!(out.contains("Server tools: Unknown"), "{out}");
+    assert!(!out.contains("context "), "{out}");
+    assert!(app.open_session_info());
+    let info = draw(&app, 140, 40);
+    assert!(info.contains("Server tools: Unknown"), "{info}");
 }
 
 #[test]
@@ -319,32 +329,35 @@ fn expands_a_tool_row_and_shows_status_duration_exit_and_truncation() {
     // The latest row opens expanded; collapsing it hides the details without
     // recording a manual expansion.
     let expanded = draw(&app, 110, 30);
-    assert!(expanded.contains("shell cargo test --all"), "{expanded}");
-    assert!(expanded.contains("[collapse]"), "{expanded}");
-    assert!(expanded.contains("Duration: 1.2s"), "{expanded}");
+    assert!(expanded.contains("✗ shell cargo test --all"), "{expanded}");
+    assert!(expanded.contains("exit 1"), "{expanded}");
+    assert!(
+        expanded.contains("recorded preview · v opens the source"),
+        "{expanded}"
+    );
 
     app.inspector_toggle();
     let collapsed = draw(&app, 110, 30);
-    assert!(collapsed.contains("[expand]"), "{collapsed}");
-    assert!(!collapsed.contains("Duration:"), "{collapsed}");
+    assert!(!collapsed.contains("input:"), "{collapsed}");
+    assert!(!collapsed.contains("recorded preview"), "{collapsed}");
+    assert!(collapsed.contains("exit 1"), "{collapsed}");
 
     app.inspector_toggle();
     let out = draw(&app, 110, 30);
     for want in [
-        "[collapse]",
-        "Status: Error",
-        "Duration: 1.2s",
-        "Exit: 1",
-        "Input: cargo test --all",
+        "✗ shell cargo test --all",
+        "exit 1",
+        "input: cargo test --all",
         "[truncated: showing 16 of 9000 bytes]",
-        "Output: 2 failed assertions",
+        "output: 2 failed assertions",
         "second line",
+        "recorded preview · v opens the source",
     ] {
         assert!(out.contains(want), "missing {want:?} in:\n{out}");
     }
 
     app.inspector_toggle();
-    assert!(!draw(&app, 110, 30).contains("Duration:"));
+    assert!(!draw(&app, 110, 30).contains("input:"));
 }
 
 #[test]
@@ -421,16 +434,29 @@ fn labels_reasoning_as_provider_persisted_and_images_as_placeholders() {
     let image = event(1, EventKind::UserPrompt, "[image]");
     open(&mut app, page(vec![reasoning, image], None, false));
     let out = draw(&app, 110, 30);
-    assert!(out.contains("Provider reasoning (persisted)"), "{out}");
+    assert!(out.contains("reasoning: weighing the options"), "{out}");
+    assert!(!out.contains("Provider reasoning (persisted)"), "{out}");
     assert!(out.contains("[image]"), "{out}");
-    assert!(!out.contains("weighing the options"), "collapsed: {out}");
 
     // The transcript opens at its newest entry; the reasoning row is first.
     app.inspector_first();
     app.inspector_toggle();
     let out = draw(&app, 110, 30);
     assert!(out.contains("weighing the options"), "{out}");
-    assert!(out.contains("not hidden chain-of-thought"), "{out}");
+    assert!(
+        out.contains("recorded preview · v opens the source"),
+        "{out}"
+    );
+
+    // Details still names persisted provider reasoning rather than claiming
+    // hidden chain-of-thought.
+    assert!(app.open_details());
+    let details = draw(&app, 110, 30);
+    assert!(
+        details.contains("Provider reasoning (persisted)"),
+        "{details}"
+    );
+    assert!(details.contains("not hidden chain-of-thought"), "{details}");
 }
 
 #[test]
@@ -442,7 +468,8 @@ fn missing_timestamps_and_usage_show_unknown() {
     e.timestamp = None;
     open(&mut app, page(vec![e], None, false));
     let out = draw(&app, 110, 30);
-    assert!(out.contains("Tokens: Unknown · Cost: Unknown"), "{out}");
+    assert!(out.contains("tokens —"), "{out}");
+    assert!(out.contains("cost —"), "{out}");
     let row = out.lines().find(|l| l.contains("message 0")).unwrap();
     assert!(row.contains('—'), "{row}");
 }
@@ -1112,7 +1139,7 @@ fn keeps_the_selected_row_visible_when_expanded_rows_fill_the_viewport() {
     }
     assert_eq!(app.transcript().unwrap().selected(), 4);
     let out = draw(&app, 80, 20);
-    assert!(out.contains("> "), "{out}");
+    assert!(out.contains("▌"), "{out}");
     assert!(out.contains("SELECTED-ROW"), "{out}");
 }
 
@@ -1319,7 +1346,7 @@ fn session_info_is_reachable_by_key_and_listed_in_the_inspector_footer() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut app = app_with(summary(1));
     open_empty(&mut app);
-    assert!(draw(&app, 120, 30).contains("i session"));
+    assert!(draw(&app, 120, 30).contains("i info"));
     agentscope::ui::handle_key(
         &mut app,
         KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
@@ -1918,4 +1945,616 @@ fn model_and_thinking_changes_stay_visible() {
         assert_eq!(rows.len(), 1, "{record_type}");
         assert_eq!(rows[0].kind, RowKind::Other, "{record_type}");
     }
+}
+
+// ---- conversation rendering and child navigation (readability redesign) ----
+
+fn key_for(id: &str) -> SessionKey {
+    SessionKey {
+        harness: Harness::Codex,
+        native_id: id.into(),
+        source: SourceKey::File(format!("{id}.jsonl").into()),
+    }
+}
+
+fn session_for(id: &str, title: &str, count: usize) -> SessionSummary {
+    let mut s = summary(count);
+    s.meta.key = key_for(id);
+    s.meta.title = title.into();
+    s.meta.title_derived = false;
+    s
+}
+
+fn app_with_all(sessions: Vec<SessionSummary>) -> App {
+    let mut app = App::new(
+        NOW,
+        Thresholds {
+            quiet: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+        },
+    );
+    app.apply_roster(sessions, vec![]);
+    app
+}
+
+fn event_in(session: &SessionKey, i: u64, kind: EventKind, body: &str) -> Event {
+    let mut e = event(i, kind, body);
+    e.session = session.clone();
+    e
+}
+
+fn tool_in(session: &SessionKey, i: u64, child: Option<SessionLink>) -> Event {
+    let mut e = event_in(session, i, EventKind::Tool, "");
+    e.text = None;
+    e.tool = Some(ToolInteraction {
+        name: "task".into(),
+        call_id: Some(format!("call-{i}")),
+        input: Some(text("{\"description\":\"delegate the check\"}")),
+        output: Some(text("done")),
+        status: ToolStatus::Completed,
+        exit_code: None,
+        started_at: Some(NOW),
+        completed_at: Some(NOW + 1_500),
+        orphan: false,
+        child_session: child,
+    });
+    e
+}
+
+fn press(app: &mut App, code: KeyCode) {
+    agentscope::ui::handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+}
+
+fn take_select(app: &mut App, expected: &SessionKey) -> u64 {
+    let requests = app.take_requests();
+    requests
+        .iter()
+        .find_map(|request| match request {
+            WorkerRequest::Select { request_id, key } if key == expected => Some(*request_id),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected Select for {expected:?}, got {requests:?}"))
+}
+
+#[test]
+fn header_has_three_lines_with_dash_for_missing_cost() {
+    let mut s = summary(2);
+    s.usage = None;
+    let mut app = app_with(s);
+    open(&mut app, page(vec![msg(0), msg(1)], None, false));
+
+    let out = draw(&app, 110, 30);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].contains("[CDX] Inventory API"), "{:?}", lines[0]);
+    assert!(lines[0].contains("quiet"), "{:?}", lines[0]);
+    assert!(
+        lines[1].contains("project RipperGame")
+            && lines[1].contains("model gpt-5.1-codex")
+            && lines[1].contains("2 loaded"),
+        "{:?}",
+        lines[1]
+    );
+    assert!(
+        lines[2].contains("tokens —") && lines[2].contains("cost —"),
+        "{:?}",
+        lines[2]
+    );
+    assert!(
+        lines[3].chars().all(|c| c == '─'),
+        "the header is exactly three lines: {:?}",
+        lines.get(3)
+    );
+}
+
+#[test]
+fn renders_conversation_turns() {
+    let mut app = app_with(summary(6));
+    let mut tool = event(4, EventKind::Tool, "");
+    tool.text = None;
+    tool.tool = Some(ToolInteraction {
+        name: "shell".into(),
+        call_id: Some("c1".into()),
+        input: Some(text("{\"command\":\"cargo test\"}")),
+        output: Some(text("ok")),
+        status: ToolStatus::Completed,
+        exit_code: Some(0),
+        started_at: None,
+        completed_at: None,
+        orphan: false,
+        child_session: None,
+    });
+    let events = vec![
+        event(0, EventKind::UserPrompt, "Plan the refactor"),
+        auxiliary(1, "job-widget"),
+        auxiliary(2, "job-widget"),
+        event(3, EventKind::Reasoning, "reading the parser"),
+        tool,
+        event(5, EventKind::AssistantMessage, "The refactor is done."),
+    ];
+    open(&mut app, page(events, None, false));
+    let out = draw(&app, 110, 30);
+
+    let position = |needle: &str| {
+        out.lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in:\n{out}"))
+    };
+    let prompt = position("Plan the refactor");
+    let noise = position("· 2 auxiliary model calls (job-widget)");
+    let reasoning = position("reasoning: reading the parser");
+    let tool = position("✓ shell cargo test");
+    let reply = position("The refactor is done.");
+    assert!(
+        prompt < noise && noise < reasoning && reasoning < tool && tool < reply,
+        "rows follow the conversation:\n{out}"
+    );
+
+    let prompt_row = out.lines().nth(prompt).unwrap();
+    assert!(prompt_row.starts_with("  ▌ You"), "{prompt_row:?}");
+    let reasoning_row = out.lines().nth(reasoning).unwrap();
+    assert!(
+        reasoning_row.starts_with("    reasoning:"),
+        "{reasoning_row:?}"
+    );
+    let tool_row = out.lines().nth(tool).unwrap();
+    assert!(tool_row.starts_with("    ✓ shell"), "{tool_row:?}");
+    let reply_row = out.lines().nth(reply).unwrap();
+    assert!(reply_row.starts_with("▌ ▌ Agent"), "{reply_row:?}");
+    assert!(
+        out.contains("recorded preview · v opens the source"),
+        "{out}"
+    );
+}
+
+#[test]
+fn tool_row_shows_summary_glyph_and_exit() {
+    let mut app = app_with(summary(3));
+    let mut failed = event(1, EventKind::Tool, "");
+    failed.text = None;
+    failed.tool = Some(ToolInteraction {
+        name: "shell".into(),
+        call_id: Some("c1".into()),
+        input: Some(text("{\"command\":\"cargo test --all\"}")),
+        output: Some(text("2 failed assertions")),
+        status: ToolStatus::Error,
+        exit_code: Some(1),
+        started_at: Some(NOW),
+        completed_at: Some(NOW + 1_200),
+        orphan: false,
+        child_session: None,
+    });
+    let mut ok = event(2, EventKind::Tool, "");
+    ok.text = None;
+    ok.tool = Some(ToolInteraction {
+        name: "read_file".into(),
+        call_id: Some("c2".into()),
+        input: Some(text("{\"path\":\"src/main.rs\"}")),
+        output: Some(text("fn main()")),
+        status: ToolStatus::Completed,
+        exit_code: Some(0),
+        started_at: Some(NOW),
+        completed_at: Some(NOW + 40),
+        orphan: false,
+        child_session: None,
+    });
+    open(
+        &mut app,
+        page(
+            vec![event(0, EventKind::UserPrompt, "check"), failed, ok],
+            None,
+            false,
+        ),
+    );
+    let out = draw(&app, 110, 30);
+
+    let failed_row = out
+        .lines()
+        .find(|line| line.contains("shell cargo test --all"))
+        .unwrap();
+    assert!(
+        failed_row.contains("✗ shell cargo test --all"),
+        "{failed_row:?}"
+    );
+    assert!(failed_row.contains("exit 1"), "{failed_row:?}");
+    assert!(
+        !failed_row.contains("1.2s"),
+        "exit wins over duration: {failed_row:?}"
+    );
+
+    let ok_row = out
+        .lines()
+        .find(|line| line.contains("read_file src/main.rs"))
+        .unwrap();
+    assert!(ok_row.contains("✓ read_file src/main.rs"), "{ok_row:?}");
+    assert!(ok_row.contains("exit 0"), "{ok_row:?}");
+}
+
+#[test]
+fn reply_token_count_only_for_message_scope() {
+    let mut message = event(0, EventKind::AssistantMessage, "message scoped");
+    let mut usage = usage_with_purpose(RequestPurpose::Conversation);
+    usage.scope = UsageScope::Message;
+    usage.categories.total = Some(1_200);
+    message.usage = Some(usage);
+    let mut session = event(1, EventKind::AssistantMessage, "session scoped");
+    let mut usage = usage_with_purpose(RequestPurpose::Conversation);
+    usage.scope = UsageScope::Session;
+    usage.categories.total = Some(5_000);
+    session.usage = Some(usage);
+
+    let mut app = app_with(summary(2));
+    open(&mut app, page(vec![message, session], None, false));
+    let out = draw(&app, 110, 30);
+    let message_row = out
+        .lines()
+        .find(|line| line.contains("message scoped"))
+        .unwrap();
+    assert!(message_row.contains("1.2k"), "{message_row:?}");
+    let session_row = out
+        .lines()
+        .find(|line| line.contains("session scoped"))
+        .unwrap();
+    assert!(
+        !session_row.contains("5k"),
+        "session scope belongs in totals only: {session_row:?}"
+    );
+}
+
+#[test]
+fn expanded_row_labels_recorded_preview() {
+    let mut app = app_with(summary(2));
+    let mut tool = event(1, EventKind::Tool, "");
+    tool.text = None;
+    tool.tool = Some(ToolInteraction {
+        name: "shell".into(),
+        call_id: Some("c1".into()),
+        input: Some(text("cargo test --all")),
+        output: Some(text("finished in 1.2s")),
+        status: ToolStatus::Completed,
+        exit_code: Some(0),
+        started_at: None,
+        completed_at: None,
+        orphan: false,
+        child_session: None,
+    });
+    open(
+        &mut app,
+        page(
+            vec![event(0, EventKind::UserPrompt, "check"), tool],
+            None,
+            false,
+        ),
+    );
+
+    let expanded = draw(&app, 110, 30);
+    for want in [
+        "input: cargo test --all",
+        "output: finished in 1.2s",
+        "recorded preview · v opens the source",
+    ] {
+        assert!(expanded.contains(want), "missing {want:?}:\n{expanded}");
+    }
+    assert!(!expanded.contains("[expand]"), "{expanded}");
+    assert!(!expanded.contains("[collapse]"), "{expanded}");
+
+    app.inspector_toggle();
+    let collapsed = draw(&app, 110, 30);
+    assert!(!collapsed.contains("input:"), "{collapsed}");
+    assert!(!collapsed.contains("recorded preview"), "{collapsed}");
+
+    app.inspector_toggle();
+    assert!(draw(&app, 110, 30).contains("recorded preview · v opens the source"));
+}
+
+#[test]
+fn no_expand_labels_rendered() {
+    let mut app = app_with(summary(4));
+    let mut tool = event(2, EventKind::Tool, "");
+    tool.text = None;
+    tool.tool = Some(ToolInteraction {
+        name: "shell".into(),
+        call_id: None,
+        input: Some(text("cargo test")),
+        output: None,
+        status: ToolStatus::Completed,
+        exit_code: None,
+        started_at: None,
+        completed_at: None,
+        orphan: false,
+        child_session: None,
+    });
+    open(
+        &mut app,
+        page(
+            vec![
+                event(0, EventKind::UserPrompt, "prompt"),
+                event(1, EventKind::Reasoning, "thinking"),
+                tool,
+                event(3, EventKind::AssistantMessage, "reply"),
+            ],
+            None,
+            false,
+        ),
+    );
+    let out = draw(&app, 110, 30);
+    assert!(!out.contains("[expand]"), "{out}");
+    assert!(!out.contains("[collapse]"), "{out}");
+}
+
+fn child_pair() -> (App, SessionKey, SessionKey) {
+    let parent = key();
+    let child = key_for("child-1");
+    let mut app = app_with_all(vec![summary(2), session_for("child-1", "Child work", 1)]);
+    assert!(app.select_row(&parent));
+    (app, parent, child)
+}
+
+#[test]
+fn o_opens_child_and_esc_returns_to_parent_selection() {
+    let (mut app, parent, child) = child_pair();
+    let parent_page = page(
+        vec![
+            event_in(&parent, 0, EventKind::UserPrompt, "Investigate the failure"),
+            tool_in(&parent, 1, Some(SessionLink::Resolved(child.clone()))),
+        ],
+        None,
+        false,
+    );
+    open(&mut app, parent_page.clone());
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.screen, Screen::Inspector);
+    assert_eq!(app.transcript().unwrap().key(), &child);
+    assert_eq!(app.selected_key(), Some(child.clone()));
+    let request = take_select(&mut app, &child);
+    let child_page = page(
+        vec![event_in(
+            &child,
+            0,
+            EventKind::AssistantMessage,
+            "child reply",
+        )],
+        None,
+        false,
+    );
+    assert!(app.apply_transcript(request, child_page));
+
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.screen, Screen::Inspector);
+    assert_eq!(app.transcript().unwrap().key(), &parent);
+    assert_eq!(app.selected_key(), Some(parent.clone()));
+    let request = take_select(&mut app, &parent);
+    assert!(app.apply_transcript(request, parent_page));
+    assert_eq!(
+        app.transcript().unwrap().selected_event().unwrap().id,
+        "e1",
+        "the tool row that opened the child is selected again"
+    );
+}
+
+#[test]
+fn nested_children_pop_in_order() {
+    let parent = key();
+    let child = key_for("child-1");
+    let grandchild = key_for("child-2");
+    let mut app = app_with_all(vec![
+        summary(2),
+        session_for("child-1", "Child work", 2),
+        session_for("child-2", "Grandchild work", 1),
+    ]);
+    assert!(app.select_row(&parent));
+
+    let parent_page = page(
+        vec![
+            event_in(&parent, 0, EventKind::UserPrompt, "parent prompt"),
+            tool_in(&parent, 1, Some(SessionLink::Resolved(child.clone()))),
+        ],
+        None,
+        false,
+    );
+    let child_page = page(
+        vec![
+            event_in(&child, 0, EventKind::UserPrompt, "child prompt"),
+            tool_in(&child, 1, Some(SessionLink::Resolved(grandchild.clone()))),
+        ],
+        None,
+        false,
+    );
+    let grandchild_page = page(
+        vec![event_in(
+            &grandchild,
+            0,
+            EventKind::AssistantMessage,
+            "grandchild reply",
+        )],
+        None,
+        false,
+    );
+    open(&mut app, parent_page.clone());
+
+    press(&mut app, KeyCode::Char('o'));
+    let request = take_select(&mut app, &child);
+    assert!(app.apply_transcript(request, child_page.clone()));
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.transcript().unwrap().key(), &grandchild);
+    let request = take_select(&mut app, &grandchild);
+    assert!(app.apply_transcript(request, grandchild_page));
+
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.transcript().unwrap().key(), &child);
+    let request = take_select(&mut app, &child);
+    assert!(app.apply_transcript(request, child_page));
+    assert_eq!(app.transcript().unwrap().selected_event().unwrap().id, "e1");
+
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.transcript().unwrap().key(), &parent);
+    let request = take_select(&mut app, &parent);
+    assert!(app.apply_transcript(request, parent_page));
+    assert_eq!(app.transcript().unwrap().selected_event().unwrap().id, "e1");
+
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.screen, Screen::Roster);
+    assert!(app.transcript().is_none());
+}
+
+#[test]
+fn esc_at_stack_bottom_returns_to_roster() {
+    let mut app = app_with(summary(1));
+    open(&mut app, page(vec![msg(0)], None, false));
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.screen, Screen::Roster);
+    assert!(app.transcript().is_none());
+}
+
+#[test]
+fn enter_expands_and_o_opens_on_child_row() {
+    let (mut app, parent, child) = child_pair();
+    let mut tool = tool_in(&parent, 1, Some(SessionLink::Resolved(child.clone())));
+    tool.tool.as_mut().unwrap().input = Some(text("delegate the check"));
+    open(
+        &mut app,
+        page(
+            vec![
+                event_in(&parent, 0, EventKind::UserPrompt, "parent prompt"),
+                tool,
+                event_in(&parent, 2, EventKind::AssistantMessage, "parent reply"),
+            ],
+            None,
+            false,
+        ),
+    );
+    assert!(
+        app.take_requests().is_empty(),
+        "opening drained its request"
+    );
+
+    // The reply row is selected on opening; step up to the tool row.
+    press(&mut app, KeyCode::Char('k'));
+    let collapsed = draw(&app, 110, 30);
+    assert!(collapsed.contains("▸ child"), "{collapsed}");
+    assert!(!collapsed.contains("input:"), "{collapsed}");
+
+    press(&mut app, KeyCode::Enter);
+    let expanded = draw(&app, 110, 30);
+    assert!(expanded.contains("input: delegate the check"), "{expanded}");
+    assert!(
+        expanded.contains("recorded preview · v opens the source"),
+        "{expanded}"
+    );
+    assert_eq!(app.screen, Screen::Inspector);
+    assert_eq!(app.transcript().unwrap().key(), &parent);
+    assert!(app.take_requests().is_empty(), "Enter does not navigate");
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.transcript().unwrap().key(), &child);
+    take_select(&mut app, &child);
+}
+
+#[test]
+fn o_on_unloaded_child_shows_notice() {
+    let missing = key_for("not-loaded");
+    let mut app = app_with(summary(2));
+    let mut tool = event(1, EventKind::Tool, "");
+    tool.text = None;
+    tool.tool = Some(ToolInteraction {
+        name: "task".into(),
+        call_id: Some("c1".into()),
+        input: Some(text("{\"description\":\"delegate\"}")),
+        output: Some(text("done")),
+        status: ToolStatus::Completed,
+        exit_code: None,
+        started_at: None,
+        completed_at: None,
+        orphan: false,
+        child_session: Some(SessionLink::Resolved(missing)),
+    });
+    open(
+        &mut app,
+        page(
+            vec![event(0, EventKind::UserPrompt, "parent prompt"), tool],
+            None,
+            false,
+        ),
+    );
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.screen, Screen::Inspector);
+    assert_eq!(app.transcript().unwrap().key(), &key());
+    assert_eq!(app.notice(), Some("child session not loaded"));
+    let out = draw(&app, 110, 30);
+    assert!(out.contains("child session not loaded"), "{out}");
+    assert!(
+        app.take_requests().is_empty(),
+        "nothing is loaded implicitly"
+    );
+
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(app.notice(), None);
+    assert!(!draw(&app, 110, 30).contains("child session not loaded"));
+}
+
+#[test]
+fn expanded_noise_row_shows_recorded_preview() {
+    let mut app = app_with(summary(3));
+    open(
+        &mut app,
+        page(
+            vec![
+                event(0, EventKind::UserPrompt, "prompt"),
+                auxiliary(1, "job-widget"),
+                event(2, EventKind::AssistantMessage, "reply"),
+            ],
+            None,
+            false,
+        ),
+    );
+
+    // The reply row is selected on opening; step up to the folded noise row.
+    press(&mut app, KeyCode::Char('k'));
+    let collapsed = draw(&app, 110, 30);
+    assert!(
+        collapsed.contains("· 1 auxiliary model calls (job-widget)"),
+        "{collapsed}"
+    );
+    assert!(
+        !collapsed.contains("auxiliary model call: job-widget"),
+        "{collapsed}"
+    );
+
+    press(&mut app, KeyCode::Enter);
+    let expanded = draw(&app, 110, 30);
+    assert!(
+        expanded.contains("auxiliary model call: job-widget"),
+        "{expanded}"
+    );
+    assert!(
+        expanded.contains("recorded preview · v opens the source"),
+        "{expanded}"
+    );
+
+    press(&mut app, KeyCode::Enter);
+    assert!(!draw(&app, 110, 30).contains("auxiliary model call: job-widget"));
+}
+
+#[test]
+fn long_unbroken_reply_keeps_token_in_bounds() {
+    let word = "a".repeat(43);
+    let mut reply = event(0, EventKind::AssistantMessage, &word);
+    let mut usage = usage_with_purpose(RequestPurpose::Conversation);
+    usage.scope = UsageScope::Message;
+    usage.categories.total = Some(1_200);
+    reply.usage = Some(usage);
+
+    let mut app = app_with(summary(1));
+    open(&mut app, page(vec![reply], None, false));
+    let out = draw(&app, 60, 20);
+    let line = out
+        .lines()
+        .find(|line| line.contains("aaaaaaaa"))
+        .unwrap_or_else(|| panic!("the reply is drawn:\n{out}"));
+    assert!(
+        line.contains("1.2k"),
+        "the first line keeps the token reservation: {line:?}"
+    );
 }

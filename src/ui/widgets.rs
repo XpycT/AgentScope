@@ -18,6 +18,30 @@ pub const READ_FAILED: &str = "couldn't read";
 /// Longest tail of the search text shown in the prompt.
 const PROMPT_TAIL: usize = 40;
 
+/// Tool-name groups used only to color a name by what the call does.
+const SHELL_TOOLS: &[&str] = &["bash", "shell", "exec", "command", "terminal", "run", "cmd"];
+const FILE_TOOLS: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "patch",
+    "str_replace",
+    "delete",
+    "move",
+    "copy",
+    "list",
+    "ls",
+    "glob",
+    "grep",
+    "find",
+    "todo",
+    "todo_write",
+    "update_plan",
+];
+const SEARCH_TOOLS: &[&str] = &["search", "web_search", "web_fetch", "fetch"];
+const TASK_TOOLS: &[&str] = &["task", "agent", "spawn", "subagent", "delegate"];
+
 /// The footer line while a search is edited. Long text keeps its end (the
 /// part being typed) visible. Input must already be display-safe.
 pub fn search_prompt(text: &str) -> String {
@@ -298,6 +322,45 @@ impl Palette {
             Style::default()
         } else {
             Style::default().fg(color)
+        }
+    }
+
+    /// The `▌` bar that starts a user prompt.
+    pub fn prompt_bar(&self) -> Style {
+        self.colored(Color::Cyan)
+    }
+
+    /// The `▌` bar that starts an agent reply; bold so it differs from a prompt
+    /// without relying on color.
+    pub fn reply_bar(&self) -> Style {
+        self.colored(Color::Cyan).add_modifier(Modifier::BOLD)
+    }
+
+    /// Tool names grouped by kind, so the eye can separate shell work, file
+    /// work, searches and delegated tasks. Color is decorative: the glyph and
+    /// the name carry the same information without it.
+    pub fn tool_name(&self, name: &str) -> Style {
+        let is = |names: &[&str]| names.iter().any(|n| name.eq_ignore_ascii_case(n));
+        if is(SHELL_TOOLS) {
+            self.colored(Color::Yellow)
+        } else if is(FILE_TOOLS) {
+            self.colored(Color::Green)
+        } else if is(SEARCH_TOOLS) {
+            self.colored(Color::Cyan)
+        } else if is(TASK_TOOLS) {
+            self.colored(Color::Magenta)
+        } else {
+            Style::default()
+        }
+    }
+
+    /// Glyph color for a tool outcome.
+    pub fn tool_status(&self, status: ToolStatus) -> Style {
+        match status {
+            ToolStatus::Completed => self.colored(Color::Green),
+            ToolStatus::Error => self.colored(Color::Red),
+            ToolStatus::Pending => self.colored(Color::Yellow),
+            ToolStatus::Unknown => self.colored(Color::DarkGray),
         }
     }
 

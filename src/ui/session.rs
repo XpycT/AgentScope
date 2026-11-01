@@ -869,6 +869,7 @@ pub fn render_session(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         frame,
         &f,
         "< Session: usage and lineage",
+        app.notice(),
         "Usage is persisted evidence; cost is derived only from the dated price table.",
         "j/k scroll  m older details  Space expand summaries  Esc back  q quit",
     );

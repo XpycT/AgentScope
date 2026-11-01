@@ -996,3 +996,38 @@ fn m_on_a_session_without_request_rows_pages_visible_recent_events() {
         "the last page ends the hint:\n{two}"
     );
 }
+
+#[test]
+fn o_on_unloaded_child_from_details_shows_notice() {
+    use agentscope::domain::SessionLink;
+    use agentscope::ui::handle_key;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let unloaded = SessionKey {
+        harness: Harness::Codex,
+        native_id: "missing-child".into(),
+        source: SourceKey::File("missing-child.jsonl".into()),
+    };
+    let mut app = app();
+    let mut tool = tool_event(0);
+    tool.tool.as_mut().unwrap().child_session = Some(SessionLink::Resolved(unloaded));
+    open(&mut app, page(vec![tool], vec![]));
+    assert!(app.open_details());
+
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.screen, Screen::Details, "no navigation");
+    assert_eq!(app.notice(), Some("child session not loaded"));
+    let screen = draw(&app);
+    assert!(screen.contains("child session not loaded"), "{screen}");
+
+    // The next key still clears it.
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.notice(), None);
+    assert!(!draw(&app).contains("child session not loaded"));
+}

@@ -207,6 +207,12 @@ pub struct App {
     pub focus: Focus,
     pub live: bool,
     transcript: Option<Transcript>,
+    /// Sessions opened from a tool row, with the parent event that was selected
+    /// when they were opened. `Esc` in the inspector walks back through them.
+    session_stack: Vec<(SessionKey, Option<String>)>,
+    /// Transient inspector message ("child session not loaded"); the next key
+    /// clears it.
+    notice: Option<String>,
     request_seq: u64,
     outbox: Vec<WorkerRequest>,
     overlays: overlay::Overlays,
@@ -250,6 +256,8 @@ impl App {
             focus: Focus::default(),
             live: true,
             transcript: None,
+            session_stack: Vec::new(),
+            notice: None,
             request_seq: 0,
             outbox: Vec::new(),
             overlays: overlay::Overlays::default(),
@@ -1028,16 +1036,53 @@ impl App {
         let Some(key) = self.selected.clone() else {
             return false;
         };
+        self.session_stack.clear();
         self.start_transcript(key, None);
         self.screen = Screen::Inspector;
         true
     }
 
+    /// Open a session's transcript from a link rather than from the roster:
+    /// a fresh transcript with no carried expansion, optionally returning to
+    /// `event_id` once its page arrives.
+    pub fn start_transcript_at(&mut self, key: SessionKey, event_id: Option<String>) {
+        self.start_transcript(key, None);
+        if let Some(id) = event_id
+            && let Some(transcript) = self.transcript.as_mut()
+        {
+            transcript.resume_at(id);
+        }
+    }
+
     pub fn close_inspector(&mut self) {
         self.abandon_details();
         self.transcript = None;
+        self.session_stack.clear();
         self.overlays = overlay::Overlays::default();
         self.screen = Screen::Roster;
+    }
+
+    /// A transient inspector message, cleared by the next key press.
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
+    }
+
+    /// `Esc` inside the inspector: return to the session that opened this one,
+    /// restoring the event that was selected there. `false` at the stack
+    /// bottom, where the caller closes the inspector.
+    pub fn back_to_parent_session(&mut self) -> bool {
+        let Some((key, event_id)) = self.session_stack.pop() else {
+            return false;
+        };
+        self.selected = Some(key.clone());
+        self.recompute_visual_selection();
+        self.start_transcript_at(key, event_id);
+        self.screen = Screen::Inspector;
+        true
     }
 
     /// Restart the open transcript from its oldest page, keeping expansion.
@@ -1333,11 +1378,12 @@ impl App {
         Some(self.resolve_link(session, link))
     }
 
-    /// `o` in details: open the selected tool's confirmed child session. Only a
-    /// resolved link to a session in this roster navigates; unresolved and
-    /// ambiguous links are ignored rather than guessed.
+    /// `o` on a tool row: open the confirmed child session. A resolved link to
+    /// a session the roster has loaded navigates and remembers the parent and
+    /// its selected event for `Esc`; an unloaded child only explains itself.
+    /// Unresolved and ambiguous links are ignored rather than guessed.
     pub fn open_tool_child_session(&mut self) -> bool {
-        if self.screen != Screen::Details {
+        if !matches!(self.screen, Screen::Inspector | Screen::Details) {
             return false;
         }
         let link = self.transcript.as_ref().and_then(|transcript| {
@@ -1349,12 +1395,23 @@ impl App {
             return false;
         };
         if self.session(&key).is_none() {
+            self.notice = Some("child session not loaded".into());
             return false;
         }
+        let Some((parent, event_id)) = self
+            .transcript
+            .as_ref()
+            .map(|t| (t.key().clone(), t.selected_event().map(|e| e.id.clone())))
+        else {
+            return false;
+        };
+        self.session_stack.push((parent, event_id));
         self.overlays = overlay::Overlays::default();
-        self.selected = Some(key);
+        self.selected = Some(key.clone());
         self.recompute_visual_selection();
-        self.open_inspector()
+        self.start_transcript_at(key, None);
+        self.screen = Screen::Inspector;
+        true
     }
 
     fn resolve_link(&self, child: &SessionKey, link: &SessionLink) -> SessionLink {

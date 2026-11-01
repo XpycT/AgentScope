@@ -208,6 +208,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
     if key.kind != KeyEventKind::Press {
         return KeyAction::None;
     }
+    // A transient inspector notice lasts until the next key press.
+    app.clear_notice();
     // Windows reports AltGr as Ctrl+Alt; that is a character, not a chord.
     let chord =
         key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
@@ -420,8 +422,15 @@ fn handle_inspector_key(app: &mut App, code: KeyCode) -> KeyAction {
         KeyCode::Char('i') => {
             app.open_session_info();
         }
+        KeyCode::Char('o') => {
+            app.open_tool_child_session();
+        }
         KeyCode::Char('x') => app.toggle_redaction(),
-        KeyCode::Esc | KeyCode::Backspace => app.close_inspector(),
+        KeyCode::Esc | KeyCode::Backspace => {
+            if !app.back_to_parent_session() {
+                app.close_inspector();
+            }
+        }
         KeyCode::Char('r') => {
             app.retry_transcript();
             return KeyAction::Refresh;

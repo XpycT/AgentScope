@@ -4,9 +4,9 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, SourceState, Transcript};
 use crate::domain::{DiagnosticEntry, Event, LocatorKind, SessionLink, SourceLocator};
@@ -70,15 +70,30 @@ pub(super) fn chrome(frame: &mut Frame, ctx: &RosterContext) -> Option<Frame3> {
     })
 }
 
-pub(super) fn put(frame: &mut Frame, f: &Frame3, title: &str, status: &str, footer: &str) {
+pub(super) fn put(
+    frame: &mut Frame,
+    f: &Frame3,
+    title: &str,
+    notice: Option<&str>,
+    status: &str,
+    footer: &str,
+) {
     frame.render_widget(
         Paragraph::new(Line::styled(fit(title, f.width), f.palette.title())),
         f.title,
     );
-    frame.render_widget(
-        Paragraph::new(Line::styled(fit(status, f.width), f.palette.warning())),
-        f.status,
-    );
+    let mut spans = Vec::new();
+    let mut used = 0;
+    if let Some(notice) = notice {
+        let text = format!("{}  ·  ", display_safe(notice));
+        used = text.width();
+        spans.push(Span::styled(text, f.palette.quiet()));
+    }
+    spans.push(Span::styled(
+        fit(status, f.width.saturating_sub(used)),
+        f.palette.warning(),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), f.status);
     frame.render_widget(
         Paragraph::new(Line::styled(fit(footer, f.width), f.palette.dim())),
         f.footer,
@@ -193,6 +208,7 @@ pub fn render_details(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         frame,
         &f,
         "< Details",
+        app.notice(),
         status,
         "j/k scroll  v source  x redaction  D diagnostics  o open child  Esc back  q quit",
     );
@@ -227,6 +243,7 @@ pub fn render_source(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         frame,
         &f,
         "< Source record",
+        app.notice(),
         &note,
         "j/k scroll  x redaction  Esc back  q quit",
     );
@@ -332,6 +349,7 @@ pub fn render_diagnostics(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         frame,
         &f,
         "< Diagnostics: hidden, unknown, and source-only records",
+        app.notice(),
         if entries
             .get(app.diagnostics_selected())
             .is_some_and(|e| app.revealed_for(&e.locator))

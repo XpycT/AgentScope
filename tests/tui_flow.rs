@@ -531,7 +531,7 @@ fn help_is_contextual_and_closes_without_quitting() {
     open_with(&mut app, &mut ctx, &["one", "two"]);
     ch(&mut app, '?');
     let screen = draw(&app, 100, 30);
-    assert!(screen.contains("n/N"), "{screen}");
+    assert!(screen.contains("Next / previous match"), "{screen}");
     ch(&mut app, '?');
     assert_eq!(app.panel(), Panel::None);
     assert_eq!(app.screen, Screen::Inspector);

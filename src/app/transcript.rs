@@ -286,6 +286,13 @@ impl Transcript {
         self.resume_scanned = 0;
     }
 
+    /// Return to `event_id` on the next tail page: the position is re-found as
+    /// pages arrive, walking backward when it is older than the first window.
+    pub(super) fn resume_at(&mut self, event_id: String) {
+        self.resume = Some(event_id);
+        self.resume_scanned = 0;
+    }
+
     /// The active transcript search query (empty when none).
     pub fn search_query(&self) -> &str {
         self.search.query()
