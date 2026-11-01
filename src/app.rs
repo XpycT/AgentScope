@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::domain::{
-    Harness, PageAnchor, ReleaseState, ScanProgress, SessionDetailPage, SessionKey, SessionLink,
-    SessionMetadata, SessionSummary, SourceKey, Status, StatusLabel, Thresholds, Timestamp,
-    ToolInteraction, TranscriptPage, Warning,
+    AggregationClass, Harness, PageAnchor, ReleaseState, ScanProgress, SessionDetailPage,
+    SessionKey, SessionLink, SessionMetadata, SessionSummary, SourceKey, Status, StatusLabel,
+    Thresholds, Timestamp, ToolInteraction, TranscriptPage, Warning,
 };
 use crate::providers::WorkProgress;
 use crate::roster::{DiscoveryLimit, RosterSnapshot, cmp_keys};
@@ -27,7 +27,8 @@ pub use input::{FilterItem, FilterTarget, Panel, ProcessView, SearchScope};
 pub use overlay::{MAX_SOURCE_BYTES, SourceState, SourceView};
 pub use preview::{DetailsState, PreviewState};
 pub use roster::{
-    COLUMN_COUNT, LoadFocus, PREVIEW_SPLIT_WIDTH, RosterItem, RosterRows, RosterSession,
+    COLUMN_COUNT, GroupHeader, GroupTotals, LoadFocus, PREVIEW_SPLIT_WIDTH, RosterItem, RosterRows,
+    RosterSession,
 };
 pub use transcript::{MAX_LOADED_EVENTS, PageKind, Transcript};
 
@@ -50,17 +51,15 @@ const STATUS_ORDER: [StatusLabel; 9] = [
 pub enum SortMode {
     LastActivity,
     Provider,
-    Project,
     Tokens,
     Status,
 }
 
 impl SortMode {
     /// Order used by `s` to cycle (spec §10.4).
-    const CYCLE: [SortMode; 5] = [
+    const CYCLE: [SortMode; 4] = [
         SortMode::LastActivity,
         SortMode::Provider,
-        SortMode::Project,
         SortMode::Tokens,
         SortMode::Status,
     ];
@@ -155,6 +154,9 @@ pub struct App {
     statuses: Vec<Status>,
     /// Indices into `sessions` that pass the filter, in display order.
     view: Vec<usize>,
+    /// Project groups over `view`, with their loaded-member totals. Rebuilt with
+    /// the view so the row iterator only borrows it.
+    groups: Vec<roster::GroupInfo>,
     selected: Option<SessionKey>,
     /// Cached visual position of `selected`, including Load more rows.
     visual_selected: Option<usize>,
@@ -208,6 +210,7 @@ impl App {
             hydrated: Vec::new(),
             statuses: Vec::new(),
             view: Vec::new(),
+            groups: Vec::new(),
             selected: None,
             visual_selected: None,
             sort: SortMode::LastActivity,
@@ -397,6 +400,7 @@ impl App {
         self.preview_generation = 0;
         self.details.reset();
         self.visual_selected = None;
+        self.rebuild_groups();
     }
 
     /// Ask the worker for the next 50 top-level groups of the applied generation.
@@ -1254,6 +1258,7 @@ impl App {
         let (sort, asc) = (self.sort, self.ascending);
         view.sort_by(|&a, &b| self.compare(a, b, sort, asc));
         self.view = view;
+        self.rebuild_groups();
 
         // A selected child stays only while its actual row is included: its
         // parent must be visible and its own cached visibility true.
@@ -1293,6 +1298,62 @@ impl App {
         }
     }
 
+    /// Rebuild the project groups of the current view. A group starts at its
+    /// first root in view order; later roots with the same project join it even
+    /// when other projects sit between them. Totals count every loaded member,
+    /// so the frame only borrows the result.
+    fn rebuild_groups(&mut self) {
+        let mut groups: Vec<roster::GroupInfo> = Vec::new();
+        let mut indices: HashMap<Option<&str>, usize> = HashMap::new();
+        for (position, root) in self.view.iter().enumerate() {
+            let project = self.sessions[*root].meta.project.as_deref();
+            let at = match indices.get(&project) {
+                Some(&at) => at,
+                None => {
+                    indices.insert(project, groups.len());
+                    groups.push(roster::GroupInfo {
+                        project: project.map(str::to_owned),
+                        roots: Vec::new(),
+                        totals: roster::GroupTotals::default(),
+                    });
+                    groups.len() - 1
+                }
+            };
+            groups[at].roots.push(position);
+        }
+        let more_roots = self.roster.has_more;
+        for group in &mut groups {
+            let totals = &mut group.totals;
+            for &position in &group.roots {
+                let root = self.view[position];
+                let key = &self.sessions[root].meta.key;
+                add_member(totals, &self.sessions[root]);
+                if let Some(list) = self.children.get(key) {
+                    for meta in &list.metadata {
+                        match self.child_summaries.get(&meta.key) {
+                            Some(summary) => add_member(totals, summary),
+                            None => {
+                                totals.sessions += 1;
+                                totals.tokens_partial = true;
+                                totals.cost_partial = true;
+                            }
+                        }
+                    }
+                    if list.next.is_some() {
+                        totals.tokens_partial = true;
+                        totals.cost_partial = true;
+                    }
+                }
+            }
+            if more_roots {
+                // Roots beyond the loaded page may belong to any group.
+                totals.tokens_partial = true;
+                totals.cost_partial = true;
+            }
+        }
+        self.groups = groups;
+    }
+
     /// A loaded child of `parent` is visible under the active filter/search.
     fn any_child_matches(&self, parent: &SessionKey) -> bool {
         self.children
@@ -1328,11 +1389,6 @@ impl App {
                 }
             }
             SortMode::Provider => directed(sa.meta.key.harness.cmp(&sb.meta.key.harness), asc),
-            SortMode::Project => opt_cmp(
-                sa.meta.project.as_deref().map(str::to_lowercase),
-                sb.meta.project.as_deref().map(str::to_lowercase),
-                asc,
-            ),
             SortMode::Tokens => opt_cmp(
                 sa.usage.as_ref().and_then(|u| u.total),
                 sb.usage.as_ref().and_then(|u| u.total),
@@ -1354,6 +1410,45 @@ fn activity(s: &SessionSummary) -> Option<Timestamp> {
         .into_iter()
         .flatten()
         .max()
+}
+
+/// Add one loaded member's recorded facts to a group total. A missing value is
+/// unknown, never zero: it only marks the totals partial.
+fn add_member(totals: &mut roster::GroupTotals, summary: &SessionSummary) {
+    totals.sessions += 1;
+    let Some(usage) = summary.usage.as_ref() else {
+        totals.tokens_partial = true;
+        totals.cost_partial = true;
+        return;
+    };
+    match usage.total {
+        Some(total) => totals.tokens = Some(totals.tokens.unwrap_or(0).saturating_add(total)),
+        None => totals.tokens_partial = true,
+    }
+    if usage.class == AggregationClass::Partial {
+        totals.tokens_partial = true;
+    }
+    let cost = &usage.cost;
+    match cost.usd {
+        Some(usd) => {
+            totals.cost_usd = Some(totals.cost_usd.unwrap_or(0.0) + usd);
+            if cost.class == AggregationClass::Partial {
+                totals.cost_partial = true;
+            }
+            if cost.class == AggregationClass::Estimated {
+                totals.cost_estimated = true;
+            }
+        }
+        // Only priced legs are known: the sum is a lower bound, not a total.
+        None if cost.known_subtotal > 0.0 => {
+            totals.cost_usd = Some(totals.cost_usd.unwrap_or(0.0) + cost.known_subtotal);
+            totals.cost_partial = true;
+            if cost.class == AggregationClass::Estimated {
+                totals.cost_estimated = true;
+            }
+        }
+        None => totals.cost_partial = true,
+    }
 }
 
 /// Case-insensitive query plus the active filters for one summary. Shared by

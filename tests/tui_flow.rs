@@ -5,7 +5,7 @@ use std::time::Duration;
 
 mod support;
 
-use agentscope::app::{App, Panel, Screen};
+use agentscope::app::{App, Panel, RosterItem, Screen};
 use agentscope::domain::*;
 use agentscope::ui::{KeyAction, RosterContext, apply_worker_event, handle_key, render};
 use agentscope::worker::{WorkerEvent, WorkerRequest};
@@ -500,12 +500,12 @@ fn filter_panel_and_sort_keys_update_the_roster() {
     );
     ch(&mut app, 's');
     let screen = draw(&app, 100, 30);
-    assert!(screen.contains("Sort: project (asc)"), "{screen}");
-    assert_eq!(titles(&app)[0], "PR review");
+    assert!(screen.contains("Sort: tokens (desc)"), "{screen}");
+    assert_eq!(titles(&app)[0], "Inventory API");
     ch(&mut app, 'S');
     let screen = draw(&app, 100, 30);
-    assert!(screen.contains("Sort: project (desc)"), "{screen}");
-    ch(&mut app, 's');
+    assert!(screen.contains("Sort: tokens (asc)"), "{screen}");
+    assert_eq!(titles(&app)[0], "Scanner refactor");
     ch(&mut app, 's');
     let screen = draw(&app, 100, 30);
     assert!(screen.contains("Sort: status"), "{screen}");
@@ -810,6 +810,29 @@ fn paged_app() -> App {
     app
 }
 
+/// `roots` two-line sessions in one project, plus an optional root Load more.
+fn uniform_app(roots: usize, has_more: bool) -> App {
+    let mut app = new_app();
+    let sessions: Vec<SessionSummary> = (0..roots)
+        .map(|i| {
+            session(
+                Harness::Codex,
+                &format!("s-{i:02}"),
+                "Same project row",
+                "Uniform",
+                "/work/uniform",
+                60 + i as i64,
+                None,
+            )
+        })
+        .collect();
+    let mut snap = support::snapshot(1, sessions, scan());
+    snap.has_more = has_more;
+    assert!(app.apply_roster_snapshot(snap, vec![]));
+    app.take_requests();
+    app
+}
+
 fn load_more_requested(app: &mut App) -> bool {
     app.take_requests()
         .iter()
@@ -1004,18 +1027,19 @@ fn mouse_selects_expands_and_loads_more_only_where_rows_are_drawn() {
     let layout = RosterLayout::for_area(area, 0);
     let first_y = layout.rows.y;
 
-    // A click on the second row (either of its two physical lines) selects it.
-    click(&mut app, area, 12, first_y + 2);
+    // A click on the second row (either of its two physical lines) selects it;
+    // the first line is the project heading.
+    click(&mut app, area, 12, first_y + 3);
     assert_eq!(
         app.selected_key(),
         Some(key_of(Harness::Claude, "claude-1"))
     );
-    click(&mut app, area, 12, first_y + 5);
+    click(&mut app, area, 12, first_y + 6);
     assert_eq!(app.selected_key(), Some(key_of(Harness::OpenCode, "oc-9")));
 
     // The marker column is the Space-equivalent expander.
     app.take_requests();
-    click(&mut app, area, 0, first_y);
+    click(&mut app, area, 0, first_y + 1);
     assert_eq!(app.selected_key(), Some(key_of(Harness::Codex, "codex-1")));
     let requests = app.take_requests();
     assert!(
@@ -1028,7 +1052,7 @@ fn mouse_selects_expands_and_loads_more_only_where_rows_are_drawn() {
     // Load more rows are activated by a click, and only when they are shown.
     let _ = app.take_requests();
     let before = app.selected_key();
-    click(&mut app, area, 12, first_y + 6);
+    click(&mut app, area, 12, first_y + 8);
     assert!(load_more_requested(&mut app));
     assert_eq!(app.selected_key(), before, "Load more is not a session");
     assert_eq!(app.load_focus(), Some(&LoadFocus::Roots));
@@ -1045,6 +1069,39 @@ fn mouse_selects_expands_and_loads_more_only_where_rows_are_drawn() {
         assert_eq!(app.selected_key(), selected, "({x},{y}) is not a row");
         assert!(app.take_requests().is_empty(), "({x},{y})");
     }
+}
+
+#[test]
+fn mouse_never_hits_rows_the_list_did_not_draw() {
+    let area = Rect::new(0, 0, 90, 25);
+    let layout = RosterLayout::for_area(area, 0);
+    let blank = layout.rows.y + layout.rows.height - 1;
+    assert_eq!(
+        layout.rows.height, 18,
+        "one heading plus eight rows leaves the last line empty"
+    );
+
+    // One heading plus eight two-line rows fill 17 of 18 lines; the undrawn
+    // ninth session must not be selected through the leftover blank line.
+    let mut app = uniform_app(9, false);
+    let before = app.selected_key();
+    click(&mut app, area, 12, blank);
+    assert_eq!(
+        app.selected_key(),
+        before,
+        "an undrawn session is not a mouse target"
+    );
+    assert!(app.take_requests().is_empty());
+
+    // Eight rows leave the two-line root Load more row undrawn: the same blank
+    // line must not request another page.
+    let mut app = uniform_app(8, true);
+    click(&mut app, area, 12, blank);
+    assert!(
+        app.take_requests().is_empty(),
+        "a blank line must not activate an undrawn Load more row"
+    );
+    assert_eq!(app.load_focus(), None);
 }
 
 #[test]
@@ -1228,13 +1285,17 @@ fn real_store_reader_worker_app_event_and_terminal_surface() {
     handle_event(&mut app, TermEvent::Resize(90, 25), area);
     let layout = RosterLayout::for_area(area, 0);
     let second = app.visible_rows()[1].session.meta.key.clone();
+    // Walk the row model so a project heading above the row cannot shift the click.
+    let mut y = layout.rows.y;
+    for item in app.roster_rows() {
+        if matches!(&item, RosterItem::Session(row) if row.session.meta.key == second) {
+            break;
+        }
+        y += item.height();
+    }
     handle_event(
         &mut app,
-        TermEvent::Mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            12,
-            layout.rows.y + 2,
-        )),
+        TermEvent::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 12, y)),
         area,
     );
     assert_eq!(app.selected_key(), Some(second.clone()));

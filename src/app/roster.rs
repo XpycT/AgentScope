@@ -1,8 +1,9 @@
-//! Borrowed roster rows: loaded roots, their loaded children, and the explicit
-//! Load more rows between them (spec §10.2).
+//! Borrowed roster rows: project group headings, loaded roots, their loaded
+//! children, and the explicit Load more rows between them (spec §10.2).
 //!
 //! Rows borrow the facts already in `App`; nothing is cloned or formatted here,
-//! so a frame only pays for the rows it actually asks for.
+//! so a frame only pays for the rows it actually asks for. Group order and
+//! totals are computed once per rebuild and only borrowed here.
 
 use std::cell::Cell;
 
@@ -65,6 +66,41 @@ enum Slot {
     Load(LoadFocus),
 }
 
+/// Totals of the loaded members of one project group. A value stays `None`
+/// until a member reports one, so a group with no recorded usage reads as
+/// unknown, never as zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GroupTotals {
+    /// Loaded roots plus loaded children in the group.
+    pub sessions: usize,
+    pub tokens: Option<u64>,
+    /// Some member reported no token total, or the group is incomplete.
+    pub tokens_partial: bool,
+    pub cost_usd: Option<f64>,
+    /// Some member reported no cost or only a priced subtotal, or the group
+    /// is incomplete.
+    pub cost_partial: bool,
+    /// Some summed cost amount is an estimate.
+    pub cost_estimated: bool,
+}
+
+/// The one-line heading emitted before a project group's members.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupHeader<'a> {
+    pub project: Option<&'a str>,
+    pub totals: GroupTotals,
+}
+
+/// One project group over the visible roots. Rebuilt with the view and totals,
+/// so the row iterator only borrows it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GroupInfo {
+    pub project: Option<String>,
+    /// Indices into `App::view`, in view order.
+    pub roots: Vec<usize>,
+    pub totals: GroupTotals,
+}
+
 /// One session row in the loaded tree.
 #[derive(Clone, Debug)]
 pub struct RosterSession<'a> {
@@ -84,6 +120,8 @@ pub struct RosterSession<'a> {
 /// A visual roster row.
 #[derive(Clone, Debug)]
 pub enum RosterItem<'a> {
+    /// Project group heading; never selectable.
+    GroupHeader(GroupHeader<'a>),
     Session(RosterSession<'a>),
     /// Reveal the next frozen root page.
     RootLoadMore,
@@ -94,11 +132,26 @@ pub enum RosterItem<'a> {
     },
 }
 
+impl RosterItem<'_> {
+    /// Physical lines this row occupies.
+    pub fn height(&self) -> u16 {
+        match self {
+            Self::GroupHeader(_) => 1,
+            Self::Session(_) => 2,
+            Self::RootLoadMore | Self::ChildLoadMore { .. } => 2,
+        }
+    }
+}
+
 /// Iterator over the loaded roster rows of [`App::roster_rows`].
 pub struct RosterRows<'a> {
     app: &'a App,
-    /// Next index into `App::view`.
-    root: usize,
+    /// Next group in `App::groups`.
+    group: usize,
+    /// Next root within the current group.
+    root_in_group: usize,
+    /// The current group's heading has not been emitted yet.
+    header_pending: bool,
     /// Root whose children are being emitted, and the next child index.
     children: Option<(usize, &'a SessionKey, usize)>,
     /// Filter/search active when this traversal began.
@@ -112,7 +165,9 @@ impl<'a> RosterRows<'a> {
     pub(super) fn new(app: &'a App) -> Self {
         Self {
             app,
-            root: 0,
+            group: 0,
+            root_in_group: 0,
+            header_pending: !app.groups.is_empty(),
             children: None,
             filtering: app.filter_active(),
             root_more: false,
@@ -145,7 +200,7 @@ impl<'a> Iterator for RosterRows<'a> {
         if self.finished {
             return None;
         }
-        // Continue an expanded/filtering parent's children.
+        // Continue an expanded/filtering parent's children before moving on.
         if let Some((root, parent, i)) = self.children {
             let list = self.app.children.get(parent);
             let mut at = i;
@@ -170,9 +225,36 @@ impl<'a> Iterator for RosterRows<'a> {
                 return Some(RosterItem::ChildLoadMore { parent, depth: 1 });
             }
         }
-        // Next loaded root.
-        if let Some(&index) = self.app.view.get(self.root) {
-            self.root += 1;
+        // A group starts at its first root in view order and collects the other
+        // roots with the same project, even non-adjacent ones.
+        if self.header_pending {
+            self.header_pending = false;
+            if let Some(group) = self.app.groups.get(self.group) {
+                return Some(RosterItem::GroupHeader(GroupHeader {
+                    project: group.project.as_deref(),
+                    totals: group.totals,
+                }));
+            }
+        }
+        let root = self
+            .app
+            .groups
+            .get(self.group)
+            .and_then(|group| group.roots.get(self.root_in_group))
+            .and_then(|&position| self.app.view.get(position))
+            .copied();
+        if let Some(index) = root {
+            self.root_in_group += 1;
+            if self
+                .app
+                .groups
+                .get(self.group)
+                .is_none_or(|group| self.root_in_group >= group.roots.len())
+            {
+                self.group += 1;
+                self.root_in_group = 0;
+                self.header_pending = self.group < self.app.groups.len();
+            }
             let session = &self.app.sessions[index];
             let key = &session.meta.key;
             let selected = self.app.selected.as_ref() == Some(key);
@@ -298,12 +380,14 @@ impl App {
     pub fn move_focus(&mut self, delta: isize) {
         let slots: Vec<Slot> = self
             .roster_rows()
-            .map(|item| match item {
-                RosterItem::Session(row) => Slot::Session(row.session.meta.key.clone()),
-                RosterItem::RootLoadMore => Slot::Load(LoadFocus::Roots),
+            .filter_map(|item| match item {
+                RosterItem::Session(row) => Some(Slot::Session(row.session.meta.key.clone())),
+                RosterItem::RootLoadMore => Some(Slot::Load(LoadFocus::Roots)),
                 RosterItem::ChildLoadMore { parent, .. } => {
-                    Slot::Load(LoadFocus::Children(parent.clone()))
+                    Some(Slot::Load(LoadFocus::Children(parent.clone())))
                 }
+                // A heading is never a keyboard stop.
+                RosterItem::GroupHeader(_) => None,
             })
             .collect();
         if slots.is_empty() {

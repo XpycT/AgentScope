@@ -34,7 +34,7 @@ pub const PREVIEW_WIDTH: u16 = 45;
 
 /// Pinned selection/expansion marker.
 const MARKER_W: u16 = 2;
-/// Physical lines per roster row.
+/// Physical lines of a session or Load more row; headings cost one.
 const ROW_HEIGHT: u16 = 2;
 /// Lines above the table header: title, filters, counts.
 const HEAD_H: u16 = 2;
@@ -102,7 +102,7 @@ pub struct RosterLayout {
     pub area: Rect,
     /// Table header line of the list.
     pub header: Rect,
-    /// Rows region of the list: [`ROW_HEIGHT`] lines per row.
+    /// Rows region of the list; items are laid out by their own heights.
     pub rows: Rect,
     /// Preview column beside the list (terminal at least [`PREVIEW_SPLIT_WIDTH`] wide).
     pub preview: Option<Rect>,
@@ -214,15 +214,29 @@ impl RosterLayout {
         self.rows.height >= ROW_HEIGHT
     }
 
-    /// Rows that fit in the list.
-    pub fn capacity(&self) -> usize {
-        (self.rows.height / ROW_HEIGHT) as usize
-    }
-
-    /// Index of the first row drawn: the focused row stays on screen.
+    /// Index of the first item drawn: the focused item's window fits the list.
     pub fn first_visible(&self, app: &App) -> usize {
-        app.focus_visual_index()
-            .map_or(0, |at| (at + 1).saturating_sub(self.capacity()))
+        let Some(at) = app.focus_visual_index() else {
+            return 0;
+        };
+        let mut total = 0u16;
+        let mut count = 0usize;
+        for item in app.roster_rows().take(at + 1) {
+            total = total.saturating_add(item.height());
+            count += 1;
+        }
+        if count <= at {
+            return 0;
+        }
+        let mut first = 0;
+        for item in app.roster_rows() {
+            if first >= at || total <= self.rows.height {
+                break;
+            }
+            total = total.saturating_sub(item.height());
+            first += 1;
+        }
+        first
     }
 
     /// Trailing column displayed under screen column `x`.
@@ -233,13 +247,28 @@ impl RosterLayout {
             .map(|c| c.column)
     }
 
-    /// Displayed row slot (0-based from the first drawn row) under `(x, y)`.
-    pub fn slot_at(&self, x: u16, y: u16) -> Option<usize> {
+    /// Item index under `(x, y)` in the drawn window, or `None` when the point
+    /// is outside the list or on a line the renderer left blank. Heights make
+    /// headings and two-line rows share one mapping for render and mouse.
+    pub fn item_at(&self, app: &App, x: u16, y: u16) -> Option<usize> {
         if !self.usable() || !contains(self.rows, x, y) {
             return None;
         }
-        let slot = ((y - self.rows.y) / ROW_HEIGHT) as usize;
-        (slot < self.capacity()).then_some(slot)
+        let y = y - self.rows.y;
+        let mut offset = 0u16;
+        for (index, item) in app.roster_rows().enumerate().skip(self.first_visible(app)) {
+            // The renderer stops before an item that does not fully fit, so the
+            // mouse must not resolve the blank lines that item would have used.
+            let height = item.height();
+            if offset.saturating_add(height) > self.rows.height {
+                break;
+            }
+            offset += height;
+            if y < offset {
+                return Some(index);
+            }
+        }
+        None
     }
 
     /// The preview's current screen area: beside the list, or swapped over it.
@@ -305,17 +334,16 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, layout: &RosterLayout) {
                 app.scroll_columns(1);
                 return;
             }
-            let Some(slot) = layout.slot_at(x, y) else {
+            let Some(index) = layout.item_at(app, x, y) else {
                 return;
             };
-            let hit =
-                app.roster_rows()
-                    .nth(layout.first_visible(app) + slot)
-                    .map(|item| match item {
-                        RosterItem::Session(row) => Hit::Session(row.session.meta.key.clone()),
-                        RosterItem::RootLoadMore => Hit::Roots,
-                        RosterItem::ChildLoadMore { parent, .. } => Hit::Children(parent.clone()),
-                    });
+            let hit = app.roster_rows().nth(index).and_then(|item| match item {
+                RosterItem::Session(row) => Some(Hit::Session(row.session.meta.key.clone())),
+                RosterItem::RootLoadMore => Some(Hit::Roots),
+                RosterItem::ChildLoadMore { parent, .. } => Some(Hit::Children(parent.clone())),
+                // A project heading selects nothing.
+                RosterItem::GroupHeader(_) => None,
+            });
             match hit {
                 Some(Hit::Session(key)) => {
                     if app.select_row(&key) && x < layout.rows.x + MARKER_W {
@@ -432,17 +460,29 @@ pub fn render_roster(frame: &mut Frame, app: &App, ctx: &RosterContext) {
 }
 
 fn render_rows(frame: &mut Frame, app: &App, layout: &RosterLayout, palette: Palette) {
-    let capacity = layout.capacity();
-    if capacity == 0 {
-        return;
-    }
     let first = layout.first_visible(app);
     let load_focus = app.load_focus().and(app.focus_visual_index());
     let now = app.now();
     // Only the visible slice is borrowed and formatted; unshown rows cost nothing.
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(capacity * 2);
-    for (index, item) in app.roster_rows().enumerate().skip(first).take(capacity) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut used = 0u16;
+    for (index, item) in app.roster_rows().enumerate().skip(first) {
+        let height = item.height();
+        if used + height > layout.rows.height {
+            break;
+        }
+        used += height;
         match item {
+            RosterItem::GroupHeader(header) => {
+                let name = header
+                    .project
+                    .map_or_else(|| "No project".to_string(), display_safe);
+                let text = format!("{name} · {} sessions", header.totals.sessions);
+                lines.push(Line::styled(
+                    fit(&text, layout.rows.width as usize),
+                    palette.title(),
+                ));
+            }
             RosterItem::Session(row) => {
                 let highlighted = row.selected && load_focus.is_none();
                 lines.extend(row_lines(&row, layout, now, highlighted, palette));
@@ -747,7 +787,6 @@ fn sort_name(mode: SortMode) -> &'static str {
     match mode {
         SortMode::LastActivity => "last activity",
         SortMode::Provider => "provider",
-        SortMode::Project => "project",
         SortMode::Tokens => "tokens",
         SortMode::Status => "status",
     }

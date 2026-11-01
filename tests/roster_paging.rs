@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use agentscope::app::{App, RosterItem};
 use agentscope::config::{CliOverrides, Config, Env};
 use agentscope::domain::*;
 use agentscope::providers::DiscoveryDelta;
@@ -691,6 +692,53 @@ fn real_native_stores_page_fifty_at_a_time_through_the_worker() {
     assert!(next.is_none());
     assert!(worker.shutdown());
     let _: Option<Arc<()>> = None;
+}
+
+#[test]
+fn root_load_more_comes_after_all_groups() {
+    let mut app = App::new(
+        BASE,
+        Thresholds {
+            quiet: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+        },
+    );
+    let mut a = meta(Harness::Codex, "a", Some(BASE + 3_000));
+    a.project = Some("X".into());
+    let mut b = meta(Harness::Claude, "b", Some(BASE + 2_000));
+    b.project = Some("Y".into());
+    let mut c = meta(Harness::OpenCode, "c", Some(BASE + 1_000));
+    c.project = Some("X".into());
+    let sessions = [a, b, c]
+        .into_iter()
+        .map(SessionSummary::unhydrated)
+        .collect();
+    let scan = ScanProgress {
+        harness: Harness::Codex,
+        scanned: 3,
+        total: Some(3),
+        done: true,
+    };
+    let mut snap = support::snapshot(1, sessions, scan);
+    snap.has_more = true;
+    assert!(app.apply_roster_snapshot(snap, vec![]));
+
+    let shape: Vec<String> = app
+        .roster_rows()
+        .map(|item| match item {
+            RosterItem::GroupHeader(header) => {
+                format!("header:{}", header.project.unwrap_or("none"))
+            }
+            RosterItem::Session(row) => row.session.meta.key.native_id.clone(),
+            RosterItem::RootLoadMore => "roots-more".into(),
+            RosterItem::ChildLoadMore { .. } => "child-more".into(),
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        ["header:X", "a", "c", "header:Y", "b", "roots-more"],
+        "the one root Load more row stays below every group"
+    );
 }
 
 #[test]

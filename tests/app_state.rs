@@ -5,7 +5,8 @@ use std::time::Duration;
 mod support;
 
 use agentscope::app::{
-    App, FilterState, FilterTarget, PreviewState, RosterItem, SortMode, UsageAvailability,
+    App, FilterState, FilterTarget, GroupTotals, PreviewState, RosterItem, SortMode,
+    UsageAvailability,
 };
 use agentscope::domain::*;
 use agentscope::providers::WorkProgress;
@@ -73,6 +74,33 @@ fn ids(app: &App) -> Vec<String> {
 
 fn selected_id(app: &App) -> Option<String> {
     app.selected_key().map(|k| k.native_id)
+}
+
+fn with_project(mut summary: SessionSummary, project: Option<&str>) -> SessionSummary {
+    summary.meta.project = project.map(str::to_owned);
+    summary
+}
+
+/// Project groups as `(project, totals)` in the order the roster draws them.
+fn group_headers(app: &App) -> Vec<(Option<String>, GroupTotals)> {
+    app.roster_rows()
+        .filter_map(|item| match item {
+            RosterItem::GroupHeader(header) => {
+                Some((header.project.map(str::to_owned), header.totals))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Roster session rows in visual order, skipping headings and Load more rows.
+fn roster_ids(app: &App) -> Vec<String> {
+    app.roster_rows()
+        .filter_map(|item| match item {
+            RosterItem::Session(row) => Some(row.session.meta.key.native_id.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn warning(source: &str, message: &str, count: u32) -> Warning {
@@ -197,11 +225,6 @@ fn filters_and_sorts_with_unknown_tokens_last() {
 
     app.sort(SortMode::Provider);
     assert_eq!(ids(&app), ["a", "d", "b", "c"]);
-    app.sort(SortMode::Project);
-    // case-insensitive ascending, missing project last
-    assert_eq!(ids(&app), ["b", "a", "c", "d"]);
-    app.sort(SortMode::Project); // reversed: still missing last
-    assert_eq!(ids(&app), ["a", "b", "c", "d"]);
 
     app.sort(SortMode::LastActivity);
     assert_eq!(ids(&app), ["c", "b", "a", "d"]);
@@ -1240,18 +1263,251 @@ fn visual_positions_include_child_load_more_and_released_children_stay_hidden() 
         "loaded children count toward their harness"
     );
 
-    // Selecting the second root accounts for the ChildLoadMore row before it.
-    assert_eq!(app.visual_selected_index(), Some(0), "parent selected");
+    // Selecting the second root accounts for the group heading and the
+    // ChildLoadMore row before it.
+    assert_eq!(app.visual_selected_index(), Some(1), "parent selected");
     app.move_selection(isize::MAX);
     assert_eq!(app.selected_index(), Some(1));
-    assert_eq!(app.visual_selected_index(), Some(2));
+    assert_eq!(app.visual_selected_index(), Some(3));
     // Collapsing the family removes the ChildLoadMore row and the cached visual
     // position follows immediately.
     app.move_selection(isize::MIN);
     app.toggle_children();
-    assert_eq!(app.visual_selected_index(), Some(0));
-    app.move_selection(isize::MAX);
     assert_eq!(app.visual_selected_index(), Some(1));
+    app.move_selection(isize::MAX);
+    assert_eq!(app.visual_selected_index(), Some(2));
+}
+
+#[test]
+fn roster_rows_emit_group_header_before_each_project() {
+    let mut app = app();
+    let a = with_project(session(Harness::Codex, "a", NOW - 1000), Some("X"));
+    let b = with_project(session(Harness::Claude, "b", NOW - 2000), Some("Y"));
+    let c = with_project(session(Harness::OpenCode, "c", NOW - 3000), Some("X"));
+    app.apply_roster(vec![a, b, c], vec![]);
+
+    // Group order follows the first member in view order; C joins X even though
+    // B sits between them.
+    let rows: Vec<RosterItem> = app.roster_rows().collect();
+    let shape: Vec<String> = rows
+        .iter()
+        .map(|item| match item {
+            RosterItem::GroupHeader(header) => {
+                format!("header:{}", header.project.unwrap_or("none"))
+            }
+            RosterItem::Session(row) => row.session.meta.key.native_id.clone(),
+            RosterItem::RootLoadMore => "roots-more".into(),
+            RosterItem::ChildLoadMore { .. } => "child-more".into(),
+        })
+        .collect();
+    assert_eq!(shape, ["header:X", "a", "c", "header:Y", "b"]);
+    assert_eq!(rows[0].height(), 1);
+    assert_eq!(rows[1].height(), 2);
+    assert_eq!(rows[3].height(), 1);
+    assert!(matches!(
+        &rows[0],
+        RosterItem::GroupHeader(header) if header.totals.sessions == 2
+    ));
+    assert_eq!(group_headers(&app).len(), 2);
+
+    // Selection moves between sessions only; a heading is never a stop.
+    assert_eq!(selected_id(&app).as_deref(), Some("a"));
+    assert_eq!(roster_ids(&app), ["a", "c", "b"]);
+    app.move_selection(1);
+    assert_eq!(selected_id(&app).as_deref(), Some("c"));
+    app.move_selection(1);
+    assert_eq!(selected_id(&app).as_deref(), Some("b"));
+}
+
+#[test]
+fn sessions_without_project_group_under_none() {
+    let mut app = app();
+    app.apply_roster(
+        vec![
+            session(Harness::Codex, "a", NOW - 1000),
+            session(Harness::Claude, "b", NOW - 2000),
+            with_project(session(Harness::OpenCode, "c", NOW - 3000), Some("X")),
+        ],
+        vec![],
+    );
+    let headers = group_headers(&app);
+    assert_eq!(headers.len(), 2);
+    assert_eq!(headers[0].0, None, "roots without a project lead here");
+    assert_eq!(headers[0].1.sessions, 2);
+    assert_eq!(headers[1].0.as_deref(), Some("X"));
+    assert_eq!(headers[1].1.sessions, 1);
+}
+
+#[test]
+fn child_stays_in_parent_group_even_with_other_project() {
+    let mut app = app();
+    let parent = with_project(session(Harness::Codex, "parent", NOW - 1000), Some("X"));
+    let parent_key = parent.meta.key.clone();
+    app.apply_roster(vec![parent], vec![]);
+    app.take_requests();
+    assert!(app.load_children(&parent_key));
+    let requests = app.take_requests();
+    let [WorkerRequest::LoadChildren { request_id, .. }] = requests.as_slice() else {
+        panic!("expected a child page request, got {requests:?}");
+    };
+    let child_key = key(Harness::Codex, "child");
+    let mut child = metadata(child_key, "child");
+    child.project = Some("Y".into());
+    assert!(app.apply_children(*request_id, &parent_key, vec![Arc::new(child)], None));
+    app.toggle_children();
+
+    let shape: Vec<String> = app
+        .roster_rows()
+        .map(|item| match item {
+            RosterItem::GroupHeader(header) => {
+                format!("header:{}", header.project.unwrap_or("none"))
+            }
+            RosterItem::Session(row) => row.session.meta.key.native_id.clone(),
+            RosterItem::RootLoadMore => "roots-more".into(),
+            RosterItem::ChildLoadMore { .. } => "child-more".into(),
+        })
+        .collect();
+    // Lineage wins: the child's own project never opens a second group.
+    assert_eq!(shape, ["header:X", "parent", "child"]);
+    assert_eq!(group_headers(&app).len(), 1);
+}
+
+#[test]
+fn group_totals_sum_roots_and_loaded_children() {
+    let mut app = app();
+    let mut parent = with_project(session(Harness::Codex, "parent", NOW - 1000), Some("X"));
+    parent.usage = Some(usage(Some(1_000), Some(1.5)));
+    let parent_key = parent.meta.key.clone();
+    app.apply_roster(vec![parent], vec![]);
+    app.take_requests();
+    assert!(app.load_children(&parent_key));
+    let requests = app.take_requests();
+    let [WorkerRequest::LoadChildren { request_id, .. }] = requests.as_slice() else {
+        panic!("expected a child page request, got {requests:?}");
+    };
+    let child_key = key(Harness::Codex, "child");
+    let child = metadata(child_key.clone(), "child");
+    assert!(app.apply_children(
+        *request_id,
+        &parent_key,
+        vec![Arc::new(child.clone())],
+        None
+    ));
+    app.toggle_children();
+
+    let mut child_summary = facts::summary(child);
+    child_summary.usage = Some(usage(Some(500), Some(0.5)));
+    assert!(app.select_row(&child_key));
+    let requests = app.take_requests();
+    let request_id = requests
+        .iter()
+        .find_map(|request| match request {
+            WorkerRequest::HydratePreview { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .expect("a preview request for the child");
+    assert!(app.apply_preview(request_id, child_key, Arc::new(child_summary), true));
+
+    let totals = group_headers(&app).remove(0).1;
+    assert_eq!(totals.sessions, 2, "root plus loaded child");
+    assert_eq!(totals.tokens, Some(1_500));
+    assert_eq!(totals.cost_usd, Some(2.0));
+    assert!(!totals.tokens_partial);
+    assert!(!totals.cost_partial);
+}
+
+#[test]
+fn group_totals_mark_partial_and_estimated() {
+    let mut app = app();
+    let mut partial = session(Harness::Codex, "partial", NOW - 1000);
+    let mut partial_usage = usage(Some(10), Some(1.0));
+    partial_usage.cost.class = AggregationClass::Partial;
+    partial.usage = Some(partial_usage);
+    let mut estimated = session(Harness::Claude, "estimated", NOW - 2000);
+    estimated.usage = Some(usage(Some(20), Some(2.0)));
+    let unknown = session(Harness::OpenCode, "unknown", NOW - 3000);
+    app.apply_roster(vec![partial, estimated, unknown], vec![]);
+
+    let totals = group_headers(&app).remove(0).1;
+    assert_eq!(totals.sessions, 3);
+    assert_eq!(totals.tokens, Some(30));
+    assert_eq!(totals.cost_usd, Some(3.0));
+    assert!(totals.tokens_partial, "one member recorded no tokens");
+    assert!(totals.cost_partial, "a partial class and a missing amount");
+    assert!(totals.cost_estimated, "one summed amount is an estimate");
+}
+
+#[test]
+fn group_totals_partial_when_more_roots_exist() {
+    let mut app = app();
+    let mut a = with_project(session(Harness::Codex, "a", NOW - 1000), Some("X"));
+    a.usage = Some(usage(Some(10), Some(1.0)));
+    let mut b = with_project(session(Harness::Claude, "b", NOW - 2000), Some("Y"));
+    b.usage = Some(usage(Some(20), Some(2.0)));
+    let mut snap = support::snapshot(1, vec![a, b], done_scan());
+    snap.has_more = true;
+    assert!(app.apply_roster_snapshot(snap, vec![]));
+
+    let headers = group_headers(&app);
+    assert_eq!(headers.len(), 2);
+    for (_, totals) in headers {
+        assert!(totals.tokens_partial, "roots beyond the page are unknown");
+        assert!(totals.cost_partial, "roots beyond the page are unknown");
+    }
+}
+
+#[test]
+fn group_totals_use_known_subtotal_with_plus() {
+    let mut app = app();
+    let mut short = session(Harness::Codex, "short", NOW - 1000);
+    let mut short_usage = usage(Some(10), None);
+    short_usage.cost.known_subtotal = 0.75;
+    short_usage.cost.class = AggregationClass::Reported;
+    short.usage = Some(short_usage);
+    app.apply_roster(vec![short], vec![]);
+
+    let totals = group_headers(&app).remove(0).1;
+    assert_eq!(totals.cost_usd, Some(0.75));
+    assert!(totals.cost_partial, "a priced subtotal is a lower bound");
+    assert!(!totals.cost_estimated);
+    assert!(!totals.tokens_partial);
+}
+
+#[test]
+fn group_totals_none_when_nothing_recorded() {
+    let mut app = app();
+    app.apply_roster(
+        vec![
+            session(Harness::Codex, "a", NOW - 1000),
+            session(Harness::Claude, "b", NOW - 2000),
+        ],
+        vec![],
+    );
+    let totals = group_headers(&app).remove(0).1;
+    assert_eq!(totals.sessions, 2);
+    assert_eq!(totals.tokens, None, "never a reported zero");
+    assert_eq!(totals.cost_usd, None, "never a reported $0.00");
+    assert!(totals.tokens_partial && totals.cost_partial);
+}
+
+#[test]
+fn sort_cycle_has_no_project_mode() {
+    let mut app = app();
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        app.cycle_sort();
+        seen.push(app.sort_mode());
+    }
+    assert_eq!(
+        seen,
+        [
+            SortMode::Provider,
+            SortMode::Tokens,
+            SortMode::Status,
+            SortMode::LastActivity,
+        ],
+        "four steps return to the default; project is not a mode"
+    );
 }
 
 #[test]

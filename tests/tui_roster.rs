@@ -541,11 +541,15 @@ fn col_of(line: &str, needle: &str) -> usize {
     line[..byte].chars().count()
 }
 
-/// The two physical lines of the row whose title is `title`.
+/// The two physical lines of the row whose title is `title`. The match must sit
+/// in the list's title column, so a preview line sharing the row never matches.
 fn row_pair(lines: &[String], title: &str) -> (String, String) {
     let at = lines
         .iter()
-        .position(|l| l.contains(title))
+        .position(|line| {
+            line.find(title)
+                .is_some_and(|byte| line[..byte].chars().count() < 40)
+        })
         .unwrap_or_else(|| panic!("{title:?} not drawn in:\n{}", lines.join("\n")));
     (lines[at].clone(), lines[at + 1].clone())
 }
@@ -613,10 +617,10 @@ fn hostile_row_text_cannot_break_the_two_line_rows() {
     }
     let (first, second) = row_pair(&lines, "evil");
     assert_eq!(col_of(&first, "Codex"), col_of(&second, "route-x"));
-    // The clean row still starts right after the hostile row's two lines.
+    // The clean row's group heading follows the hostile row's two lines.
     let evil = lines.iter().position(|l| l.contains("evil")).unwrap();
     assert!(
-        lines[evil + 2].contains("Clean row"),
+        lines[evil + 3].contains("Clean row"),
         "{}",
         lines.join("\n")
     );
