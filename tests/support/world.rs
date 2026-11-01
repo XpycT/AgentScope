@@ -803,7 +803,7 @@ const BASE_MS: i64 = NOW_MS - 2 * 24 * 3_600_000;
 /// (or into its parent's activity) would be visible in the exact root pages.
 const CHILD_MS: i64 = BASE_MS + 24 * 3_600_000;
 
-fn iso(ms: i64) -> String {
+pub fn iso(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .expect("a valid timestamp")
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -944,8 +944,24 @@ impl World {
         world
     }
 
+    /// The same integrated population with every harness configured: [`World::native`]
+    /// plus a Hermes home (default and profile databases) whose continuation chain,
+    /// delegate child and credential decoys live beside healthy roots.
+    pub fn with_all_harnesses() -> Self {
+        let mut world = World::new();
+        world.omp_on = true;
+        world.pi_on = true;
+        world.hermes_on = true;
+        let (plant, writers) = plant_hermes(&world.hermes_home);
+        world.hermes_plant = Some(plant);
+        world.hermes_writers = writers;
+        let grown = grow(&world);
+        world.grown = Some(grown);
+        world
+    }
+
     pub fn grown(&self) -> &Grown {
-        self.grown.as_ref().expect("World::native")
+        self.grown.as_ref().expect("a grown World")
     }
 
     /// The same World whose OpenCode database is the locked one.
@@ -971,6 +987,11 @@ impl World {
         if self.pi_on {
             readers.push(Box::new(
                 agentscope::providers::pi::PiScanner::new(&config).expect("pi"),
+            ));
+        }
+        if self.hermes_on {
+            readers.push(Box::new(
+                agentscope::providers::hermes::HermesScanner::new(&config).expect("hermes"),
             ));
         }
         readers.push(Box::new(opencode));
@@ -1512,7 +1533,28 @@ fn grow(world: &World) -> Grown {
     direct_tokens.extend(pi.tokens.clone());
     tails.extend(pi.tails.clone());
 
-    // ---- Plain roots up to exactly ROOT_COUNT, spread across the three harnesses.
+    // ---- Hermes: a compression continuation folded into one logical root, a delegate
+    // child, and a second profile database root. The plant lives on the World because
+    // its writers stay open like a live producer's.
+    if let Some(hermes) = &world.hermes_plant {
+        let activity = |key: &SessionKey| {
+            hermes
+                .activity
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, at)| *at)
+                .unwrap_or_else(|| panic!("{} activity", key.native_id))
+        };
+        roots.push((hermes.parent.clone(), activity(&hermes.parent)));
+        roots.push((hermes.profile.clone(), activity(&hermes.profile)));
+        children.push((hermes.child.clone(), hermes.parent.clone()));
+        direct_tokens.extend(hermes.tokens.clone());
+        tails.push((hermes.parent.clone(), hermes.tail.clone()));
+        tails.push((hermes.child.clone(), hermes.child_tail.clone()));
+    }
+
+    // ---- Plain roots up to exactly ROOT_COUNT, spread across the three file/database
+    // harnesses whose fixtures are cheapest to repeat.
     let fillers = ROOT_COUNT - roots.len();
     for n in 0..fillers {
         let t = next();
@@ -1570,7 +1612,7 @@ fn grow(world: &World) -> Grown {
     .unwrap();
     fs::create_dir(oc::sidecar(&locked_db, "-shm")).unwrap();
 
-    let child_activity = vec![
+    let mut child_activity = vec![
         (cdx_kid.clone(), CHILD_MS + 3),
         (cdx_nested.clone(), CHILD_MS + 6),
         (claude_child.clone(), CHILD_MS + 3),
@@ -1581,6 +1623,17 @@ fn grow(world: &World) -> Grown {
         (omp.family.child.clone(), CHILD_MS + 30),
         (omp.family.nested.clone(), CHILD_MS + 31),
     ];
+    if let Some(hermes) = &world.hermes_plant {
+        child_activity.push((
+            hermes.child.clone(),
+            hermes
+                .activity
+                .iter()
+                .find(|(k, _)| k == &hermes.child)
+                .map(|(_, at)| *at)
+                .expect("delegate activity"),
+        ));
+    }
     Grown {
         desktop: d,
         roots,
@@ -1703,7 +1756,11 @@ pub fn plant_omp(root: &Path, t: OmpTimes) -> OmpPlant {
             stamped(om::header("omp-kid", None, None), t.child - 200),
             stamped(om::user_message("ku", None, "child task"), t.child - 100),
             stamped(
-                om::call("ka", Some("ku"), Some("r-ka"), owned((200, 80, 0))),
+                om::with_message(
+                    om::call("ka", Some("ku"), Some("r-ka"), owned((200, 80, 0))),
+                    "duration",
+                    json!(2_000),
+                ),
                 t.child,
             ),
         ],
@@ -2011,6 +2068,14 @@ pub struct HermesPlant {
     pub profile_db: PathBuf,
     pub tail: String,
     pub summary: String,
+    /// Text of the delegate child's newest event.
+    pub child_tail: String,
+    /// Exact tokens each logical session owns: a compression chain sums its
+    /// members' recorded totals, a delegate only its own.
+    pub tokens: Vec<(SessionKey, u64)>,
+    /// Recorded activity of the chain's newest member and of the profile session,
+    /// plus the delegate's own stamp (which rolls up into its parent group).
+    pub activity: Vec<(SessionKey, i64)>,
 }
 
 /// Creates a Hermes home with a default `state.db` and one profile database,
@@ -2179,9 +2244,22 @@ pub fn plant_hermes(home: &Path) -> (HermesPlant, Vec<Connection>) {
         continuation: key(&db, "h-cont"),
         child: key(&db, "h-child"),
         profile: key(&profile_db, "h-profile"),
-        profile_db,
+        profile_db: profile_db.clone(),
         tail: "hermes continuation tail".into(),
         summary: "hermes compacted summary".into(),
+        child_tail: "hermes delegate answer".into(),
+        // The chain head owns both recorded segments; the delegate is separate.
+        tokens: vec![
+            (key(&db, "h-parent"), 240),
+            (key(&db, "h-child"), 120),
+            (key(&profile_db, "h-profile"), 60),
+        ],
+        // Newest member of the chain, the delegate itself and the profile session.
+        activity: vec![
+            (key(&db, "h-parent"), NOW_MS - 440_000),
+            (key(&db, "h-child"), NOW_MS - 440_000),
+            (key(&profile_db, "h-profile"), NOW_MS - 430_000),
+        ],
     };
     (plant, vec![root, profile])
 }

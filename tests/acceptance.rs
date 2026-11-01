@@ -41,7 +41,11 @@ struct Driver {
 
 impl Driver {
     fn start(world: &World) -> Self {
-        let worker = WorkerHandle::spawn(world.readers(), world.config());
+        Self::start_with(world, world.config())
+    }
+
+    fn start_with(world: &World, config: agentscope::config::Config) -> Self {
+        let worker = WorkerHandle::spawn(world.readers(), config);
         Self {
             app: App::new(NOW, THRESHOLDS),
             ctx: RosterContext {
@@ -1474,5 +1478,732 @@ fn pi_family_opens_through_the_real_worker_app_and_renderer() {
     // The secret-bearing root is listed, and its title is masked.
     let masked = h.app.session(&secret).unwrap().session.meta.title.clone();
     assert!(masked.contains("[REDACTED]"), "{masked}");
+    assert!(h.worker.shutdown());
+}
+
+// ---- R1: every harness in one roster ----------------------------------------------
+
+/// Discovery-and-hydrate one family's children through the real worker.
+fn children_of(
+    worker: &WorkerHandle,
+    request_id: u64,
+    parent: &SessionKey,
+    cursor: Option<SessionKey>,
+) -> (
+    Vec<std::sync::Arc<agentscope::domain::SessionMetadata>>,
+    Option<SessionKey>,
+) {
+    worker
+        .tx
+        .send(WorkerRequest::LoadChildren {
+            request_id,
+            parent: parent.clone(),
+            cursor,
+        })
+        .unwrap();
+    let WorkerEvent::Children { metadata, next, .. } = wait_for_event(
+        worker,
+        "a child page",
+        |e| matches!(e, WorkerEvent::Children { request_id: id, .. } if *id == request_id),
+    ) else {
+        unreachable!()
+    };
+    (metadata, next)
+}
+
+fn keys_of(metadata: &[std::sync::Arc<agentscope::domain::SessionMetadata>]) -> Vec<SessionKey> {
+    metadata.iter().map(|m| m.key.clone()).collect()
+}
+
+#[test]
+fn six_harness_roster_preserves_direct_usage_and_generation() {
+    let world = World::with_all_harnesses();
+    let g = world.grown();
+    let hermes = world.hermes_plant.as_ref().expect("the Hermes home");
+    let mut config = world.config();
+    config.refresh_ms = 3_600_000;
+    let worker = WorkerHandle::spawn(world.readers(), config);
+
+    // Explicit, distinct activity stamps make the expected root order unambiguous.
+    let expected = g.expected_roots();
+    assert_eq!(expected.len(), ROOT_COUNT);
+    let mut stamps: Vec<i64> = g.roots.iter().map(|(_, at)| *at).collect();
+    stamps.sort_unstable();
+    stamps.dedup();
+    assert_eq!(stamps.len(), ROOT_COUNT, "every root has its own stamp");
+
+    // All six harnesses own roots. Five native child families exist; Pi records no
+    // child session at all.
+    for harness in [
+        Harness::Codex,
+        Harness::Claude,
+        Harness::OpenCode,
+        Harness::Omp,
+        Harness::Hermes,
+        Harness::Pi,
+    ] {
+        assert!(
+            expected.iter().any(|key| key.harness == harness),
+            "{harness:?} owns a root"
+        );
+    }
+    let child_of = |child: &SessionKey| {
+        g.children
+            .iter()
+            .find(|(c, _)| c == child)
+            .map(|(_, p)| p.clone())
+    };
+    for family in [&g.codex, &g.claude, &g.opencode] {
+        assert_eq!(child_of(&family.child), Some(family.parent.clone()));
+        assert_eq!(child_of(&family.nested), Some(family.child.clone()));
+    }
+    assert_eq!(
+        child_of(&g.omp.family.child),
+        Some(g.omp.family.parent.clone())
+    );
+    assert_eq!(
+        child_of(&g.omp.family.nested),
+        Some(g.omp.family.child.clone())
+    );
+    assert_eq!(child_of(&hermes.child), Some(hermes.parent.clone()));
+    assert_eq!(child_of(&g.desktop_child), Some(g.desktop_code.clone()));
+    assert_eq!(child_of(&g.pi.parent), None, "native Pi has no children");
+    assert_eq!(child_of(&g.pi.fork), None);
+
+    // Pages 50 -> 100 -> 125, exact and duplicate-free; a stale generation reveals
+    // nothing and children/continuations never become extra root slots.
+    let first = roster_with(&worker, "the frozen first generation", |s| !s.provisional);
+    assert_eq!(first.generation, 1);
+    assert_eq!(first.roots.as_ref(), &expected[..50]);
+    assert!(first.has_more);
+
+    worker
+        .tx
+        .send(WorkerRequest::LoadRosterMore { generation: 9 })
+        .unwrap();
+    let until = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < until {
+        if let Ok(WorkerEvent::Roster { snapshot, .. }) =
+            worker.rx.recv_timeout(Duration::from_millis(20))
+        {
+            assert!(
+                snapshot.roots.len() <= 50,
+                "a stale generation revealed more roots"
+            );
+        }
+    }
+    worker
+        .tx
+        .send(WorkerRequest::LoadRosterMore { generation: 1 })
+        .unwrap();
+    let hundred = roster_with(&worker, "100 roots", |s| s.roots.len() >= 100);
+    assert_eq!(hundred.roots.as_ref(), &expected[..100]);
+    worker
+        .tx
+        .send(WorkerRequest::LoadRosterMore { generation: 1 })
+        .unwrap();
+    let all = roster_with(&worker, "125 roots", |s| s.roots.len() == ROOT_COUNT);
+    assert_eq!(all.roots.as_ref(), expected.as_slice());
+    assert!(!all.has_more);
+    let distinct: std::collections::HashSet<&SessionKey> = all.roots.iter().collect();
+    assert_eq!(distinct.len(), ROOT_COUNT, "no root is listed twice");
+
+    let mut id = 100;
+    for (child, _) in &g.children {
+        assert!(!all.roots.contains(child), "a child is never a root slot");
+    }
+    for (fork, _) in &g.forks {
+        assert!(all.roots.contains(fork), "a fork is its own root");
+    }
+    assert!(
+        !all.roots.contains(&hermes.continuation),
+        "a compression continuation is a member, not a slot"
+    );
+
+    // Children load under their immediate parent, one family level at a time.
+    let mut parents: Vec<&SessionKey> = g.children.iter().map(|(_, p)| p).collect();
+    parents.dedup();
+    for parent in parents {
+        id += 1;
+        let (metadata, next) = children_of(&worker, id, parent, None);
+        let mut got = keys_of(&metadata);
+        let mut want: Vec<SessionKey> = g
+            .children
+            .iter()
+            .filter(|(_, p)| p == parent)
+            .map(|(c, _)| c.clone())
+            .collect();
+        got.sort_by(agentscope::roster::cmp_keys);
+        want.sort_by(agentscope::roster::cmp_keys);
+        assert_eq!(got, want, "children of {}", parent.native_id);
+        assert!(next.is_none());
+    }
+    // A fresh publication after every family was expanded still holds exactly the
+    // frozen 125 roots: children never consume or duplicate a root slot.
+    worker.tx.send(WorkerRequest::Refresh).unwrap();
+    let refreshed = roster_with(&worker, "the refreshed roster", |s| {
+        s.generation == 2 && !s.provisional && s.roots.len() == ROOT_COUNT
+    });
+    assert_eq!(refreshed.roots.as_ref(), expected.as_slice());
+    let fresh: std::collections::HashSet<&SessionKey> = refreshed.roots.iter().collect();
+    assert_eq!(fresh.len(), ROOT_COUNT, "no root is listed twice");
+    for (child, _) in &g.children {
+        assert!(
+            !refreshed.roots.contains(child),
+            "a child never takes a root slot"
+        );
+    }
+    assert!(
+        !refreshed.roots.contains(&hermes.continuation),
+        "a continuation never takes a root slot"
+    );
+    // The Pi root still has no family.
+    id += 1;
+    let (pi_children, _) = children_of(&worker, id, &g.pi.parent, None);
+    assert!(pi_children.is_empty(), "Pi lists no children");
+
+    // Direct usage: every member reports only what it owns.
+    let mut hydrated: std::collections::HashMap<SessionKey, std::sync::Arc<SessionSummary>> =
+        std::collections::HashMap::new();
+    for (key, tokens) in &g.direct_tokens {
+        id += 1;
+        let summary = hydrate(&worker, id, key);
+        assert_eq!(
+            summary.usage.as_ref().and_then(|u| u.total),
+            Some(*tokens),
+            "{:?} {}",
+            key.harness,
+            key.native_id
+        );
+        hydrated.insert(key.clone(), summary);
+    }
+    for (key, usd) in &g.reported_cost {
+        id += 1;
+        let summary = hydrate(&worker, id, key);
+        assert_eq!(summary.usage.as_ref().unwrap().cost.usd, Some(*usd));
+        hydrated.insert(key.clone(), summary);
+    }
+
+    // Direct dollar ownership beyond OpenCode: catalog estimates only where the
+    // bundled/saved evidence prices every used leg, Unknown everywhere else. The
+    // OMP parent's untrusted saved 99.0 and its child's quoted $9.99 are never money.
+    let expect_cost = |key: &SessionKey,
+                       usd: Option<f64>,
+                       class: AggregationClass,
+                       source: Option<MoneySource>| {
+        let summary = hydrated
+            .get(key)
+            .unwrap_or_else(|| panic!("{} not hydrated", key.native_id));
+        let usage = summary.usage.as_ref().expect("usage");
+        match usd {
+            Some(expected) => {
+                let actual = usage.cost.usd.expect("a complete estimate");
+                assert!(
+                    (actual - expected).abs() < 1e-9,
+                    "{} cost {actual} != {expected}",
+                    key.native_id
+                );
+            }
+            None => assert_eq!(usage.cost.usd, None, "{} must stay Unknown", key.native_id),
+        }
+        assert_eq!(usage.cost.class, class, "{}", key.native_id);
+        assert_eq!(usage.cost.source, source, "{}", key.native_id);
+    };
+    // Claude: bundled reference estimates for the priced family members.
+    expect_cost(
+        &g.claude.parent,
+        Some(0.0014),
+        AggregationClass::Estimated,
+        Some(MoneySource::BundledReference),
+    );
+    expect_cost(
+        &g.claude.child,
+        Some(0.0007),
+        AggregationClass::Estimated,
+        Some(MoneySource::BundledReference),
+    );
+    // Hermes: the source's saved estimates, split per logical session.
+    expect_cost(
+        &hermes.parent,
+        Some(0.02),
+        AggregationClass::Estimated,
+        Some(MoneySource::SavedCatalogEstimate),
+    );
+    expect_cost(
+        &hermes.child,
+        Some(0.01),
+        AggregationClass::Estimated,
+        Some(MoneySource::SavedCatalogEstimate),
+    );
+    expect_cost(
+        &hermes.profile,
+        Some(0.005),
+        AggregationClass::Estimated,
+        Some(MoneySource::SavedCatalogEstimate),
+    );
+    assert_eq!(
+        hydrated[&hermes.parent]
+            .usage
+            .as_ref()
+            .and_then(|u| u.saved_estimate_usd),
+        Some(0.02)
+    );
+    // Codex, OMP, Pi, unknown-route OpenCode and the unpriced Claude Desktop/Cowork
+    // sessions report no complete dollar amount.
+    for key in [
+        &g.codex.parent,
+        &g.codex.child,
+        &g.zstd,
+        &g.desktop_code,
+        &g.cowork,
+        &g.omp.family.parent,
+        &g.omp.family.child,
+        &g.omp.fork,
+        &g.unknown_billing,
+        &g.pi.parent,
+        &g.pi.fork,
+    ] {
+        expect_cost(key, None, AggregationClass::Unknown, None);
+    }
+    // The OMP parent keeps its untrusted saved figure out of money, and the child's
+    // quoted task-result cost is not added to the parent.
+    let omp_parent = hydrated[&g.omp.family.parent].usage.as_ref().unwrap();
+    assert_eq!(omp_parent.saved_estimate_usd, None);
+    assert_eq!(omp_parent.reported_cost_usd, None);
+    assert_ne!(omp_parent.cost.usd, Some(99.0));
+    assert_ne!(omp_parent.cost.usd, Some(9.99));
+
+    // The Hermes chain is one logical root; its members and the delegate stay out of
+    // the root slots, and the archived Codex rollout is a native root.
+    id += 1;
+    let chain = hydrate(&worker, id, &hermes.parent);
+    assert_eq!(
+        chain
+            .meta
+            .members
+            .iter()
+            .map(|m| m.native_id.as_str())
+            .collect::<Vec<_>>(),
+        ["h-parent", "h-cont"]
+    );
+    assert_eq!(chain.usage.as_ref().and_then(|u| u.total), Some(240));
+    assert!(all.roots.contains(&g.zstd), "the zstd rollout is a root");
+    id += 1;
+    worker
+        .tx
+        .send(WorkerRequest::Select {
+            request_id: id,
+            key: g.zstd.clone(),
+        })
+        .unwrap();
+    let WorkerEvent::Transcript { page, .. } = wait_for_event(
+        &worker,
+        "the archived transcript",
+        |e| matches!(e, WorkerEvent::Transcript { request_id, .. } if *request_id == id),
+    ) else {
+        unreachable!()
+    };
+    assert!(
+        texts(&page).iter().any(|t| t == "Archived prompt"),
+        "the archived rollout keeps its readable records"
+    );
+
+    // Selecting each parent and each child reaches the actual newest transcript event.
+    for (key, tail) in &g.tails {
+        id += 1;
+        worker
+            .tx
+            .send(WorkerRequest::Select {
+                request_id: id,
+                key: key.clone(),
+            })
+            .unwrap();
+        let WorkerEvent::Transcript { page, .. } = wait_for_event(
+            &worker,
+            "a transcript page",
+            |e| matches!(e, WorkerEvent::Transcript { request_id, .. } if *request_id == id),
+        ) else {
+            unreachable!()
+        };
+        let last = page
+            .events
+            .last()
+            .and_then(|e| e.text.as_ref())
+            .map(|t| t.preview.as_str());
+        assert_eq!(
+            last,
+            Some(tail.as_str()),
+            "{:?} {}",
+            key.harness,
+            key.native_id
+        );
+    }
+    assert!(worker.shutdown());
+
+    // A broken source and privacy sentinels coexist with every healthy root.
+    let mut readers = world.readers();
+    let mut surface = Surface::default();
+    surface_all(&mut readers, &mut surface);
+    assert_eq!(surface.sessions.len(), ROOT_COUNT + g.children.len());
+    assert!(
+        surface
+            .warnings
+            .iter()
+            .any(|w| w.key.source.contains("rollout-cdx-cut.jsonl.zst#")),
+        "the truncated archive is reported beside healthy roots"
+    );
+    for forbidden in g.forbidden_texts() {
+        assert!(
+            !surface
+                .warnings
+                .iter()
+                .any(|w| w.message.contains(forbidden)),
+            "a warning leaked a secret"
+        );
+        for summary in &surface.sessions {
+            assert!(
+                !summary.meta.title.contains(forbidden),
+                "a title leaked a secret"
+            );
+        }
+    }
+    assert!(surface.sessions.iter().any(|s| s.meta.key == g.zstd));
+}
+
+#[test]
+fn six_harness_refresh_keeps_selection_and_truthful_unknowns() {
+    use support::facts::file_key;
+
+    let world = World::with_all_harnesses();
+    let g = world.grown();
+    let hermes = world.hermes_plant.as_ref().expect("the Hermes home");
+    let mut config = world.config();
+    config.refresh_ms = 3_600_000;
+    let mut h = Driver::start_with(&world, config);
+
+    // The first page freezes while newer sources are on disk but not yet admitted.
+    h.pump_until("the frozen first page", |a| {
+        a.roster_status().generation == 1
+            && !a.roster_status().provisional
+            && a.all_rows().len() == 50
+    });
+    assert_eq!(
+        h.app
+            .all_rows()
+            .iter()
+            .map(|r| r.session.meta.key.clone())
+            .collect::<Vec<_>>(),
+        g.expected_roots()[..50]
+    );
+
+    // A timed OMP child is the selection under a preview that a refresh will obsolete.
+    let omp_parent = g.omp.family.parent.clone();
+    let omp_child = g.omp.family.child.clone();
+    assert!(h.app.select_row(&omp_parent));
+    h.ch(' ');
+    h.pump_until("the OMP children", |a| {
+        a.children_of(&omp_parent)
+            .is_some_and(|c| c.metadata.iter().any(|m| m.key == omp_child))
+    });
+    assert!(h.app.select_row(&omp_child));
+    h.pump_until("the timed child preview", |a| {
+        a.preview()
+            .summary()
+            .is_some_and(|s| s.meta.key == omp_child && s.metrics.speed.latest.is_some())
+    });
+    // A replacement preview request is genuinely outstanding at the generation
+    // change: send it to the worker now and withhold its answer.
+    assert!(h.app.retry_preview());
+    let pending_preview = h
+        .app
+        .preview()
+        .request_id()
+        .expect("the replacement request");
+    flush_requests(&mut h.app, &h.worker);
+    let mut late_previews: Vec<WorkerEvent> = Vec::new();
+    let mut terminal_answer = false;
+
+    // Newer source data and a child whose parent does not exist yet land on disk.
+    let newest_path = dated(&world.codex_root, "rollout-six-newest.jsonl");
+    write_lines(
+        &newest_path,
+        &[
+            cx::session_meta(&iso(NOW + 60_000), "six-newest", "/work/native"),
+            cx::user(&iso(NOW + 60_000), "newest root prompt"),
+        ],
+    );
+    let kid_path = dated(&world.codex_root, "rollout-six-late-kid.jsonl");
+    write_lines(
+        &kid_path,
+        &[
+            cx::child_session_meta(
+                &iso(NOW + 30_000),
+                "six-late-kid",
+                "six-late-kid",
+                "six-late-parent",
+                None,
+                "0.159.2",
+            ),
+            cx::turn_context(&iso(NOW + 30_000), "gpt-5.5", "/work/native"),
+        ],
+    );
+    // Every answer for the replacement request is withheld, including its terminal
+    // `done: true`, and no new source is admitted before the explicit refresh.
+    let answer_by = Instant::now() + Duration::from_secs(20);
+    while !terminal_answer {
+        assert!(Instant::now() < answer_by, "the terminal preview answer");
+        if let Ok(ev) = h.worker.rx.recv_timeout(Duration::from_millis(25)) {
+            if matches!(
+                &ev,
+                WorkerEvent::Preview { request_id, key, .. }
+                    if *request_id == pending_preview && key == &omp_child
+            ) {
+                terminal_answer = matches!(&ev, WorkerEvent::Preview { done: true, .. });
+                late_previews.push(ev);
+            } else {
+                apply_worker_event(&mut h.app, &mut h.ctx, ev);
+            }
+        }
+    }
+    // The replacement request is genuinely outstanding immediately before the
+    // generation change: the worker answered it, the App has not applied anything.
+    assert_eq!(h.app.roster_status().generation, 1, "no refresh yet");
+    assert_eq!(
+        h.app.preview().request_id(),
+        Some(pending_preview),
+        "the replacement request is still current"
+    );
+    assert!(h.app.preview().is_loading(), "its answer is still withheld");
+    assert_eq!(h.app.all_rows().len(), 50, "pages stay frozen");
+    assert!(
+        !h.app
+            .all_rows()
+            .iter()
+            .any(|r| r.session.meta.key.native_id == "six-newest"),
+        "a new source waits for the explicit refresh"
+    );
+
+    // The explicit refresh is a new generation: the newest root appears, the orphan
+    // child is still its own root, and the withheld answer cannot own the new state.
+    h.worker.tx.send(WorkerRequest::Refresh).unwrap();
+    let generation_by = Instant::now() + Duration::from_secs(20);
+    loop {
+        if h.app.roster_status().generation == 2
+            && h.app
+                .all_rows()
+                .iter()
+                .any(|r| r.session.meta.key.native_id == "six-newest")
+            && h.app
+                .all_rows()
+                .iter()
+                .any(|r| r.session.meta.key.native_id == "six-late-kid")
+        {
+            break;
+        }
+        assert!(Instant::now() < generation_by, "generation 2");
+        if let Ok(ev) = h.worker.rx.recv_timeout(Duration::from_millis(25)) {
+            if matches!(
+                &ev,
+                WorkerEvent::Preview { request_id, key, .. }
+                    if *request_id == pending_preview && key == &omp_child
+            ) {
+                late_previews.push(ev);
+            } else {
+                apply_worker_event(&mut h.app, &mut h.ctx, ev);
+            }
+        }
+    }
+    assert_eq!(h.app.all_rows().len(), 50, "the revealed capacity is kept");
+    assert_eq!(
+        h.app.all_rows()[0].session.meta.key.native_id,
+        "six-newest",
+        "the newest root is first"
+    );
+    // The new generation answers its own preview request; its facts are the ones
+    // the delayed terminal answer must not replace.
+    h.pump_until("the refreshed preview", |a| a.preview().summary().is_some());
+    let selected = h.app.selected_key().expect("a selection survives");
+    let request = h.app.preview().request_id().expect("a current request");
+    assert_ne!(
+        request, pending_preview,
+        "the generation change released the old request"
+    );
+    let facts = h
+        .app
+        .preview()
+        .summary()
+        .map(|s| std::sync::Arc::as_ptr(s) as usize);
+    assert!(facts.is_some(), "current preview facts exist");
+    assert!(
+        !late_previews.is_empty(),
+        "at least one withheld answer is delivered late"
+    );
+    for ev in late_previews {
+        apply_worker_event(&mut h.app, &mut h.ctx, ev);
+    }
+    assert_eq!(h.app.selected_key(), Some(selected), "selection is kept");
+    assert_eq!(
+        h.app.preview().request_id(),
+        Some(request),
+        "the late preview answers are ignored"
+    );
+    assert_eq!(
+        h.app
+            .preview()
+            .summary()
+            .map(|s| std::sync::Arc::as_ptr(s) as usize),
+        facts,
+        "current preview facts are not replaced"
+    );
+
+    // The late parent arrives: the next generation reparents the child instead of
+    // leaving it as a duplicate root.
+    let parent_path = dated(&world.codex_root, "rollout-six-late-parent.jsonl");
+    write_lines(
+        &parent_path,
+        &[
+            cx::session_meta(&iso(NOW + 40_000), "six-late-parent", "/work/native"),
+            cx::user(&iso(NOW + 40_000), "late parent prompt"),
+        ],
+    );
+    let late_parent = file_key(Harness::Codex, "six-late-parent", &parent_path);
+    let late_kid = file_key(Harness::Codex, "six-late-kid", &kid_path);
+    h.worker.tx.send(WorkerRequest::Refresh).unwrap();
+    h.pump_until("generation 3", |a| {
+        a.roster_status().generation == 3
+            && a.all_rows()
+                .iter()
+                .any(|r| r.session.meta.key == late_parent)
+            && a.all_rows().iter().all(|r| r.session.meta.key != late_kid)
+    });
+    assert!(h.app.select_row(&late_parent));
+    h.ch(' ');
+    h.pump_until("the late child", |a| {
+        a.children_of(&late_parent)
+            .is_some_and(|c| c.metadata.iter().any(|m| m.key == late_kid))
+    });
+    assert_eq!(h.app.all_rows().len(), 50, "a child never adds a root slot");
+
+    // Search reads only loaded roots: an unloaded root is not invented.
+    let unloaded = g.expected_roots()[60].clone();
+    h.app.set_query(&unloaded.native_id);
+    assert!(
+        h.app.visible_rows().is_empty(),
+        "an unloaded root cannot match a loaded-only search"
+    );
+    h.app.set_query("");
+
+    // A child-only match keeps the parent context on the roster. The generation
+    // change dropped loaded families, so the OMP family is opened again first.
+    assert!(h.app.select_row(&omp_parent));
+    h.ch(' ');
+    h.pump_until("the OMP children again", |a| {
+        a.children_of(&omp_parent)
+            .is_some_and(|c| c.metadata.iter().any(|m| m.key == omp_child))
+    });
+    h.app.set_query("omp-kid");
+    let visible: Vec<SessionKey> = h
+        .app
+        .visible_rows()
+        .iter()
+        .map(|r| r.session.meta.key.clone())
+        .collect();
+    assert!(
+        visible.contains(&omp_parent),
+        "a child match keeps its parent row"
+    );
+    assert!(!visible.contains(&omp_child), "children are not root rows");
+    let shown: Vec<(SessionKey, u8)> = h
+        .app
+        .roster_rows()
+        .filter_map(|item| match item {
+            agentscope::app::RosterItem::Session(row) => {
+                Some((row.session.meta.key.clone(), row.depth))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        shown
+            .iter()
+            .any(|(key, depth)| key == &omp_child && *depth == 1),
+        "the matched child is shown under its parent"
+    );
+    h.app.set_query("");
+
+    // Manual historical reading is not jumped by a refresh, and the older anchor
+    // still resumes from where the reader was. Reveal the rest of the frozen
+    // generation first so the long archived rollout is loaded.
+    while h.app.roster_status().has_more {
+        let loaded = h.app.all_rows().len();
+        assert!(h.app.load_more_roots());
+        h.pump_until("a longer frozen page", |a| a.all_rows().len() > loaded);
+    }
+    let archived = g.truncated_zstd.clone();
+    assert!(h.app.select_row(&archived), "the archived root is loaded");
+    h.key(KeyCode::Enter);
+    h.pump_until("the archived transcript", |a| {
+        a.transcript().is_some_and(|t| t.loaded())
+    });
+    h.ch('k');
+    let reading = h
+        .app
+        .transcript()
+        .unwrap()
+        .selected_event()
+        .unwrap()
+        .id
+        .clone();
+    let loaded_before = h.app.transcript().unwrap().events().len();
+    assert!(h.app.transcript().unwrap().has_older());
+    h.worker.tx.send(WorkerRequest::Refresh).unwrap();
+    h.pump_until("generation 4", |a| a.roster_status().generation == 4);
+    assert_eq!(
+        h.app.transcript().unwrap().selected_event().unwrap().id,
+        reading,
+        "the reader is not moved"
+    );
+    assert_eq!(h.app.transcript().unwrap().events().len(), loaded_before);
+    assert!(h.app.transcript().unwrap().has_older());
+    let boundary = h.app.transcript().unwrap().events()[0].id.clone();
+    h.ch('g');
+    h.pump_until("the older page", |a| {
+        a.transcript()
+            .is_some_and(|t| t.events().len() > loaded_before)
+    });
+    let resumed = h.app.transcript().unwrap();
+    assert_eq!(
+        resumed.selected_event().unwrap().id,
+        boundary,
+        "focus stays on the boundary event the older page was resumed from"
+    );
+    assert_ne!(
+        resumed.events()[0].id,
+        boundary,
+        "older events were prepended"
+    );
+    assert!(
+        !resumed.has_older(),
+        "the older page reached the readable start of the truncated archive"
+    );
+
+    // Aggregate rows and missing timing stay Unknown; they generate no request speed.
+    let chain = hydrate(&h.worker, 901, &hermes.parent);
+    assert!(chain.usage.is_some(), "recorded aggregate rows reconcile");
+    assert!(chain.metrics.speed.latest.is_none(), "no aggregate speed");
+    assert!(chain.metrics.speed.weighted_tokens_per_second.is_none());
+    assert_eq!(chain.metrics.speed.total_requests, 0);
+    assert_eq!(
+        chain.usage.as_ref().unwrap().cost.usd,
+        Some(0.02),
+        "the chain's estimated rows reconcile exactly"
+    );
+    let pi = hydrate(&h.worker, 902, &g.pi.parent);
+    assert!(pi.usage.is_some());
+    assert!(pi.metrics.speed.latest.is_none(), "no recorded duration");
+    assert_eq!(pi.metrics.speed.measured_requests, 0);
+    assert_eq!(pi.metrics.speed.total_requests, 1, "its call is known");
+    assert!(!pi.metrics.speed.complete);
+    assert_eq!(pi.metrics.timing.ended_at, None);
     assert!(h.worker.shutdown());
 }
