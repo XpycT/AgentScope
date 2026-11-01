@@ -6,6 +6,7 @@ use agentscope::ingest::text::display_safe;
 use agentscope::providers::ProviderReader;
 use agentscope::providers::claude::ClaudeScanner;
 use agentscope::providers::codex::CodexScanner;
+use agentscope::providers::hermes::RetryingHermes;
 use agentscope::providers::omp::OmpScanner;
 use agentscope::providers::opencode::RetryingOpenCode;
 use agentscope::ui::{self, RosterContext};
@@ -30,7 +31,7 @@ const USAGE: &str =
     "Usage: agentscope [OPTIONS]\n       agentscope inspect <rollout.jsonl|rollout.jsonl.zst>";
 
 const HELP: &str =
-    "AgentScope: read-only monitor for local Codex, Claude Code, OpenCode, and OMP sessions.
+    "AgentScope: read-only monitor for local Codex, Claude Code, OpenCode, OMP, and Hermes sessions.
 
 Usage:
   agentscope [OPTIONS]
@@ -45,7 +46,7 @@ Options:
   --opencode-db <path>      OpenCode database
   --omp-sessions <dir>      OMP sessions root
   --pi-sessions <dir>       Pi sessions root (accepted; no reader yet)
-  --hermes-db <path>        Hermes state.db (accepted; no reader yet)
+  --hermes-db <path>        Hermes state.db
   --no-processes            Disable process observation
   --no-color                Disable color (NO_COLOR is also honored)
   --no-mouse                Disable mouse capture (keyboard still works; the terminal keeps native selection)
@@ -226,6 +227,19 @@ fn build_readers(config: &Config) -> (Vec<Box<dyn ProviderReader>>, Vec<String>)
         }
         Some(error) => notes.push(format!("OpenCode unavailable: {error}")),
     }
+    // A configured Hermes database that cannot be opened is retried on every
+    // refresh; an absent platform default stays silent.
+    let (hermes, opened) = RetryingHermes::open(config);
+    let configured = config
+        .harnesses
+        .hermes
+        .db
+        .as_ref()
+        .is_some_and(|path| path.is_file());
+    if let Some(error) = opened.filter(|_| configured) {
+        notes.push(format!("Hermes unavailable: {error}; retrying"));
+    }
+    readers.push(Box::new(hermes));
     (readers, notes)
 }
 
@@ -239,6 +253,15 @@ fn checked_roots(config: &Config) -> Vec<String> {
         show("Claude", &config.harnesses.claude.root),
         show("OpenCode", &config.harnesses.opencode.db),
         show("OMP", &config.harnesses.omp.root),
+        show(
+            "Hermes",
+            &config
+                .harnesses
+                .hermes
+                .root
+                .clone()
+                .or_else(|| config.harnesses.hermes.db.clone()),
+        ),
     ]
 }
 

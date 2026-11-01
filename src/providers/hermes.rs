@@ -10,6 +10,8 @@
 pub mod discovery;
 pub mod hydration;
 pub mod lineage;
+pub(crate) mod messages;
+pub mod scanner;
 pub mod schema;
 pub mod usage;
 
@@ -21,6 +23,7 @@ pub use lineage::{
     HermesEdge, HermesLineage, HermesLogicalSession, HermesMarkers, HermesRelation, HermesRowMeta,
     HermesUnresolved, classify_edge, resolve_chains, resolve_lineage,
 };
+pub use scanner::{HermesScanner, RetryingHermes};
 pub use usage::{
     HermesCostStatus, HermesModelTotals, HermesMoney, HermesRowId, HermesSessionTotals,
     HermesTokens, HermesUsageContribution, HermesUsageReconciler, HermesUsageReport,

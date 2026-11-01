@@ -585,3 +585,19 @@ pub fn sidecar(db: &Path, suffix: &str) -> PathBuf {
     name.push(suffix);
     PathBuf::from(name)
 }
+
+pub fn set_message_display_metadata(conn: &Connection, message: i64, metadata: Option<&str>) {
+    conn.execute(
+        "UPDATE messages SET display_metadata = ?1 WHERE id = ?2",
+        rusqlite::params![text(metadata), message],
+    )
+    .expect("update message display metadata");
+}
+
+pub fn set_message_content(conn: &Connection, message: i64, content: &str) {
+    conn.execute(
+        "UPDATE messages SET content = ?1 WHERE id = ?2",
+        rusqlite::params![content, message],
+    )
+    .expect("update message content");
+}

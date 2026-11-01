@@ -18,6 +18,7 @@ use rusqlite::Connection;
 
 use super::super::sqlite_guard::{interrupted, map_error};
 use super::super::{DiscoveryDelta, FORGOTTEN_CAP, Forgotten, ProviderError};
+use super::lineage::{HermesMarkers, HermesRowMeta};
 use super::schema::{self, EFFORT_MAX, HermesShape, MAX_CONFIG_BYTES, epoch_ms, short};
 use crate::config::{Config, HarnessConfig};
 use crate::domain::{
@@ -161,6 +162,30 @@ impl HermesCatalog {
     /// Largest pass seen set observed; bounded by tracked + forgotten entries.
     pub fn peak_seen(&self) -> usize {
         self.peak_seen
+    }
+
+    /// The metadata last reported for `key`, while its row is still tracked.
+    pub fn reported(&self, key: &SessionKey) -> Option<&SessionMetadata> {
+        self.known.entries.get(key).map(|entry| &entry.meta)
+    }
+
+    /// The relation inputs of every tracked row (bounded by the metadata ceiling).
+    pub fn rows(&self) -> Vec<&HermesRowMeta> {
+        self.known
+            .entries
+            .values()
+            .map(|entry| &entry.row)
+            .collect()
+    }
+
+    /// Databases that failed (or had an unsupported shape) in the latest pass.
+    /// Their last-good rows stay tracked and are retried on the next pass.
+    pub fn failed_databases(&self) -> Vec<PathBuf> {
+        self.sources
+            .iter()
+            .filter(|source| source.failed || source.unsupported)
+            .map(|source| source.path.clone())
+            .collect()
     }
 
     /// One bounded slice of discovery. Finishing a pass (`scan.done`) reports
@@ -402,6 +427,12 @@ struct MetaRow {
     last_activity_type: Option<String>,
     archived: Option<i64>,
     latest_message: Option<f64>,
+    source: Option<String>,
+    end_reason: Option<String>,
+    ended: Option<f64>,
+    delegate_from: Option<String>,
+    branched_from: Option<String>,
+    reset_from: Option<String>,
     bytes: usize,
 }
 
@@ -424,6 +455,12 @@ impl MetaRow {
         let last_activity_type: Option<String> = row.get(14)?;
         let archived: Option<i64> = row.get(15)?;
         let latest_message: Option<f64> = row.get(16)?;
+        let source: Option<String> = row.get(17)?;
+        let end_reason: Option<String> = row.get(18)?;
+        let ended: Option<f64> = row.get(19)?;
+        let delegate_from: Option<String> = row.get(20)?;
+        let branched_from: Option<String> = row.get(21)?;
+        let reset_from: Option<String> = row.get(22)?;
         let config_bytes = config_bytes.unwrap_or(0).max(0) as usize;
         let bytes = KNOWN_OVERHEAD
             + id.as_ref().map_or(0, String::len)
@@ -450,6 +487,12 @@ impl MetaRow {
             last_activity_type,
             archived,
             latest_message,
+            source,
+            end_reason,
+            ended,
+            delegate_from,
+            branched_from,
+            reset_from,
             bytes,
         })
     }
@@ -539,6 +582,23 @@ fn row_sql(shape: &HermesShape) -> String {
     };
     let started = number(true, "s.started_at");
     let started_type = kind(true, "s.started_at");
+    let ended = number(shape.ended, "s.ended_at");
+    let source = text(shape.source, "SUBSTR(s.source, 1, 64)");
+    let end_reason = text(shape.end_reason, "SUBSTR(s.end_reason, 1, 64)");
+    let marker = |key: &str| {
+        if shape.model_config {
+            format!(
+                "CASE WHEN {sized} AND json_valid(s.model_config) \
+                 AND json_type(s.model_config, '$.{key}') = 'text' \
+                 THEN SUBSTR(json_extract(s.model_config, '$.{key}'), 1, 256) END"
+            )
+        } else {
+            "NULL".to_string()
+        }
+    };
+    let delegate = marker("_delegate_from");
+    let branched = marker("_branched_from");
+    let reset = marker("_reset_from");
     let last_activity = number(shape.last_activity, "s.last_activity_at");
     let last_activity_type = kind(shape.last_activity, "s.last_activity_at");
     let archived = if shape.archived {
@@ -564,10 +624,17 @@ fn row_sql(shape: &HermesShape) -> String {
     format!(
         "SELECT {id}, {parent}, {parent_exists}, {title}, {model}, {provider}, \
          {config_type}, {config_bytes}, {config_valid}, {enabled}, {effort}, {started}, \
-         {started_type}, {last_activity}, {last_activity_type}, {archived}, {latest} \
+         {started_type}, {last_activity}, {last_activity_type}, {archived}, {latest}, \
+         {source}, {end_reason}, {ended}, {delegate}, {branched}, {reset} \
          FROM sessions s \
          WHERE typeof(s.id) = 'text' AND s.id <> '' AND s.id > ?1 \
-         ORDER BY s.id LIMIT ?2"
+         ORDER BY s.id LIMIT ?2",
+        source = source,
+        end_reason = end_reason,
+        ended = ended,
+        delegate = delegate,
+        branched = branched,
+        reset = reset,
     )
 }
 
@@ -584,7 +651,7 @@ fn configured_effort(enabled: Option<&str>, effort: Option<&str>) -> Option<Stri
     }
 }
 
-fn metadata(database: &Path, row: MetaRow) -> Option<SessionMetadata> {
+fn metadata(database: &Path, row: &MetaRow) -> Option<SessionMetadata> {
     if row.id.is_empty() {
         return None;
     }
@@ -656,6 +723,23 @@ fn metadata(database: &Path, row: MetaRow) -> Option<SessionMetadata> {
         source_available: true,
         harness_version: None,
     })
+}
+
+/// The exact relation inputs of one discovered row, kept beside its metadata so
+/// the scanner can resolve compression chains without a second database scan.
+fn row_meta(database: &Path, row: &MetaRow) -> HermesRowMeta {
+    let mut meta = HermesRowMeta::new(database, &row.id);
+    meta.parent = row.parent.clone().filter(|parent| !parent.is_empty());
+    meta.source = row.source.clone();
+    meta.started = epoch_ms(row.started);
+    meta.ended = epoch_ms(row.ended);
+    meta.end_reason = row.end_reason.clone();
+    meta.markers = HermesMarkers {
+        delegate_from: row.delegate_from.clone().filter(|id| !id.is_empty()),
+        branched_from: row.branched_from.clone().filter(|id| !id.is_empty()),
+        reset_from: row.reset_from.clone().filter(|id| !id.is_empty()),
+    };
+    meta
 }
 
 fn digest(meta: &SessionMetadata) -> u64 {
@@ -831,13 +915,18 @@ fn work(
             step.records = step.records.saturating_sub(1);
             step.bytes = step.bytes.saturating_sub(row.bytes);
             nonsense |= row.nonsense();
-            let Some(meta) = metadata(&database, row) else {
+            let Some(meta) = metadata(&database, &row) else {
                 continue;
             };
+            let facts = row_meta(&database, &row);
             pass.cursor = meta.key.native_id.clone();
-            let change = books
-                .known
-                .insert(&meta.key, digest(&meta), meta.activity.at);
+            let change = books.known.insert(
+                &meta.key,
+                digest(&meta),
+                meta.activity.at,
+                meta.clone(),
+                facts,
+            );
             // Displaced entries stay watched (bounded) so a later confirmed
             // deletion is still reported. The watch is shared across databases,
             // so cleanup targets the shared seen set, not the current source.
@@ -955,6 +1044,8 @@ struct KnownEntry {
     at: Option<Timestamp>,
     seq: u64,
     bytes: usize,
+    meta: SessionMetadata,
+    row: HermesRowMeta,
 }
 
 struct Change {
@@ -994,7 +1085,14 @@ impl BoundedKnown {
         KNOWN_OVERHEAD + key.native_id.len() + database(key).as_os_str().len()
     }
 
-    fn insert(&mut self, key: &SessionKey, digest: u64, at: Option<Timestamp>) -> Change {
+    fn insert(
+        &mut self,
+        key: &SessionKey,
+        digest: u64,
+        at: Option<Timestamp>,
+        meta: SessionMetadata,
+        row: HermesRowMeta,
+    ) -> Change {
         let changed = self
             .entries
             .get(key)
@@ -1014,6 +1112,8 @@ impl BoundedKnown {
                 at,
                 seq,
                 bytes,
+                meta,
+                row,
             },
         );
         self.order.insert((at, seq));

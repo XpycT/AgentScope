@@ -728,3 +728,36 @@ fn omp_full_worker_and_tui_session_leaves_provider_data_unchanged() {
     assert_eq!(metadata(&world), before_meta);
     assert_only_adr0002_sidecars_added(&world, &before_paths);
 }
+
+#[test]
+fn hermes_profiles_and_decoy_credentials_leave_provider_content_unchanged() {
+    let world = World::with_hermes();
+    let before = snapshot(world.dir.path());
+    let before_paths = all_paths(world.dir.path());
+    let before_meta = metadata(&world);
+
+    let mut readers = world.readers();
+    let surface = exercise_everything(&mut readers);
+    let _ = exercise_everything(&mut readers);
+    assert!(surface.sessions.len() >= 3, "parent, delegate and profile");
+    drop(readers);
+
+    let after = snapshot(world.dir.path());
+    assert_eq!(
+        after.files, before.files,
+        "Hermes main databases, session rows and credential decoys are byte-identical"
+    );
+    assert_eq!(
+        metadata(&world),
+        before_meta,
+        "sizes, mtimes, permissions unchanged"
+    );
+    assert_only_adr0002_sidecars_added(&world, &before_paths);
+    // The live writers still see their own data: nothing was repaired or truncated.
+    for writer in &world.hermes_writers {
+        let messages: i64 = writer
+            .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert!(messages > 0);
+    }
+}

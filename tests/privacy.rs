@@ -1319,3 +1319,50 @@ fn omp_titles_prompts_private_fields_and_decoys_never_surface() {
         }
     }
 }
+
+#[test]
+fn hermes_profiles_and_decoy_credentials_never_surface() {
+    let world = World::with_hermes();
+    let mut readers = world.readers();
+    let surface = exercise_everything(&mut readers);
+    for session in &surface.sessions {
+        assert_clean("Hermes summary", &format!("{:?}", session));
+        assert_clean("Hermes metadata", &format!("{:?}", session.meta));
+    }
+    for page in &surface.pages {
+        for event in &page.events {
+            assert_clean("Hermes event", &format!("{event:?}"));
+            if let Some(text) = &event.text {
+                assert_clean("Hermes preview", &text.preview);
+            }
+            if let Some(tool) = &event.tool {
+                assert_clean("Hermes tool", &format!("{tool:?}"));
+            }
+        }
+    }
+    for warning in &surface.warnings {
+        assert_clean("Hermes warning", &warning.message);
+        assert_clean("Hermes warning source", &warning.key.source);
+    }
+    let masked = surface
+        .pages
+        .iter()
+        .flat_map(|page| page.events.iter())
+        .filter_map(|event| event.text.as_ref())
+        .any(|text| text.preview.contains("api_key="));
+    assert!(
+        masked,
+        "the credential-shaped transcript text is rendered masked"
+    );
+    let leaked = surface
+        .pages
+        .iter()
+        .flat_map(|page| page.events.iter())
+        .any(|event| {
+            event
+                .text
+                .as_ref()
+                .is_some_and(|text| text.preview.contains(INLINE_SECRET))
+        });
+    assert!(!leaked, "the inline credential is never painted");
+}

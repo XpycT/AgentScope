@@ -19,8 +19,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::domain::{
     AggregationClass, CostBreakdown, CostEstimate, InputAccounting, ModelDetail, ModelUsageSummary,
-    MoneyFact, MoneySource, OutputAccounting, RecordedMoney, SessionKey, SessionMetadata,
-    TokenAccounting, TokenCategories, UsageCoverage, UsageSummary,
+    MoneyFact, MoneySource, OutputAccounting, Provenance, RecordedMoney, SessionKey,
+    SessionMetadata, TokenAccounting, TokenCategories, UsageCoverage, UsageObservation, UsageScope,
+    UsageSummary,
 };
 use crate::pricing::{PriceSchedule, PricedFacts, ReferencePolicy, estimate_facts};
 
@@ -131,7 +132,7 @@ impl HermesMoney {
         })
     }
 
-    fn recorded(self) -> RecordedMoney {
+    pub(crate) fn recorded(self) -> RecordedMoney {
         match self.status {
             HermesCostStatus::Actual => RecordedMoney {
                 reported_api: self.actual_usd.map(|usd| MoneyFact {
@@ -198,6 +199,26 @@ pub struct HermesModelTotals {
     pub api_call_count: Option<u64>,
     pub tokens: HermesTokens,
     pub money: HermesMoney,
+}
+
+impl HermesModelTotals {
+    /// One aggregate-scope observation for a ledger row (used by the compaction
+    /// details page). It is never treated as one request.
+    pub(crate) fn observation(
+        &self,
+        _prices: &PriceSchedule,
+        provenance: Provenance,
+    ) -> UsageObservation {
+        UsageObservation {
+            model: self.model.clone(),
+            scope: UsageScope::Session,
+            categories: self.tokens.categories(),
+            accounting: HermesTokens::accounting(),
+            request: None,
+            money: self.money.recorded(),
+            provenance,
+        }
+    }
 }
 
 /// Where a contribution came from, kept for honest detail display.

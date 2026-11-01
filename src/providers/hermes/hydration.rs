@@ -26,9 +26,11 @@ use crate::domain::{
 };
 use crate::pricing::PriceSchedule;
 use crate::providers::sqlite_guard::{interrupted, map_error};
-use crate::providers::{HydrationDelta, ProviderError, ReadJobId};
+use crate::providers::{HydrationDelta, ProviderError, ReadJobId, ReadProgress};
 
 const BATCH: usize = 64;
+/// Longest ancestor/member chain primed per job.
+const MAX_CHAIN: usize = 256;
 /// Bounded pure lineage input per job. H3 replaces the whole-database scan with
 /// chain-local walking; until then an oversized graph fails explicitly instead of
 /// growing without limit.
@@ -52,6 +54,8 @@ struct Job {
     rows: Vec<RowFacts>,
     usage_cursor: i64,
     usage: Vec<HermesModelTotals>,
+    ledger_cursor: i64,
+    ledger: Vec<crate::domain::CompactionObservation>,
     logical: Option<HermesLogicalSession>,
     members: Vec<SessionKey>,
 }
@@ -60,6 +64,7 @@ struct Job {
 enum Phase {
     Sessions,
     Usage,
+    Compactions,
     Finished,
 }
 
@@ -134,6 +139,150 @@ impl HermesHydration {
         self.jobs.remove(&(key.clone(), job));
     }
 
+    /// Loads only the requested chain and its ancestor rows, then continues with
+    /// usage. `false` means the slice was interrupted and the call should be retried.
+    pub(crate) fn prime(
+        &mut self,
+        job: ReadJobId,
+        key: &SessionKey,
+        members: &[SessionKey],
+        budget: RefreshBudget,
+    ) -> Result<bool, ProviderError> {
+        if database(key) != Some(self.database.as_path()) {
+            return Err(ProviderError::Internal(
+                "hydration key belongs to another database".into(),
+            ));
+        }
+        self.jobs.entry((key.clone(), job)).or_insert_with(|| Job {
+            phase: Phase::Sessions,
+            sessions_cursor: -1,
+            rows: Vec::new(),
+            usage_cursor: -1,
+            usage: Vec::new(),
+            ledger_cursor: -1,
+            ledger: Vec::new(),
+            logical: None,
+            members: Vec::new(),
+        });
+        if self
+            .jobs
+            .get(&(key.clone(), job))
+            .is_some_and(|state| state.logical.is_some())
+        {
+            return Ok(true);
+        }
+        let Some(first) = members.first() else {
+            return Err(ProviderError::Unavailable("session row is missing".into()));
+        };
+        let deadline = Instant::now() + Duration::from_millis(budget.max_millis.max(1));
+        self.open(deadline)?;
+        let shape = *self
+            .shape
+            .as_ref()
+            .ok_or_else(|| ProviderError::Internal("hermes shape missing".into()))?;
+        let database = self.database.clone();
+        let ids: Vec<String> = members
+            .iter()
+            .map(|member| member.native_id.clone())
+            .collect();
+        let mut seen: std::collections::HashSet<String> = ids.iter().cloned().collect();
+        let mut rows = match self.load_rows(&shape, &database, &ids, deadline)? {
+            Some(rows) => rows,
+            None => return Ok(false),
+        };
+        let mut next = rows
+            .iter()
+            .find(|facts| facts.meta.key == *first)
+            .and_then(|facts| facts.meta.parent.clone());
+        while let Some(parent) = next {
+            if !seen.insert(parent.clone()) {
+                break;
+            }
+            if seen.len() > MAX_CHAIN {
+                return Err(ProviderError::Unsupported(
+                    "Hermes lineage is longer than the supported ancestor count".into(),
+                ));
+            }
+            let loaded = match self.load_rows(&shape, &database, &[parent], deadline)? {
+                Some(rows) => rows,
+                None => return Ok(false),
+            };
+            let Some(facts) = loaded.into_iter().next() else {
+                break;
+            };
+            next = facts.meta.parent.clone();
+            rows.push(facts);
+        }
+        let metas: Vec<HermesRowMeta> = rows.iter().map(|facts| facts.meta.clone()).collect();
+        let lineage = lineage::resolve_lineage(&metas);
+        let logical = lineage
+            .for_key(key)
+            .cloned()
+            .ok_or_else(|| ProviderError::Unavailable("session row is missing".into()))?;
+        if logical.key != *key {
+            return Err(ProviderError::Unavailable(
+                "the requested row is part of another compression chain".into(),
+            ));
+        }
+        let state = self
+            .jobs
+            .get_mut(&(key.clone(), job))
+            .ok_or_else(|| ProviderError::Internal("hydration job vanished".into()))?;
+        state.rows = rows;
+        state.members = logical.members.clone();
+        state.logical = Some(logical);
+        state.phase = Phase::Usage;
+        Ok(true)
+    }
+
+    /// Reads the requested session rows by native id (same fixed projection as the
+    /// full scan). `None` means the slice deadline interrupted the batch.
+    fn load_rows(
+        &mut self,
+        shape: &HermesShape,
+        database: &Path,
+        ids: &[String],
+        deadline: Instant,
+    ) -> Result<Option<Vec<RowFacts>>, ProviderError> {
+        if ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let marks = (1..=ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = session_sql(shape).replace(
+            "WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+            &format!("WHERE typeof(s.id) = 'text' AND s.id IN ({marks}) ORDER BY s.id"),
+        );
+        let values: Vec<rusqlite::types::Value> = ids
+            .iter()
+            .map(|id| rusqlite::types::Value::Text(id.clone()))
+            .collect();
+        let busy = busy_for_deadline(deadline, self.busy_ms);
+        let connection = self
+            .connection
+            .as_mut()
+            .ok_or_else(|| ProviderError::Internal("hermes connection missing".into()))?;
+        set_busy(connection, busy)?;
+        let mut rows = Vec::new();
+        let outcome = with_deadline_bound(connection, deadline, |conn| {
+            let mut statement = conn.prepare_cached(&sql).map_err(map_error)?;
+            let mut query = statement
+                .query(rusqlite::params_from_iter(values))
+                .map_err(map_error)?;
+            while let Some(row) = query.next().map_err(map_error)? {
+                rows.push(row_facts(database, row)?);
+            }
+            Ok(())
+        });
+        match outcome {
+            Ok(()) => Ok(Some(rows)),
+            Err(error) if interrupted(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// One bounded slice. `Pending` leaves only this job's own partial state; a
     /// cancelled job is never visible again, and a fresh job re-reads the database.
     pub fn step(
@@ -155,6 +304,8 @@ impl HermesHydration {
             rows: Vec::new(),
             usage_cursor: -1,
             usage: Vec::new(),
+            ledger_cursor: -1,
+            ledger: Vec::new(),
             logical: None,
             members: Vec::new(),
         });
@@ -189,6 +340,12 @@ impl HermesHydration {
                 Phase::Usage => {
                     self.prepare_chain(key, job)?;
                     let done = self.read_usage(key, job, &mut slice)?;
+                    if done && let Some(state) = self.jobs.get_mut(&(key.clone(), job)) {
+                        state.phase = Phase::Compactions;
+                    }
+                }
+                Phase::Compactions => {
+                    let done = self.read_ledger(key, job, &mut slice)?;
                     if done && let Some(state) = self.jobs.get_mut(&(key.clone(), job)) {
                         state.phase = Phase::Finished;
                     }
@@ -427,6 +584,66 @@ impl HermesHydration {
         Ok(!stopped && fetched < limit)
     }
 
+    /// One bounded slice of the aggregate compression ledger. The cursor is
+    /// physical (`session_model_usage.rowid`); rows read but not stored are
+    /// retried by the next slice.
+    fn read_ledger(
+        &mut self,
+        key: &SessionKey,
+        job: ReadJobId,
+        slice: &mut Slice,
+    ) -> Result<bool, ProviderError> {
+        let shape = *self
+            .shape
+            .as_ref()
+            .ok_or_else(|| ProviderError::Internal("hermes shape missing".into()))?;
+        if !shape.usage {
+            return Ok(true);
+        }
+        let (cursor, limit, members) = {
+            let state = self
+                .jobs
+                .get(&(key.clone(), job))
+                .ok_or_else(|| ProviderError::Internal("hydration job vanished".into()))?;
+            (state.ledger_cursor, slice.limit(), state.members.clone())
+        };
+        if limit == 0 {
+            return Ok(false);
+        }
+        let connection = self
+            .connection
+            .as_mut()
+            .ok_or_else(|| ProviderError::Internal("hermes connection missing".into()))?;
+        let request = super::messages::LedgerRequest {
+            members: &members,
+            after: cursor,
+            limit,
+            max_bytes: slice.bytes,
+            deadline: Some(slice.deadline),
+            generation: None,
+        };
+        match super::messages::compression_ledger(
+            connection,
+            shape,
+            &self.database,
+            &self.prices,
+            request,
+        )? {
+            ReadProgress::Pending(_) => Ok(false),
+            ReadProgress::Ready(page) => {
+                let count = page.observations.len();
+                if let Some(state) = self.jobs.get_mut(&(key.clone(), job)) {
+                    state.ledger.extend(page.observations);
+                    if let Some(next) = page.next {
+                        state.ledger_cursor = next;
+                    }
+                }
+                slice.charge(count, page.bytes);
+                Ok(!page.more)
+            }
+        }
+    }
+
     fn pending_summary(&self, key: &SessionKey, job: ReadJobId) -> SessionSummary {
         let state = self.jobs.get(&(key.clone(), job));
         let meta = state
@@ -516,6 +733,7 @@ impl HermesHydration {
             .filter(|facts| logical.members.contains(&facts.meta.key))
             .filter_map(|facts| facts.activity)
             .max();
+        let compactions = self.compactions(state, &logical)?;
         let mut summary = SessionSummary::unhydrated(meta);
         summary.usage = Some(usage);
         summary.lifecycle = closure.lifecycle;
@@ -532,9 +750,52 @@ impl HermesHydration {
                 model_ms: None,
                 active_complete: false,
             },
+            compactions,
             ..crate::domain::SessionMetrics::default()
         };
         Ok(summary)
+    }
+
+    /// In-place carriers plus rotation edges (Event scope) and the aggregate
+    /// compression ledger (Aggregate scope). The aggregate amount is never split
+    /// into events and no event before/after/duration is invented.
+    fn compactions(
+        &self,
+        state: &Job,
+        logical: &HermesLogicalSession,
+    ) -> Result<crate::domain::CompactionSummary, ProviderError> {
+        let shape = *self
+            .shape
+            .as_ref()
+            .ok_or_else(|| ProviderError::Internal("hermes shape missing".into()))?;
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| ProviderError::Internal("hermes connection missing".into()))?;
+        let rows: Vec<HermesRowMeta> = state
+            .rows
+            .iter()
+            .filter(|facts| logical.members.contains(&facts.meta.key))
+            .map(|facts| facts.meta.clone())
+            .collect();
+        let scan = super::messages::read_compactions(
+            connection,
+            shape,
+            &self.database,
+            &logical.members,
+            &rows,
+            None,
+            super::messages::CARRIER_SCAN,
+            None,
+        )?;
+        let mut observations = scan.observations;
+        observations.extend(state.ledger.iter().cloned());
+        Ok(crate::metrics::compaction_summary(
+            &observations,
+            scan.history_complete,
+            &self.prices,
+            crate::pricing::ReferencePolicy::Disabled,
+        ))
     }
 
     fn logical_metadata(

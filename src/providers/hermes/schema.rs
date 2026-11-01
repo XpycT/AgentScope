@@ -121,6 +121,7 @@ static HERMES_ALLOWLIST: Allowlist = Allowlist {
         "max",
         "min",
         "substr",
+        "sum",
         "typeof",
     ],
 };

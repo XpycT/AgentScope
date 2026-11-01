@@ -43,6 +43,12 @@ pub struct World {
     pub omp_on: bool,
     /// The OMP family of [`World::with_omp`] (the native world keeps it in [`Grown`]).
     pub omp_plant: Option<OmpPlant>,
+    /// Hermes home (its own `state.db` and a `profiles/work` database).
+    pub hermes_home: PathBuf,
+    /// Held open like a live Hermes writer so committed rows stay in the WAL.
+    pub hermes_writers: Vec<Connection>,
+    pub hermes_on: bool,
+    pub hermes_plant: Option<HermesPlant>,
 }
 
 pub fn claude_line(
@@ -172,6 +178,7 @@ impl World {
             .unwrap();
 
         let omp_root = dir.path().join("omp").join("agent").join("sessions");
+        let hermes_home = dir.path().join("hermes");
         World {
             dir,
             codex_root,
@@ -182,6 +189,10 @@ impl World {
             omp_root,
             omp_on: false,
             omp_plant: None,
+            hermes_home,
+            hermes_writers: Vec::new(),
+            hermes_on: false,
+            hermes_plant: None,
         }
     }
 
@@ -195,7 +206,12 @@ impl World {
             ..CliOverrides::default()
         };
         cli.claude_desktop = self.grown.as_ref().map(|g| g.desktop.data.clone());
-        Config::load_with_env(&cli, &Env::new()).expect("valid world config")
+        let mut config = Config::load_with_env(&cli, &Env::new()).expect("valid world config");
+        if self.hermes_on {
+            config.harnesses.hermes.root = Some(self.hermes_home.clone());
+            config.harnesses.hermes.db = Some(self.hermes_home.join("state.db"));
+        }
+        config
     }
 
     pub fn readers(&self) -> Vec<Box<dyn ProviderReader>> {
@@ -206,6 +222,11 @@ impl World {
         ];
         if self.omp_on {
             readers.push(Box::new(OmpScanner::new(&config).expect("omp")));
+        }
+        if self.hermes_on {
+            readers.push(Box::new(
+                agentscope::providers::hermes::HermesScanner::new(&config).expect("hermes"),
+            ));
         }
         readers.push(Box::new(OpenCodeScanner::new(&config).expect("opencode")));
         readers
@@ -226,6 +247,18 @@ impl World {
                 secret: NOW_MS - 360_000,
             },
         ));
+        world
+    }
+
+    /// The three-provider World plus a Hermes home (default and profile
+    /// databases) with a compression chain, a delegate, in-place compaction and
+    /// credential decoys.
+    pub fn with_hermes() -> Self {
+        let mut world = World::new();
+        world.hermes_on = true;
+        let (plant, writers) = plant_hermes(&world.hermes_home);
+        world.hermes_plant = Some(plant);
+        world.hermes_writers = writers;
         world
     }
 
@@ -1745,4 +1778,193 @@ pub fn plant_omp(root: &Path, t: OmpTimes) -> OmpPlant {
         decoys,
         family,
     }
+}
+
+// ---- Hermes ------------------------------------------------------------------------
+
+use super::hermes as hx;
+
+/// Identities and text of the planted Hermes home.
+pub struct HermesPlant {
+    /// Logical parent chain (`h-parent` → `h-cont`).
+    pub parent: SessionKey,
+    pub continuation: SessionKey,
+    pub child: SessionKey,
+    pub profile: SessionKey,
+    pub profile_db: PathBuf,
+    pub tail: String,
+    pub summary: String,
+}
+
+/// Creates a Hermes home with a default `state.db` and one profile database,
+/// plus credential decoys beside them. The writers stay open so rows are in WAL.
+pub fn plant_hermes(home: &Path) -> (HermesPlant, Vec<Connection>) {
+    let db = home.join("state.db");
+    let profile_db = home.join("profiles").join("work").join("state.db");
+    let root = hx::create_db(&db, true);
+    let profile = hx::create_db(&profile_db, true);
+
+    hx::insert_session(
+        &root,
+        "h-parent",
+        None,
+        json!({}),
+        (NOW_MS - 500_000) as f64 / 1000.0,
+    );
+    hx::set_title(&root, "h-parent", "Hermes parent");
+    hx::insert_session(
+        &root,
+        "h-cont",
+        Some("h-parent"),
+        json!({}),
+        (NOW_MS - 490_000) as f64 / 1000.0,
+    );
+    hx::set_title(&root, "h-cont", "Hermes continued");
+    hx::set_ended(
+        &root,
+        "h-parent",
+        (NOW_MS - 480_000) as f64 / 1000.0,
+        "compression",
+    );
+    // In-place compaction inside the continuation: an archived turn, a summary
+    // carrier and fresh work.
+    let archived = hx::insert_message(
+        &root,
+        "h-cont",
+        "user",
+        "hermes archived turn",
+        (NOW_MS - 480_000) as f64 / 1000.0,
+    );
+    hx::set_message_display(&root, archived, 1, b"hermes-archived", "hermes-archived");
+    hx::set_message_state(&root, archived, 0, 1);
+    let carrier = hx::insert_message(
+        &root,
+        "h-cont",
+        "user",
+        "hermes compacted summary",
+        (NOW_MS - 470_000) as f64 / 1000.0,
+    );
+    hx::set_message_summary(&root, carrier, 1);
+    hx::set_message_display(&root, carrier, 0, b"hermes-summary", "hermes-summary");
+    let tail = hx::insert_message(
+        &root,
+        "h-cont",
+        "assistant",
+        "hermes continuation tail",
+        (NOW_MS - 460_000) as f64 / 1000.0,
+    );
+    hx::set_message_display(&root, tail, 2, b"hermes-tail", "hermes-tail");
+
+    hx::insert_session(
+        &root,
+        "h-child",
+        Some("h-cont"),
+        json!({"_delegate_from": "h-cont"}),
+        (NOW_MS - 450_000) as f64 / 1000.0,
+    );
+    hx::set_title(&root, "h-child", "Hermes delegate");
+    hx::insert_message(
+        &root,
+        "h-child",
+        "assistant",
+        "hermes delegate answer",
+        (NOW_MS - 440_000) as f64 / 1000.0,
+    );
+    for (session, model) in [
+        ("h-parent", "test-model"),
+        ("h-cont", "test-model"),
+        ("h-child", "test-model"),
+    ] {
+        hx::insert_usage(
+            &root,
+            session,
+            model,
+            "test-provider",
+            "",
+            [100, 20, 0, 0, 0],
+            0.01,
+            "estimated",
+        );
+        hx::set_session_usage(
+            &root,
+            session,
+            [100, 20, 0, 0, 0],
+            1,
+            0.01,
+            0.0,
+            Some("estimated"),
+        );
+    }
+
+    hx::insert_session(
+        &profile,
+        "h-profile",
+        None,
+        json!({}),
+        (NOW_MS - 430_000) as f64 / 1000.0,
+    );
+    hx::set_title(&profile, "h-profile", "Hermes profile session");
+    hx::insert_message(
+        &profile,
+        "h-profile",
+        "user",
+        &format!("hermes profile prompt api_key={INLINE_SECRET}"),
+        (NOW_MS - 430_000) as f64 / 1000.0,
+    );
+    hx::insert_usage(
+        &profile,
+        "h-profile",
+        "test-model",
+        "test-provider",
+        "",
+        [50, 10, 0, 0, 0],
+        0.005,
+        "estimated",
+    );
+    hx::set_session_usage(
+        &profile,
+        "h-profile",
+        [50, 10, 0, 0, 0],
+        1,
+        0.005,
+        0.0,
+        Some("estimated"),
+    );
+
+    // Credential decoys: never opened, never shown.
+    fs::write(
+        home.join("auth.json"),
+        format!("{{\"api_key\":\"{SENTINEL}\"}}"),
+    )
+    .unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!("api_key = \"{SENTINEL}\"\n"),
+    )
+    .unwrap();
+    fs::write(
+        home.join("profiles").join("work").join(".env"),
+        format!("HERMES_API_KEY={SENTINEL}\n"),
+    )
+    .unwrap();
+
+    let key = |db: &Path, id: &str| SessionKey {
+        harness: Harness::Hermes,
+        native_id: id.to_owned(),
+        source: SourceKey::DbRow {
+            database: db.to_path_buf(),
+            table: "sessions".into(),
+            id: id.to_owned(),
+        },
+    };
+    let plant = HermesPlant {
+        parent: key(&db, "h-parent"),
+        continuation: key(&db, "h-cont"),
+        child: key(&db, "h-child"),
+        profile: key(&profile_db, "h-profile"),
+        profile_db,
+        tail: "hermes continuation tail".into(),
+        summary: "hermes compacted summary".into(),
+    };
+    (plant, vec![root, profile])
 }

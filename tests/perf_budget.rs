@@ -1151,3 +1151,83 @@ fn omp_large_session_is_probed_hydrated_and_indexed_in_bounded_calls() {
     assert!(used.bytes_read < len / 50, "{} of {len}", used.bytes_read);
     assert!(used.bytes_read <= 50 * 4096);
 }
+
+#[test]
+fn hermes_discovery_and_transcript_pages_stay_within_their_budgets() {
+    use agentscope::domain::{PageDirection, PageRequest, SessionKey, SourceKey};
+    use agentscope::providers::hermes::HermesScanner;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    let writer = support::hermes::create_db(&db, true);
+    for at in 0..400 {
+        let id = format!("h{at:03}");
+        support::hermes::insert_session(&writer, &id, None, json!({}), 1_793_000_000.0 + at as f64);
+        for turn in 0..3 {
+            support::hermes::insert_message(
+                &writer,
+                &id,
+                if turn % 2 == 0 { "user" } else { "assistant" },
+                &format!("session {at} turn {turn}"),
+                1_793_000_000.0 + at as f64 + turn as f64 / 100.0,
+            );
+        }
+    }
+    let mut config = support::hermes::config_for_db(&db);
+    config.refresh_busy_timeout_ms = 25;
+    config.page_busy_timeout_ms = 25;
+    let mut scanner = HermesScanner::new(&config).unwrap();
+
+    let mut calls = 0usize;
+    loop {
+        let delta = scanner.discover(NOW, CHUNK).expect("discover");
+        calls += 1;
+        if delta.scan.done {
+            assert_eq!(delta.scan.total, Some(400));
+            break;
+        }
+        assert!(calls < 10_000, "discovery never finished");
+    }
+    assert!(calls > 1, "400 rows cannot fit one 256-record slice");
+
+    let key = SessionKey {
+        harness: agentscope::domain::Harness::Hermes,
+        native_id: "h000".into(),
+        source: SourceKey::DbRow {
+            database: db.clone(),
+            table: "sessions".into(),
+            id: "h000".into(),
+        },
+    };
+    let summary = support::world::hydrate_budgeted(&mut scanner, &key, NOW, CHUNK, 1000);
+    assert_eq!(summary.meta.key.native_id, "h000");
+
+    let request = PageRequest {
+        max_events: 2,
+        max_bytes: 4096,
+    };
+    let page = support::world::transcript_ready(
+        &mut scanner,
+        &key,
+        None,
+        PageDirection::Backward,
+        request,
+        CHUNK,
+        support::world::STEPS,
+    );
+    assert!(page.events.len() <= 2);
+    let bytes: usize = page
+        .events
+        .iter()
+        .map(|event| {
+            event.text.as_ref().map_or(0, |text| text.preview.len())
+                + event.tool.as_ref().map_or(0, |tool| {
+                    tool.input.as_ref().map_or(0, |text| text.preview.len())
+                })
+        })
+        .sum();
+    assert!(
+        bytes <= 4096,
+        "{bytes} preview bytes exceed the page budget"
+    );
+}

@@ -1269,3 +1269,62 @@ fn omp_family_opens_through_the_real_worker_app_and_renderer() {
     h.key(KeyCode::Esc);
     assert!(h.worker.shutdown());
 }
+
+#[test]
+fn ac_hermes_profiles_chains_and_compaction_surface_end_to_end() {
+    let world = World::with_hermes();
+    let plant = world.hermes_plant.as_ref().expect("hermes plant");
+    let mut config = world.config();
+    config.refresh_ms = 3_600_000;
+    let worker = WorkerHandle::spawn(world.readers(), config);
+
+    // The roster keeps one root for the compression chain and one for the profile
+    // database; the delegate is a child of the parent chain.
+    let snapshot = roster_with(&worker, "the Hermes roster", |s| {
+        s.roots.iter().any(|key| key.native_id == "h-parent")
+            && s.roots.iter().any(|key| key.native_id == "h-profile")
+    });
+    let parent = plant.parent.clone();
+    let profile = plant.profile.clone();
+    let child = plant.child.clone();
+    assert!(snapshot.roots.contains(&parent));
+    assert!(snapshot.roots.contains(&profile));
+    assert!(!snapshot.roots.contains(&child), "a delegate is a child");
+    assert_eq!(parent.native_id, "h-parent");
+    assert_ne!(parent.source, profile.source, "profiles stay distinct");
+
+    let summary = hydrate(&worker, 900, &parent);
+    assert_eq!(summary.meta.key, parent);
+    assert_eq!(
+        summary
+            .meta
+            .members
+            .iter()
+            .map(|key| key.native_id.as_str())
+            .collect::<Vec<_>>(),
+        ["h-parent", "h-cont"]
+    );
+    assert!(summary.metrics.compactions.observed >= 2);
+    assert_eq!(
+        summary.metrics.compactions.cost_scope,
+        CompactionScope::Unknown,
+        "no compression ledger row is invented"
+    );
+    assert!(summary.usage.is_some(), "main usage rows reconcile");
+
+    let mut readers = world.readers();
+    let surface = exercise_everything(&mut readers);
+    let texts: Vec<String> = surface
+        .pages
+        .iter()
+        .flat_map(|page| page.events.iter())
+        .filter_map(|event| event.text.as_ref().map(|text| text.preview.clone()))
+        .collect();
+    assert!(texts.iter().any(|text| text == &plant.tail));
+    assert!(texts.iter().any(|text| text == &plant.summary));
+    assert!(!texts.iter().any(|text| text.contains(INLINE_SECRET)));
+    assert!(!surface.warnings.iter().any(|warning| {
+        warning.message.contains(INLINE_SECRET) || warning.message.contains(SENTINEL)
+    }));
+    worker.shutdown();
+}
