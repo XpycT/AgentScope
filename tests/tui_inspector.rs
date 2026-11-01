@@ -3,7 +3,9 @@ use std::time::Duration;
 
 mod support;
 
-use agentscope::app::{App, MAX_LOADED_EVENTS};
+use agentscope::app::{
+    App, MAX_LOADED_EVENTS, NOISE_RECORD_TYPES, RowKind, tool_summary, turn_rows,
+};
 use agentscope::domain::*;
 use agentscope::time::format_local;
 use agentscope::ui::{RosterContext, render};
@@ -1221,4 +1223,344 @@ fn incomplete_compaction_history_labels_money_as_a_subtotal_and_unknown_model_is
         screen.contains("Compactions: 256 observed (history incomplete) · cost $0.50 known subtotal (not a total) · 0 unpriced"),
         "{screen}"
     );
+}
+
+fn usage_with_purpose(purpose: RequestPurpose) -> UsageObservation {
+    UsageObservation {
+        model: None,
+        scope: UsageScope::Message,
+        categories: TokenCategories::default(),
+        accounting: TokenAccounting::default(),
+        request: Some(RequestMetadata {
+            purpose,
+            ..RequestMetadata::default()
+        }),
+        money: RecordedMoney::default(),
+        provenance: provenance(),
+    }
+}
+
+/// A System notice shaped like an OMP housekeeping record.
+fn notice(i: u64, record_type: &str, body: &str) -> Event {
+    let mut e = event(i, EventKind::System, body);
+    e.provenance.record_type = record_type.into();
+    e
+}
+
+/// An auxiliary model call: usages with an `Auxiliary` purpose.
+fn auxiliary(i: u64, purpose: &str) -> Event {
+    let mut e = event(
+        i,
+        EventKind::System,
+        &format!("auxiliary model call: {purpose}"),
+    );
+    e.usage = Some(usage_with_purpose(RequestPurpose::Auxiliary(
+        purpose.into(),
+    )));
+    e
+}
+
+fn empty_reasoning(i: u64) -> Event {
+    let mut e = event(i, EventKind::Reasoning, "");
+    e.text = None;
+    e
+}
+
+fn tool_fixture(input: Option<&str>) -> ToolInteraction {
+    ToolInteraction {
+        name: "shell".into(),
+        call_id: None,
+        input: input.map(text),
+        output: None,
+        status: ToolStatus::Completed,
+        exit_code: None,
+        started_at: None,
+        completed_at: None,
+        orphan: false,
+        child_session: None,
+    }
+}
+
+#[test]
+fn prompt_starts_turn_and_work_is_indented() {
+    let events = [
+        event(0, EventKind::System, "preamble"),
+        event(1, EventKind::UserPrompt, "fix the build"),
+        event(2, EventKind::Reasoning, "reading files"),
+        event(3, EventKind::Tool, ""),
+        event(4, EventKind::AssistantMessage, "done"),
+        event(5, EventKind::Lifecycle, "session exit"),
+    ];
+    let rows = turn_rows(&events);
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0].kind, RowKind::Other);
+    assert_eq!((rows[0].first, rows[0].last, rows[0].depth), (0, 0, 0));
+    assert_eq!(rows[1].kind, RowKind::Prompt);
+    assert_eq!((rows[1].first, rows[1].last, rows[1].depth), (1, 1, 0));
+    assert_eq!(rows[2].kind, RowKind::Reasoning);
+    assert_eq!(rows[2].depth, 1);
+    assert_eq!(rows[3].kind, RowKind::Tool);
+    assert_eq!(rows[3].depth, 1);
+    assert_eq!(rows[4].kind, RowKind::Reply);
+    assert_eq!((rows[4].first, rows[4].last, rows[4].depth), (4, 4, 0));
+    assert_eq!(rows[5].kind, RowKind::Other);
+    assert_eq!(rows[5].depth, 1);
+}
+
+#[test]
+fn auxiliary_runs_fold_into_one_row() {
+    let events = [
+        event(0, EventKind::UserPrompt, "summarize"),
+        auxiliary(1, "title"),
+        auxiliary(2, "suggestion"),
+        auxiliary(3, "title"),
+    ];
+    let rows = turn_rows(&events);
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[1].first, rows[1].last, rows[1].depth), (1, 3, 1));
+    match &rows[1].kind {
+        RowKind::Noise { count, label } => {
+            assert_eq!(*count, 3);
+            assert_eq!(label, "3 auxiliary model calls (title)");
+        }
+        other => panic!("expected one folded noise row, got {other:?}"),
+    }
+
+    // A visible row ends the run: two separate calls must not merge.
+    let separated = turn_rows(&[auxiliary(0, "title"), msg(1), auxiliary(2, "title")]);
+    assert_eq!(separated.len(), 3);
+    assert!(matches!(separated[0].kind, RowKind::Noise { count: 1, .. }));
+    assert_eq!(separated[1].kind, RowKind::Reply);
+    assert!(matches!(separated[2].kind, RowKind::Noise { count: 1, .. }));
+}
+
+#[test]
+fn noise_fold_never_hides_errors() {
+    let mut broken_text = auxiliary(1, "title");
+    broken_text.text = Some(text("error: quota exceeded"));
+    let mut broken_tool = auxiliary(3, "title");
+    broken_tool.tool = Some(ToolInteraction {
+        status: ToolStatus::Error,
+        ..tool_fixture(None)
+    });
+    let events = [
+        auxiliary(0, "title"),
+        broken_text,
+        auxiliary(2, "title"),
+        broken_tool,
+        auxiliary(4, "title"),
+    ];
+    let rows = turn_rows(&events);
+    assert_eq!(rows.len(), 5);
+    assert!(matches!(rows[0].kind, RowKind::Noise { count: 1, .. }));
+    assert_eq!(rows[1].kind, RowKind::Other);
+    assert_eq!((rows[1].first, rows[1].last), (1, 1));
+    assert!(matches!(rows[2].kind, RowKind::Noise { count: 1, .. }));
+    assert_eq!(rows[3].kind, RowKind::Other);
+    assert_eq!((rows[3].first, rows[3].last), (3, 3));
+    assert!(matches!(rows[4].kind, RowKind::Noise { count: 1, .. }));
+}
+
+#[test]
+fn noise_fold_never_hides_system_error_without_tool() {
+    let events = [
+        notice(0, "model_usage", "auxiliary model call: title"),
+        notice(1, "model_usage", "error: quota exceeded"),
+        notice(2, "model_usage", "auxiliary model call: title"),
+    ];
+    let rows = turn_rows(&events);
+    assert_eq!(rows.len(), 3);
+    assert!(matches!(rows[0].kind, RowKind::Noise { count: 1, .. }));
+    assert_eq!(rows[1].kind, RowKind::Other);
+    assert_eq!((rows[1].first, rows[1].last), (1, 1));
+    assert!(matches!(rows[2].kind, RowKind::Noise { count: 1, .. }));
+}
+
+#[test]
+fn each_noise_record_type_folds() {
+    assert_eq!(
+        NOISE_RECORD_TYPES,
+        &["model_usage", "service_tier_change", "mode_change"]
+    );
+    for &record_type in NOISE_RECORD_TYPES {
+        let events = [
+            notice(0, record_type, "notice"),
+            notice(1, record_type, "another notice"),
+        ];
+        let rows = turn_rows(&events);
+        assert_eq!(rows.len(), 1, "{record_type}");
+        match &rows[0].kind {
+            RowKind::Noise { count, label } => {
+                assert_eq!(*count, 2, "{record_type}");
+                assert_eq!(label, "2 system notices", "{record_type}");
+            }
+            other => panic!("{record_type} did not fold: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn events_before_first_prompt_are_other_at_depth_zero() {
+    let mut compacted = event(2, EventKind::Compaction, "compacted");
+    // Even auxiliary-tagged usage never turns a compaction into noise.
+    compacted.usage = Some(usage_with_purpose(RequestPurpose::Auxiliary(
+        "title".into(),
+    )));
+    let events = [
+        event(0, EventKind::Lifecycle, "session started"),
+        event(1, EventKind::System, "developer instructions"),
+        compacted,
+        event(3, EventKind::UserPrompt, "go"),
+        event(4, EventKind::System, "developer instructions"),
+        event(5, EventKind::Lifecycle, "session exit"),
+    ];
+    let rows = turn_rows(&events);
+    assert_eq!(rows.len(), 6);
+    for row in &rows[..3] {
+        assert_eq!(row.kind, RowKind::Other);
+        assert_eq!(row.depth, 0);
+    }
+    assert_eq!(rows[3].kind, RowKind::Prompt);
+    assert_eq!(rows[3].depth, 0);
+    assert_eq!(rows[4].kind, RowKind::Other);
+    assert_eq!(rows[4].depth, 1);
+    assert_eq!(rows[5].kind, RowKind::Other);
+    assert_eq!(rows[5].depth, 1);
+
+    // Agent work is indented even when the window starts after its prompt.
+    let isolated = turn_rows(&[event(0, EventKind::Tool, "")]);
+    assert_eq!(isolated[0].kind, RowKind::Tool);
+    assert_eq!(isolated[0].depth, 1);
+}
+
+#[test]
+fn turn_row_debug_omits_labels() {
+    let rows = turn_rows(&[auxiliary(0, "private-purpose-token")]);
+    assert_eq!(rows.len(), 1);
+    let debug = format!("{:?}", rows[0]);
+    assert!(debug.contains("Noise"), "{debug}");
+    assert!(debug.contains("count: 1"), "{debug}");
+    assert!(debug.contains("first: 0"), "{debug}");
+    assert!(debug.contains("last: 0"), "{debug}");
+    assert!(!debug.contains("private-purpose-token"), "{debug}");
+    assert!(!debug.contains("label"), "{debug}");
+    assert!(!debug.contains("auxiliary model calls"), "{debug}");
+}
+
+#[test]
+fn empty_reasoning_rows_collapse_with_count() {
+    let events = [
+        event(0, EventKind::UserPrompt, "go"),
+        empty_reasoning(1),
+        empty_reasoning(2),
+        empty_reasoning(3),
+        event(4, EventKind::Reasoning, "thinking"),
+        empty_reasoning(5),
+        empty_reasoning(6),
+        msg(7),
+    ];
+    let rows = turn_rows(&events);
+    assert_eq!(rows.len(), 5);
+    match &rows[1].kind {
+        RowKind::ReasoningEmpty { count } => assert_eq!(*count, 3),
+        other => panic!("expected collapsed empty reasoning, got {other:?}"),
+    }
+    assert_eq!((rows[1].first, rows[1].last, rows[1].depth), (1, 3, 1));
+    assert_eq!(rows[2].kind, RowKind::Reasoning);
+    match &rows[3].kind {
+        RowKind::ReasoningEmpty { count } => assert_eq!(*count, 2),
+        other => panic!("expected collapsed empty reasoning, got {other:?}"),
+    }
+    assert_eq!((rows[3].first, rows[3].last), (5, 6));
+    assert_eq!(rows[4].kind, RowKind::Reply);
+}
+
+#[test]
+fn failure_bearing_empty_reasoning_stays_standalone() {
+    let mut by_type = empty_reasoning(2);
+    by_type.provenance.record_type = "reasoning_error".into();
+
+    let mut by_tool = empty_reasoning(2);
+    by_tool.usage = Some(usage_with_purpose(RequestPurpose::Auxiliary(
+        "title".into(),
+    )));
+    by_tool.tool = Some(ToolInteraction {
+        status: ToolStatus::Error,
+        ..tool_fixture(None)
+    });
+
+    for failure in [by_type, by_tool] {
+        let events = [
+            empty_reasoning(0),
+            empty_reasoning(1),
+            failure,
+            empty_reasoning(3),
+            empty_reasoning(4),
+        ];
+        let rows = turn_rows(&events);
+        assert_eq!(rows.len(), 3);
+        match &rows[0].kind {
+            RowKind::ReasoningEmpty { count } => assert_eq!(*count, 2),
+            other => panic!("expected the leading run, got {other:?}"),
+        }
+        assert_eq!((rows[0].first, rows[0].last), (0, 1));
+        match &rows[1].kind {
+            RowKind::ReasoningEmpty { count } => assert_eq!(*count, 1),
+            other => panic!("expected the failure row alone, got {other:?}"),
+        }
+        assert_eq!((rows[1].first, rows[1].last), (2, 2));
+        match &rows[2].kind {
+            RowKind::ReasoningEmpty { count } => assert_eq!(*count, 2),
+            other => panic!("expected the trailing run, got {other:?}"),
+        }
+        assert_eq!((rows[2].first, rows[2].last), (3, 4));
+    }
+}
+
+#[test]
+fn tool_summary_prefers_command_then_description() {
+    let command = tool_fixture(Some("{\"command\":\"set -e\\ngit add -A\"}"));
+    assert_eq!(tool_summary(&command), "set -e git add -A");
+
+    let description = tool_fixture(Some(
+        "{\"description\":\"Scoped re-review\",\"context\":\"ignored\"}",
+    ));
+    assert_eq!(tool_summary(&description), "Scoped re-review");
+
+    let both = tool_fixture(Some("{\"command\":\"run tests\",\"description\":\"desc\"}"));
+    assert_eq!(tool_summary(&both), "run tests");
+
+    assert_eq!(tool_summary(&tool_fixture(None)), "");
+}
+
+#[test]
+fn tool_summary_falls_back_without_json_braces() {
+    let truncated = tool_fixture(Some("{\"command\": \"cargo test"));
+    assert_eq!(tool_summary(&truncated), "command: cargo test");
+
+    let plain = tool_fixture(Some("cargo test --all"));
+    assert_eq!(tool_summary(&plain), "cargo test --all");
+
+    let quoted = tool_fixture(Some("\"quoted value\""));
+    assert_eq!(tool_summary(&quoted), "quoted value");
+}
+
+#[test]
+fn tool_summary_sanitizes() {
+    let escaped = tool_fixture(Some(r#"{"command":"echo \u001b[31mred\u001b[0m"}"#));
+    let summary = tool_summary(&escaped);
+    assert_eq!(summary, "echo red");
+    assert!(!summary.contains('\u{1b}'), "{summary:?}");
+
+    let raw = tool_fixture(Some("\u{1b}[31mred\u{1b}[0m"));
+    assert_eq!(tool_summary(&raw), "red");
+}
+
+#[test]
+fn model_and_thinking_changes_stay_visible() {
+    for record_type in ["model_change", "thinking_level_change", "session_exit"] {
+        let rows = turn_rows(&[notice(0, record_type, "model changed: gpt-5")]);
+        assert_eq!(rows.len(), 1, "{record_type}");
+        assert_eq!(rows[0].kind, RowKind::Other, "{record_type}");
+    }
 }

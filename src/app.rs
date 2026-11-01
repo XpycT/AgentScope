@@ -23,6 +23,7 @@ mod preview;
 mod roster;
 mod search;
 mod transcript;
+mod turns;
 pub use input::{FilterItem, FilterTarget, Panel, ProcessView, SearchScope};
 pub use overlay::{MAX_SOURCE_BYTES, SourceState, SourceView};
 pub use preview::{DetailsState, PreviewState};
@@ -30,6 +31,7 @@ pub use roster::{
     GroupHeader, GroupTotals, LoadFocus, PREVIEW_SPLIT_WIDTH, RosterItem, RosterRows, RosterSession,
 };
 pub use transcript::{MAX_LOADED_EVENTS, PageKind, Transcript};
+pub use turns::{NOISE_RECORD_TYPES, RowKind, TurnRow, tool_summary, turn_rows};
 
 /// Every harness identity, in stable display order.
 const PROVIDERS: [Harness; 6] = Harness::ALL;
