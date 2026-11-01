@@ -1085,7 +1085,8 @@ fn native_world_readers_leak_no_secret_field_or_control_through_any_debug_or_tex
         assert_clean_native(&world, "locked error", &format!("{error:?} {error}"));
     }
     let mut found = Surface::default();
-    surface_all(&mut locked[..2], &mut found);
+    let readable = locked.len() - 1;
+    surface_all(&mut locked[..readable], &mut found);
     for w in &found.warnings {
         assert_clean_native(&world, "locked warning", &format!("{w:?} {}", w.message));
     }
@@ -1158,6 +1159,9 @@ fn native_world_screens_and_worker_events_leak_no_secret_field_or_control() {
         &g.unknown_billing,
         &g.opencode.parent,
         &g.claude.parent,
+        &g.omp.secret,
+        &g.omp.family.parent,
+        &g.omp.fork,
     ] {
         assert!(app.select_row(target));
         for (w, h) in [(60, 20), (120, 40), (160, 40)] {
@@ -1207,6 +1211,10 @@ fn native_world_screens_and_worker_events_leak_no_secret_field_or_control() {
         "the family sessions were actually drawn"
     );
     assert!(
+        screens.iter().any(|s| s.contains(OMP_TAIL)),
+        "the OMP family was actually drawn"
+    );
+    assert!(
         screens.iter().any(|s| s.contains("[REDACTED]")),
         "credential-shaped text was drawn masked, not absent"
     );
@@ -1217,4 +1225,97 @@ fn native_world_screens_and_worker_events_leak_no_secret_field_or_control() {
     assert_clean_native(&world, "app debug", &format!("{:?}", app.warnings()));
     let _ = worker.tx.send(WorkerRequest::Shutdown);
     let _ = WorkerEvent::RefreshFinished { generation: 0 };
+}
+
+#[test]
+fn omp_titles_prompts_private_fields_and_decoys_never_surface() {
+    let world = World::with_omp();
+    let plant = world.omp_plant.as_ref().expect("planted OMP family");
+    let mut readers = world.readers();
+    let surface = exercise_everything(&mut readers);
+    let forbidden = [
+        SENTINEL,
+        INLINE_SECRET,
+        FIELD_SECRET,
+        OMP_PROMPT_SECRET,
+        "\u{1b}",
+        "\u{7}",
+    ];
+    let clean = |label: &str, text: &str| {
+        for needle in forbidden {
+            assert!(
+                !text.contains(needle),
+                "{label} leaked {needle:?}: {}",
+                text.chars().take(200).collect::<String>()
+            );
+        }
+    };
+    for session in &surface.sessions {
+        let m = &session.meta;
+        clean("meta", &format!("{m:?} {m:#?}"));
+        clean("title", &m.title);
+        clean("project", m.project.as_deref().unwrap_or(""));
+        clean("summary", &format!("{session:?}"));
+    }
+    for w in &surface.warnings {
+        clean("warning", &format!("{w:?} {}", w.message));
+    }
+    for page in &surface.pages {
+        clean("page", &format!("{page:?}"));
+        for e in &page.events {
+            if let Some(t) = &e.text {
+                clean("event text", &t.preview);
+            }
+            if let Some(tool) = &e.tool {
+                clean("tool", &tool.name);
+            }
+        }
+    }
+    // The secret-bearing session's own record text is masked, not absent.
+    let secret = surface
+        .sessions
+        .iter()
+        .find(|s| s.meta.key == plant.secret)
+        .expect("secret session");
+    assert!(
+        secret.meta.title.contains("[REDACTED]"),
+        "{}",
+        secret.meta.title
+    );
+    let reader = readers
+        .iter_mut()
+        .find(|r| r.harness() == Harness::Omp)
+        .unwrap();
+    let page = transcript_ready(
+        reader.as_mut(),
+        &plant.secret,
+        None,
+        PageDirection::Backward,
+        PAGE,
+        BIG,
+        STEPS,
+    );
+    let prompt = page
+        .events
+        .iter()
+        .filter_map(|e| e.text.as_ref())
+        .map(|t| t.preview.as_str())
+        .find(|t| t.contains("password="))
+        .expect("the credential-shaped prompt is shown");
+    assert!(prompt.contains("[REDACTED]"), "{prompt}");
+    // The session-init record (system prompt, task, environment) shows a fixed label.
+    assert!(
+        page.events
+            .iter()
+            .filter_map(|e| e.text.as_ref())
+            .any(|t| t.preview.contains("content not shown"))
+    );
+    // The explicit raw record view is sanitized and credential-masked; it is the only
+    // place a session-init record's own prompt text is shown.
+    for event in &page.events {
+        let record = try_source(reader.as_mut(), &event.provenance.locator, BIG, STEPS).unwrap();
+        for needle in [SENTINEL, INLINE_SECRET, FIELD_SECRET, "\u{1b}", "\u{7}"] {
+            assert!(!record.display.contains(needle), "{needle:?}");
+        }
+    }
 }

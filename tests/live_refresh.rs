@@ -995,3 +995,205 @@ fn b5_navigation_smoke_through_reader_worker_keys_and_render() {
     let _ = draw(&app, &ctx, 110, 30);
     worker.shutdown();
 }
+
+// ---- OMP: the real reader behind the real worker --------------------------------------
+
+/// A live OMP session grows, then its source is replaced: the open transcript follows the
+/// append, reloads at the replacement's newest event, and a locator taken before the
+/// replacement is refused.
+#[test]
+fn omp_open_transcript_follows_appends_and_a_replaced_source() {
+    use support::omp as om;
+    use support::world::{OMP_TAIL, World};
+
+    let world = World::with_omp();
+    let plant = world.omp_plant.as_ref().unwrap();
+    let parent = plant.family.parent.clone();
+    let path = match &parent.source {
+        SourceKey::File(path) => path.clone(),
+        other => panic!("{other:?}"),
+    };
+    let worker = WorkerHandle::spawn(world.readers(), world.config());
+    let mut app = new_app();
+    let mut ctx = ctx();
+    let pump = |app: &mut App, ctx: &mut RosterContext, what: &str, done: &dyn Fn(&App) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            flush_requests(app, &worker);
+            if done(app) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            if let Ok(event) = worker.rx.recv_timeout(Duration::from_millis(25)) {
+                apply_worker_event(app, ctx, event);
+            }
+        }
+    };
+    let last_text = |app: &App| {
+        app.transcript().and_then(|t| {
+            t.events()
+                .last()
+                .and_then(|e| e.text.as_ref())
+                .map(|t| t.preview.clone())
+        })
+    };
+    pump(&mut app, &mut ctx, "the roster", &|a| {
+        a.total_sessions() == 6
+    });
+    assert!(app.select_row(&parent));
+    press(&mut app, KeyCode::Enter);
+    pump(&mut app, &mut ctx, "the latest page", &|a| {
+        last_text(a).as_deref() == Some(OMP_TAIL)
+    });
+    let old_locator = app
+        .transcript()
+        .unwrap()
+        .events()
+        .last()
+        .unwrap()
+        .provenance
+        .locator
+        .clone();
+
+    // A live append is counted and, once requested, shown at the end.
+    om::append(&path, &[om::user_message("u3", Some("u2"), "live append")]);
+    worker.tx.send(WorkerRequest::Refresh).unwrap();
+    pump(&mut app, &mut ctx, "the new event count", &|a| {
+        a.new_event_count() == 1
+    });
+    ch(&mut app, 'G');
+    pump(&mut app, &mut ctx, "the appended event", &|a| {
+        last_text(a).as_deref() == Some("live append")
+    });
+
+    // The source is replaced by a shorter file: the transcript reloads from it.
+    om::write_session(
+        &world.omp_root,
+        "work",
+        "t1_omp-fam",
+        &[
+            om::header("omp-fam", None, None),
+            om::user_message("r1", None, "replacement tail"),
+        ],
+    );
+    support::set_modified(&path, 1_900_000_000);
+    worker.tx.send(WorkerRequest::Refresh).unwrap();
+    pump(&mut app, &mut ctx, "the replaced transcript", &|a| {
+        last_text(a).as_deref() == Some("replacement tail")
+    });
+    assert!(
+        app.transcript()
+            .unwrap()
+            .events()
+            .iter()
+            .all(|e| e.text.as_ref().is_none_or(|t| t.preview != "live append")),
+        "nothing of the old generation stays loaded"
+    );
+    worker
+        .tx
+        .send(WorkerRequest::LoadSource {
+            request_id: 9_999,
+            locator: old_locator,
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the stale locator was not answered"
+        );
+        if let Ok(event) = worker.rx.recv_timeout(Duration::from_millis(25)) {
+            match &event {
+                WorkerEvent::Source {
+                    request_id: 9_999,
+                    record,
+                } => {
+                    assert!(
+                        !record.raw.contains(OMP_TAIL),
+                        "the replaced generation never serves old bytes"
+                    );
+                    break;
+                }
+                WorkerEvent::LoadFailed { request_id: 9_999 } => break,
+                _ => {}
+            }
+            apply_worker_event(&mut app, &mut ctx, event);
+        }
+    }
+    assert!(worker.shutdown());
+}
+
+/// Opening a large OMP transcript and leaving it cancels its indexing; another session
+/// opens at once, and the large one still opens completely afterwards.
+#[test]
+fn omp_indexing_is_cancelled_by_leaving_and_input_never_waits_for_it() {
+    use support::omp as om;
+    use support::world::World;
+
+    let world = World::with_omp();
+    let plant = world.omp_plant.as_ref().unwrap();
+    let mut entries = vec![om::header("big", None, None)];
+    let mut last: Option<String> = None;
+    for n in 0..30_000 {
+        let id = format!("e{n}");
+        entries.push(om::user_message(&id, last.as_deref(), &"word ".repeat(30)));
+        last = Some(id);
+    }
+    entries.push(om::user_message("final", last.as_deref(), "the big tail"));
+    om::write_session(&world.omp_root, "work", "t8_big", &entries);
+
+    let worker = WorkerHandle::spawn(world.readers(), world.config());
+    let mut app = new_app();
+    let mut ctx = ctx();
+    let pump = |app: &mut App, ctx: &mut RosterContext, what: &str, done: &dyn Fn(&App) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            flush_requests(app, &worker);
+            if done(app) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            if let Ok(event) = worker.rx.recv_timeout(Duration::from_millis(5)) {
+                apply_worker_event(app, ctx, event);
+            }
+        }
+    };
+    pump(&mut app, &mut ctx, "the roster", &|a| {
+        a.total_sessions() == 7
+    });
+    let big = app
+        .all_rows()
+        .iter()
+        .find(|r| r.session.meta.key.native_id == "big")
+        .map(|r| r.session.meta.key.clone())
+        .expect("the large session is listed");
+
+    assert!(app.select_row(&big));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.screen, Screen::Inspector);
+    flush_requests(&mut app, &worker);
+    // Leave before the index can possibly be finished, then open another session.
+    press(&mut app, KeyCode::Esc);
+    flush_requests(&mut app, &worker);
+    assert!(app.select_row(&plant.fork));
+    press(&mut app, KeyCode::Enter);
+    pump(&mut app, &mut ctx, "the other session", &|a| {
+        a.transcript()
+            .is_some_and(|t| t.loaded() && t.key() == &plant.fork)
+    });
+    press(&mut app, KeyCode::Esc);
+
+    // The large session opens completely on its own turn.
+    assert!(app.select_row(&big));
+    press(&mut app, KeyCode::Enter);
+    pump(&mut app, &mut ctx, "the large session", &|a| {
+        a.transcript().is_some_and(|t| {
+            t.loaded()
+                && t.events()
+                    .last()
+                    .and_then(|e| e.text.as_ref())
+                    .is_some_and(|t| t.preview == "the big tail")
+        })
+    });
+    assert!(worker.shutdown());
+}

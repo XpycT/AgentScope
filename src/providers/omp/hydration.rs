@@ -35,9 +35,11 @@ use crate::pricing::{PriceSchedule, ReferencePolicy};
 use crate::providers::omp::OmpCatalog;
 use crate::providers::omp::metadata::warning;
 use crate::providers::omp::ownership::{OmpOwnership, owned_request};
+use crate::providers::omp::records::{self, Mapped};
 use crate::providers::omp::tree::{OmpInsert, OmpTree, parse_entry_header};
 use crate::providers::omp::usage::{
-    call_identity, counter, entry_time, epoch_ms, is_assistant, map_omp_usage, server_tools, text,
+    call_identity, counter, entry_time, epoch_ms, is_assistant, map_omp_usage, omp_total,
+    server_tools, text,
 };
 use crate::providers::{HydrationDelta, ProviderError};
 use crate::usage::{LedgerOutcome, UsageLedger, UsageUpdate};
@@ -276,6 +278,10 @@ struct Fold {
     unproven: usize,
     /// A record that could hold a compaction was unreadable or unindexed.
     history_gap: bool,
+    /// Events the transcript shows and records it hides (diagnostics), as mapped by
+    /// `records::map`.
+    displayed: usize,
+    hidden: usize,
 }
 
 struct Work {
@@ -291,7 +297,7 @@ struct Work {
     fold: Fold,
 }
 
-fn file_path(key: &SessionKey) -> Result<PathBuf, ProviderError> {
+pub(super) fn file_path(key: &SessionKey) -> Result<PathBuf, ProviderError> {
     match &key.source {
         SourceKey::File(path) => Ok(path.clone()),
         SourceKey::DbRow { .. } => Err(ProviderError::Unsupported(
@@ -300,7 +306,7 @@ fn file_path(key: &SessionKey) -> Result<PathBuf, ProviderError> {
     }
 }
 
-fn open_error(error: &crate::ingest::source::SourceError) -> ProviderError {
+pub(super) fn open_error(error: &crate::ingest::source::SourceError) -> ProviderError {
     if error.kind() == std::io::ErrorKind::NotFound {
         ProviderError::Unavailable("session source is unavailable".into())
     } else {
@@ -358,6 +364,23 @@ impl OmpHydration {
         self.work = None;
     }
 
+    /// The metadata this hydration was created for.
+    pub fn metadata(&self) -> &SessionMetadata {
+        &self.meta
+    }
+
+    /// Who owns a recorded call of `source`, decided from linked predecessors'
+    /// evidence; `None` while no fold state exists (never started, or cancelled).
+    pub fn ownership(
+        &self,
+        source: &SessionKey,
+        entry_id: &str,
+        response: Option<&str>,
+    ) -> Option<OmpOwnership> {
+        let work = self.work.as_ref()?;
+        Some(owned_request(entry_id, response, source, &work.catalog))
+    }
+
     /// Requests the ledger currently holds (zero once cancelled).
     pub fn retained_requests(&self) -> usize {
         self.work
@@ -402,6 +425,8 @@ impl OmpHydration {
                 finished: None,
                 unproven: 0,
                 history_gap: false,
+                displayed: 0,
+                hidden: 0,
             },
         };
         if needs_parent {
@@ -678,9 +703,14 @@ impl OmpHydration {
             &self.prices,
             self.policy,
         );
+        let mut usage = fold.ledger.snapshot();
+        usage.total = omp_total(&usage.categories);
+        for model in &mut usage.models {
+            model.total = omp_total(&model.categories);
+        }
         SessionSummary {
             meta,
-            usage: Some(fold.ledger.snapshot()),
+            usage: Some(usage),
             metrics: SessionMetrics {
                 // No disk-backed active timer exists: active time stays Unknown, and
                 // only recorded request time is measured.
@@ -693,8 +723,8 @@ impl OmpHydration {
             unfinished_work: false,
             last_event_at: fold.last_event_at,
             last_completion: None,
-            displayed_event_count: 0,
-            hidden_records: 0,
+            displayed_event_count: fold.displayed,
+            hidden_records: fold.hidden,
             server_tools: fold.server,
             process: crate::domain::ProcessAssociation::NotChecked,
             warnings,
@@ -771,8 +801,18 @@ struct Ctx<'a> {
 impl Work {
     fn record(&mut self, scan: &mut FoldScan, item: &SourceRecordItem, ctx: &Ctx<'_>) {
         match &item.item {
-            SourceItem::Json(value) => self.entry(scan, item, value, ctx),
+            SourceItem::Json(value) => {
+                match records::map(value, false) {
+                    Mapped::Events(slots) => {
+                        self.fold.displayed = self.fold.displayed.saturating_add(slots.len());
+                    }
+                    Mapped::Hidden(_) => self.fold.hidden = self.fold.hidden.saturating_add(1),
+                    Mapped::Skip => {}
+                }
+                self.entry(scan, item, value, ctx)
+            }
             SourceItem::Invalid | SourceItem::TooLarge | SourceItem::Damaged(_) => {
+                self.fold.hidden = self.fold.hidden.saturating_add(1);
                 self.fold.history_gap = true;
                 self.fold
                     .ledger

@@ -1,22 +1,23 @@
-//! OMP (oh-my-pi) session metadata discovery, tree identity and native
-//! relationship parsing, pinned to can1357/oh-my-pi
+//! OMP (oh-my-pi) sessions and native subagents: metadata discovery, tree identity,
+//! native relationship parsing, lifetime accounting and the paged transcript
+//! reader ([`OmpScanner`]), pinned to can1357/oh-my-pi
 //! `6a86df8539fccf3ad7818081266e554022fc21bc` (an installed build may differ).
 //!
-//! This module is the metadata foundation only: it is not a [`ProviderReader`]
-//! and nothing registers it with the application. A sessions root holds one
-//! bucket directory per working directory, each holding `<timestamp>_<id>.jsonl`
-//! sessions and, per session, an artifacts directory named like the file without
-//! `.jsonl` that holds child sessions (recursively). Only that layout is walked:
-//! symlinks are not followed, directories that are not the artifacts directory of
-//! a listed session (blobs, tool output) are not entered, and sources are never
-//! opened beyond the bounded prefix/tail probe.
-//!
-//! [`ProviderReader`]: crate::providers::ProviderReader
+//! A sessions root holds one bucket directory per working directory, each holding
+//! `<timestamp>_<id>.jsonl` sessions and, per session, an artifacts directory named
+//! like the file without `.jsonl` that holds child sessions (recursively). Only that
+//! layout is walked: symlinks are not followed, directories that are not the
+//! artifacts directory of a listed session (blobs, tool output) are not entered, and
+//! sources are never opened beyond the bounded prefix/tail probe during discovery.
+//! Nothing is ever written, and no OMP credential, configuration, history, model or
+//! statistics store is opened.
 
 pub mod hydration;
 pub mod links;
 pub mod metadata;
 pub mod ownership;
+mod records;
+mod scanner;
 pub mod tree;
 pub mod usage;
 
@@ -27,8 +28,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::discovery::plain_file;
 use crate::domain::{
-    Harness, RefreshBudget, ScanProgress, SessionKey, SessionMetadata, Warning, WarningKey,
-    WarningKind,
+    Harness, RefreshBudget, ScanProgress, SessionKey, SessionMetadata, SourceKey, Warning,
+    WarningKey, WarningKind,
 };
 use crate::providers::{DiscoveryDelta, ProviderError};
 
@@ -36,6 +37,7 @@ pub use hydration::OmpHydration;
 pub use links::resolve_omp_links;
 pub use metadata::{OmpHeader, parse_header, parse_title_slot};
 pub use ownership::{OmpOwnership, owned_request};
+pub use scanner::OmpScanner;
 pub use tree::{ActiveLeaf, OmpEntryHeader, OmpInsert, OmpTree, OmpTreeError};
 pub use usage::map_omp_usage;
 
@@ -314,6 +316,18 @@ impl OmpCatalog {
     pub fn with_evidence_limit(mut self, entries: usize) -> Self {
         self.evidence_cap = entries;
         self
+    }
+
+    /// The metadata last reported for `key`, while its source is still tracked.
+    fn reported(&self, key: &SessionKey) -> Option<&SessionMetadata> {
+        let SourceKey::File(path) = &key.source else {
+            return None;
+        };
+        self.known
+            .get(path)?
+            .reported
+            .as_ref()
+            .filter(|meta| meta.key == *key)
     }
 
     fn weight(meta: &SessionMetadata, path: &Path) -> usize {

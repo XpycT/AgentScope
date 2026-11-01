@@ -2470,7 +2470,7 @@ fn checked_source<'a>(
     Ok((path, end))
 }
 
-fn event_anchor(event: &Event) -> PageAnchor {
+pub(crate) fn event_anchor(event: &Event) -> PageAnchor {
     PageAnchor {
         timestamp: event.timestamp,
         source_order: event.source_order,
@@ -2478,7 +2478,7 @@ fn event_anchor(event: &Event) -> PageAnchor {
     }
 }
 
-fn event_size(event: &Event) -> usize {
+pub(crate) fn event_size(event: &Event) -> usize {
     let len = |part: &Option<BoundedText>| part.as_ref().map_or(0, |v| v.preview.len());
     len(&event.text)
         + event
@@ -2487,7 +2487,7 @@ fn event_size(event: &Event) -> usize {
             .map_or(0, |t| t.name.len() + len(&t.input) + len(&t.output))
 }
 
-fn fit_event(event: &mut Event, budget: usize) -> bool {
+pub(crate) fn fit_event(event: &mut Event, budget: usize) -> bool {
     let mut fields: Vec<(&mut String, Option<&mut bool>)> = Vec::new();
     if let Some(text) = &mut event.text {
         fields.push((&mut text.preview, Some(&mut text.truncated)));

@@ -192,6 +192,12 @@ pub fn unreadable(path: &Path, modified: SystemTime) -> SessionMetadata {
     build(path, &id, None, None, activity_fallback(modified), false)
 }
 
+/// Whitespace-collapsed, sanitized, credential-masked and bounded display text.
+fn display_title(raw: &str) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::ingest::text::preview(&collapsed, 1024, 256).preview
+}
+
 fn activity_fallback(modified: SystemTime) -> ActivityStamp {
     ActivityStamp {
         at: modified_ms(modified),
@@ -207,9 +213,13 @@ fn build(
     activity: ActivityStamp,
     available: bool,
 ) -> SessionMetadata {
-    let (title, title_derived) = match slot.filter(|s| !s.title.trim().is_empty()) {
-        Some(slot) => (slot.title.trim().to_owned(), slot.derived.unwrap_or(false)),
-        None => (id.to_owned(), false),
+    // Titles and IDs are untrusted text: sanitized, credential-masked and bounded.
+    let (title, title_derived) = match slot
+        .map(|s| (display_title(&s.title), s.derived))
+        .filter(|(title, _)| !title.is_empty())
+    {
+        Some((title, derived)) => (title, derived.unwrap_or(false)),
+        None => (display_title(id), false),
     };
     let cwd = header.and_then(|h| h.cwd.as_deref()).map(PathBuf::from);
     SessionMetadata {
@@ -223,7 +233,7 @@ fn build(
         project: cwd
             .as_deref()
             .and_then(Path::file_name)
-            .map(|n| n.to_string_lossy().into_owned()),
+            .map(|n| display_title(&n.to_string_lossy())),
         cwd,
         model: None,
         origins: Vec::new(),

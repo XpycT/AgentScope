@@ -30,6 +30,24 @@ pub(super) fn text(value: Option<&Value>) -> Option<String> {
     (!clean.trim().is_empty()).then_some(clean)
 }
 
+/// A session's lifetime tokens: the non-cached input, the cache reads and writes
+/// (additive beside it) and the output (which already contains reasoning). The
+/// normalized legs already include provider-side orchestration, so the retained
+/// orchestration subset labels are not added again. Any missing core
+/// counter makes the total unknown rather than a partial sum.
+pub fn omp_total(categories: &TokenCategories) -> Option<u64> {
+    let cache_write = categories.cache_write.or_else(|| {
+        categories
+            .cache_write_5m?
+            .checked_add(categories.cache_write_1h?)
+    })?;
+    categories
+        .input?
+        .checked_add(categories.output?)?
+        .checked_add(categories.cache_read?)?
+        .checked_add(cache_write)
+}
+
 pub(super) fn counter(object: &Map<String, Value>, key: &str) -> Option<u64> {
     object.get(key).and_then(Value::as_u64)
 }

@@ -6,6 +6,7 @@ use agentscope::ingest::text::display_safe;
 use agentscope::providers::ProviderReader;
 use agentscope::providers::claude::ClaudeScanner;
 use agentscope::providers::codex::CodexScanner;
+use agentscope::providers::omp::OmpScanner;
 use agentscope::providers::opencode::RetryingOpenCode;
 use agentscope::ui::{self, RosterContext};
 use agentscope::worker::WorkerHandle;
@@ -29,7 +30,7 @@ const USAGE: &str =
     "Usage: agentscope [OPTIONS]\n       agentscope inspect <rollout.jsonl|rollout.jsonl.zst>";
 
 const HELP: &str =
-    "AgentScope: read-only monitor for local Codex, Claude Code, and OpenCode sessions.
+    "AgentScope: read-only monitor for local Codex, Claude Code, OpenCode, and OMP sessions.
 
 Usage:
   agentscope [OPTIONS]
@@ -42,7 +43,7 @@ Options:
   --claude-projects <dir>   Claude projects root
   --claude-desktop <dir>    Claude Desktop application-data directory
   --opencode-db <path>      OpenCode database
-  --omp-sessions <dir>      OMP sessions root (accepted; no reader yet)
+  --omp-sessions <dir>      OMP sessions root
   --pi-sessions <dir>       Pi sessions root (accepted; no reader yet)
   --hermes-db <path>        Hermes state.db (accepted; no reader yet)
   --no-processes            Disable process observation
@@ -211,6 +212,10 @@ fn build_readers(config: &Config) -> (Vec<Box<dyn ProviderReader>>, Vec<String>)
         "Claude",
         ClaudeScanner::new(config).map(|r| Box::new(r) as Box<dyn ProviderReader>),
     );
+    add(
+        "OMP",
+        OmpScanner::new(config).map(|r| Box::new(r) as Box<dyn ProviderReader>),
+    );
     // Stays registered when the first open fails; refreshes retry.
     let (opencode, opened) = RetryingOpenCode::open(config);
     match opened {
@@ -233,6 +238,7 @@ fn checked_roots(config: &Config) -> Vec<String> {
         show("Codex", &config.harnesses.codex.root),
         show("Claude", &config.harnesses.claude.root),
         show("OpenCode", &config.harnesses.opencode.db),
+        show("OMP", &config.harnesses.omp.root),
     ]
 }
 

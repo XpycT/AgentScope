@@ -11,6 +11,7 @@ use agentscope::config::{CliOverrides, Config, Env};
 use agentscope::providers::ProviderReader;
 use agentscope::providers::claude::ClaudeScanner;
 use agentscope::providers::codex::CodexScanner;
+use agentscope::providers::omp::OmpScanner;
 use agentscope::providers::opencode::OpenCodeScanner;
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -37,6 +38,11 @@ pub struct World {
     pub writer: Connection,
     /// The B7 native population ([`World::native`]); absent in the base three-session world.
     pub grown: Option<Grown>,
+    /// Directory `plant_omp` fills; configured only when `omp_on`.
+    pub omp_root: PathBuf,
+    pub omp_on: bool,
+    /// The OMP family of [`World::with_omp`] (the native world keeps it in [`Grown`]).
+    pub omp_plant: Option<OmpPlant>,
 }
 
 pub fn claude_line(
@@ -165,6 +171,7 @@ impl World {
             )
             .unwrap();
 
+        let omp_root = dir.path().join("omp").join("agent").join("sessions");
         World {
             dir,
             codex_root,
@@ -172,6 +179,9 @@ impl World {
             db,
             writer,
             grown: None,
+            omp_root,
+            omp_on: false,
+            omp_plant: None,
         }
     }
 
@@ -181,6 +191,7 @@ impl World {
             claude_projects: Some(self.claude_root.clone()),
             opencode_db: Some(self.db.clone()),
             no_processes: true,
+            omp_sessions: self.omp_on.then(|| self.omp_root.clone()),
             ..CliOverrides::default()
         };
         cli.claude_desktop = self.grown.as_ref().map(|g| g.desktop.data.clone());
@@ -189,11 +200,33 @@ impl World {
 
     pub fn readers(&self) -> Vec<Box<dyn ProviderReader>> {
         let config = self.config();
-        vec![
+        let mut readers: Vec<Box<dyn ProviderReader>> = vec![
             Box::new(CodexScanner::new(&config).expect("codex")),
             Box::new(ClaudeScanner::new(&config).expect("claude")),
-            Box::new(OpenCodeScanner::new(&config).expect("opencode")),
-        ]
+        ];
+        if self.omp_on {
+            readers.push(Box::new(OmpScanner::new(&config).expect("omp")));
+        }
+        readers.push(Box::new(OpenCodeScanner::new(&config).expect("opencode")));
+        readers
+    }
+
+    /// The three-provider World plus one OMP family, a fork, a secret-bearing session
+    /// and OMP credential/history decoys.
+    pub fn with_omp() -> Self {
+        let mut world = World::new();
+        world.omp_on = true;
+        world.omp_plant = Some(plant_omp(
+            &world.omp_root,
+            OmpTimes {
+                parent: NOW_MS - 400_000,
+                child: NOW_MS - 390_000,
+                nested: NOW_MS - 380_000,
+                fork: NOW_MS - 370_000,
+                secret: NOW_MS - 360_000,
+            },
+        ));
+        world
     }
 
     pub fn codex_file(&self) -> PathBuf {
@@ -781,6 +814,7 @@ pub struct Grown {
     pub secret_claude: SessionKey,
     pub secret_codex: SessionKey,
     pub secret_opencode: SessionKey,
+    pub omp: OmpPlant,
     /// An OpenCode database whose WAL cannot be opened without a sidecar SQLite may not
     /// create (a directory occupies the `-shm` name).
     pub locked_db: PathBuf,
@@ -838,6 +872,7 @@ impl World {
     /// fields and a locked WAL database. All synthetic.
     pub fn native() -> Self {
         let mut world = World::new();
+        world.omp_on = true;
         let grown = grow(&world);
         world.grown = Some(grown);
         world
@@ -860,11 +895,15 @@ impl World {
         let config = self.locked_config();
         let (opencode, error) = RetryingOpenCode::open(&config);
         assert!(error.is_some(), "the locked WAL cannot be opened");
-        vec![
+        let mut readers: Vec<Box<dyn ProviderReader>> = vec![
             Box::new(CodexScanner::new(&config).expect("codex")),
             Box::new(ClaudeScanner::new(&config).expect("claude")),
-            Box::new(opencode),
-        ]
+        ];
+        if self.omp_on {
+            readers.push(Box::new(OmpScanner::new(&config).expect("omp")));
+        }
+        readers.push(Box::new(opencode));
+        readers
     }
 }
 
@@ -1356,6 +1395,31 @@ fn grow(world: &World) -> Grown {
     let secret_opencode = oc_key(db, "ses_secret");
     roots.push((secret_opencode.clone(), t));
 
+    // ---- OMP: a parent with a nested child family (its task result quotes a child cost
+    // that must never be added), a fork root, a secret-bearing root and credential
+    // decoys beside the sessions root.
+    let omp_parent_t = next();
+    let omp_fork_t = next();
+    let omp_secret_t = next();
+    let omp = plant_omp(
+        &world.omp_root,
+        OmpTimes {
+            parent: omp_parent_t,
+            child: CHILD_MS + 30,
+            nested: CHILD_MS + 31,
+            fork: omp_fork_t,
+            secret: omp_secret_t,
+        },
+    );
+    roots.push((omp.family.parent.clone(), omp_parent_t));
+    roots.push((omp.fork.clone(), omp_fork_t));
+    roots.push((omp.secret.clone(), omp_secret_t));
+    children.push((omp.family.child.clone(), omp.family.parent.clone()));
+    children.push((omp.family.nested.clone(), omp.family.child.clone()));
+    forks.push((omp.fork.clone(), omp.family.parent.clone()));
+    direct_tokens.extend(omp.tokens.clone());
+    tails.push((omp.family.parent.clone(), OMP_TAIL.into()));
+
     // ---- Plain roots up to exactly ROOT_COUNT, spread across the three harnesses.
     let fillers = ROOT_COUNT - roots.len();
     for n in 0..fillers {
@@ -1422,6 +1486,8 @@ fn grow(world: &World) -> Grown {
         (desktop_child.clone(), CHILD_MS + 5),
         (oc_child.clone(), CHILD_MS + 10),
         (oc_nested.clone(), CHILD_MS + 20),
+        (omp.family.child.clone(), CHILD_MS + 30),
+        (omp.family.nested.clone(), CHILD_MS + 31),
     ];
     Grown {
         desktop: d,
@@ -1459,7 +1525,224 @@ fn grow(world: &World) -> Grown {
         secret_claude,
         secret_codex,
         secret_opencode,
+        omp,
         locked_db,
         _locked_writer: locked_writer,
+    }
+}
+
+// ---- OMP ----------------------------------------------------------------------------
+
+/// Text of the newest transcript entry of the planted OMP family parent.
+pub const OMP_TAIL: &str = "omp family tail entry";
+
+/// System-prompt and task text of the planted OMP init record: private content that
+/// must never reach metadata, warnings or events (only the raw source view shows it).
+pub const OMP_PROMPT_SECRET: &str = "SENTINEL-OMP-PROMPT-3d9c";
+
+/// Recorded activity (epoch ms) of each planted OMP session.
+pub struct OmpTimes {
+    pub parent: i64,
+    pub child: i64,
+    pub nested: i64,
+    pub fork: i64,
+    pub secret: i64,
+}
+
+/// What [`plant_omp`] wrote.
+pub struct OmpPlant {
+    pub family: Family,
+    pub fork: SessionKey,
+    pub secret: SessionKey,
+    /// Exact lifetime tokens each planted session owns (a fork's copies and a parent's
+    /// quoted child cost are not theirs).
+    pub tokens: Vec<(SessionKey, u64)>,
+    /// Credential, history, model and statistics decoys: never read, never listed.
+    pub decoys: Vec<PathBuf>,
+}
+
+/// Plants an OMP sessions tree under `root` (the `sessions` directory of an agent
+/// directory) with credential decoys beside it.
+pub fn plant_omp(root: &Path, t: OmpTimes) -> OmpPlant {
+    use super::omp as om;
+
+    let bucket = "work";
+    let stamped = |entry: Value, ms: i64| om::at(entry, &iso(ms));
+    let key = |id: &str, name: &str| {
+        file_key(
+            Harness::Omp,
+            id,
+            &root.join(bucket).join(format!("{name}.jsonl")),
+        )
+    };
+    let owned = |tokens: (u64, u64, u64)| om::usage(tokens.0, tokens.1, tokens.2, 0, 99.0);
+
+    // Parent: prompt, one owned call, a task result quoting an absurd child cost, a
+    // compaction, and the tail entry.
+    let parent = "t1_omp-fam";
+    om::write_session(
+        root,
+        bucket,
+        parent,
+        &[
+            stamped(om::header("omp-fam", None, None), t.parent - 4_000),
+            stamped(
+                om::user_message("u1", None, "OMP family prompt"),
+                t.parent - 3_000,
+            ),
+            stamped(
+                om::call("a1", Some("u1"), Some("r-a1"), owned((600, 300, 100))),
+                t.parent - 2_000,
+            ),
+            stamped(
+                om::task_result("t1", Some("a1"), "omp-kid", 9.99),
+                t.parent - 1_500,
+            ),
+            stamped(om::compaction("k1", Some("t1"), "u1"), t.parent - 1_000),
+            stamped(om::user_message("u2", Some("k1"), OMP_TAIL), t.parent),
+        ],
+    );
+    om::write_session(
+        root,
+        bucket,
+        &format!("{parent}/omp-kid"),
+        &[
+            stamped(om::header("omp-kid", None, None), t.child - 200),
+            stamped(om::user_message("ku", None, "child task"), t.child - 100),
+            stamped(
+                om::call("ka", Some("ku"), Some("r-ka"), owned((200, 80, 0))),
+                t.child,
+            ),
+        ],
+    );
+    om::write_session(
+        root,
+        bucket,
+        &format!("{parent}/omp-kid/omp-nest"),
+        &[
+            stamped(om::header("omp-nest", None, None), t.nested - 200),
+            stamped(om::user_message("nu", None, "nested task"), t.nested - 100),
+            stamped(
+                om::call("na", Some("nu"), Some("r-na"), owned((40, 10, 0))),
+                t.nested,
+            ),
+        ],
+    );
+    // Fork: copies the parent's prompt and call (money reset, tokens kept), then adds
+    // one call of its own.
+    let fork = "t2_omp-fork";
+    om::write_session(
+        root,
+        bucket,
+        fork,
+        &[
+            stamped(
+                om::header("omp-fork", Some("omp-fam"), None),
+                t.parent - 4_000,
+            ),
+            stamped(
+                om::user_message("u1", None, "OMP family prompt"),
+                t.parent - 3_000,
+            ),
+            stamped(
+                om::call(
+                    "a1",
+                    Some("u1"),
+                    Some("r-a1"),
+                    om::usage(600, 300, 100, 0, 0.0),
+                ),
+                t.parent - 2_000,
+            ),
+            stamped(
+                om::call("f1", Some("a1"), Some("r-f1"), om::usage(30, 5, 0, 0, 0.0)),
+                t.fork,
+            ),
+        ],
+    );
+    // Secret-bearing session: private fields, a system prompt, a credential-shaped
+    // prompt and a hostile title.
+    let secret = "t3_omp-secret";
+    let mut header = om::header("omp-secret", None, None);
+    header["apiKey"] = json!(FIELD_SECRET);
+    let mut init = om::entry(
+        "i1",
+        None,
+        "session_init",
+        json!({"systemPrompt": OMP_PROMPT_SECRET, "task": OMP_PROMPT_SECRET, "authorization": format!("Bearer {FIELD_SECRET}")}),
+    );
+    init["env"] = json!({"OPENAI_API_KEY": FIELD_SECRET});
+    om::write_slotted(
+        root,
+        bucket,
+        secret,
+        &om::title_slot(&format!("ops token={INLINE_SECRET} \u{1b}]0;pwned\u{7}")),
+        &[
+            stamped(header, t.secret - 1_000),
+            stamped(init, t.secret - 500),
+            stamped(
+                om::user_message(
+                    "u1",
+                    Some("i1"),
+                    &format!("password={INLINE_SECRET} \u{1b}[2J"),
+                ),
+                t.secret,
+            ),
+        ],
+    );
+
+    // Decoys: the agent directory's credential/history/model/statistics stores and
+    // files that merely look like sessions in places no session lives.
+    let agent = root.parent().expect("an agent directory").to_path_buf();
+    let body = format!("{{\"token\":\"{SENTINEL}\"}}");
+    let mut decoys = Vec::new();
+    for path in [
+        agent.join("agent.db"),
+        agent.join("history.db"),
+        agent.join("models.db"),
+        agent.join("stats.db"),
+        agent.join("config.yml"),
+        agent.join("auth.json"),
+        root.join("auth.json"),
+        root.join(bucket).join("credentials.json"),
+        root.join(bucket)
+            .join("blobs")
+            .join("sha256-deadbeef.jsonl"),
+        root.join(bucket).join("loose-dir").join("stray.jsonl"),
+        agent.join("blobs").join("sha256-cafe.jsonl"),
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &body).unwrap();
+        decoys.push(path);
+    }
+
+    let family = Family {
+        parent: key("omp-fam", parent),
+        child: file_key(
+            Harness::Omp,
+            "omp-kid",
+            &root.join(bucket).join(parent).join("omp-kid.jsonl"),
+        ),
+        nested: file_key(
+            Harness::Omp,
+            "omp-nest",
+            &root
+                .join(bucket)
+                .join(parent)
+                .join("omp-kid")
+                .join("omp-nest.jsonl"),
+        ),
+    };
+    let fork_key = key("omp-fork", fork);
+    OmpPlant {
+        tokens: vec![
+            (family.parent.clone(), 1_000),
+            (family.child.clone(), 280),
+            (family.nested.clone(), 50),
+            (fork_key.clone(), 35),
+        ],
+        fork: fork_key,
+        secret: key("omp-secret", secret),
+        decoys,
+        family,
     }
 }

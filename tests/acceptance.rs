@@ -1137,3 +1137,135 @@ fn real_data_smoke_is_read_only_and_prints_counts_only() {
     );
     assert_eq!(silent, 0, "bytes changed without any metadata change");
 }
+
+// ---- OMP: the real reader, worker, App and renderer ----------------------------------
+
+#[test]
+fn omp_family_opens_through_the_real_worker_app_and_renderer() {
+    use support::omp as om;
+
+    let world = World::with_omp();
+    let plant = world.omp_plant.as_ref().expect("planted OMP family");
+    let (parent, child, nested) = (
+        plant.family.parent.clone(),
+        plant.family.child.clone(),
+        plant.family.nested.clone(),
+    );
+    let mut h = Driver::start(&world);
+    // Three native sessions plus the OMP parent, its fork and the secret-bearing root.
+    h.pump_until("roster", |a| a.total_sessions() == 6);
+    assert!(h.screen().contains("OMP"), "{}", h.screen());
+
+    // Expand the family one level at a time: child, then grandchild.
+    assert!(h.app.select_row(&parent));
+    h.ch(' ');
+    h.pump_until("children", |a| {
+        a.children_of(&parent)
+            .is_some_and(|c| !c.metadata.is_empty())
+    });
+    // A family level opens through its own request (the roster toggles whole families).
+    assert!(h.app.load_children(&child));
+    h.pump_until("grandchildren", |a| {
+        a.children_of(&child)
+            .is_some_and(|c| !c.metadata.is_empty())
+    });
+    assert!(
+        h.app
+            .children_of(&child)
+            .is_some_and(|c| c.metadata.iter().any(|m| m.key == nested))
+    );
+
+    // The parent's preview facts: direct tokens only, the quoted child cost is not added.
+    assert!(h.app.select_row(&parent));
+    h.pump_until("parent facts", |a| {
+        a.session(&parent).is_some_and(|r| {
+            r.session
+                .usage
+                .as_ref()
+                .is_some_and(|u| u.total == Some(1_000))
+        })
+    });
+    let parent_row = h.app.session(&parent).unwrap();
+    let summary = parent_row.session.clone();
+    assert_eq!(summary.metrics.compactions.observed, 1);
+    assert_eq!(
+        summary.metrics.compactions.known_cost_usd, None,
+        "compaction cost is Unknown"
+    );
+    assert_eq!(summary.displayed_event_count, 6);
+
+    // Open the parent at its true latest event.
+    h.key(KeyCode::Enter);
+    assert_eq!(h.app.screen, Screen::Inspector);
+    h.pump_until("latest page", |a| {
+        a.transcript().is_some_and(|t| t.loaded())
+    });
+    let last = h
+        .app
+        .transcript()
+        .unwrap()
+        .events()
+        .last()
+        .and_then(|e| e.text.as_ref())
+        .map(|t| t.preview.clone());
+    assert_eq!(last.as_deref(), Some(support::world::OMP_TAIL));
+    let screen = h.screen();
+    assert!(screen.contains(support::world::OMP_TAIL), "{screen}");
+
+    // Record-level details: the owned request with its category counters and the
+    // compaction marker with its recorded summary and Unknown cost.
+    assert!(h.app.request_details());
+    h.pump_until("details", |a| a.details().complete());
+    let page = h.app.details().page().clone();
+    assert_eq!(page.requests.len(), 1);
+    assert_eq!(page.requests[0].categories.input, Some(600));
+    assert_eq!(page.requests[0].categories.cache_read, Some(100));
+    assert_eq!(page.compactions.len(), 1);
+    assert!(page.compactions[0].usage.is_none());
+    assert_eq!(
+        page.compactions[0]
+            .summary
+            .as_ref()
+            .map(|s| s.preview.as_str()),
+        Some("synthetic summary")
+    );
+    // Session info shows the usage facts and the lineage.
+    h.ch('i');
+    let info = h.screen();
+    assert!(info.contains("Tokens: 1,000"), "{info}");
+    assert!(info.contains("Provider: OMP"), "{info}");
+    assert!(info.contains("Effort: Unknown"), "{info}");
+
+    // A live append arrives through refresh and is counted, then loaded.
+    h.key(KeyCode::Esc);
+    let path = match &parent.source {
+        SourceKey::File(path) => path.clone(),
+        other => panic!("{other:?}"),
+    };
+    om::append(
+        &path,
+        &[om::user_message("u3", Some("u2"), "omp live append")],
+    );
+    h.worker.tx.send(WorkerRequest::Refresh).unwrap();
+    h.pump_until("new events", |a| a.new_event_count() == 1);
+    h.ch('G');
+    h.pump_until("appended event", |a| {
+        a.transcript().is_some_and(|t| {
+            t.events()
+                .last()
+                .and_then(|e| e.text.as_ref())
+                .is_some_and(|t| t.preview == "omp live append")
+        })
+    });
+
+    // The source view serves the exact record.
+    h.ch('v');
+    h.pump_until("source", |a| {
+        a.source_view()
+            .is_some_and(|v| !matches!(v.state, agentscope::app::SourceState::Loading))
+    });
+    assert!(h.screen().contains("omp live append"), "{}", h.screen());
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Esc);
+    assert!(h.worker.shutdown());
+}

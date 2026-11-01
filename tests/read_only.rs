@@ -15,8 +15,8 @@ use agentscope::providers::opencode::open_read_only;
 use agentscope::ui::{RosterContext, apply_worker_event, flush_requests, handle_key};
 use agentscope::worker::{WorkerHandle, WorkerRequest};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use support::NOW;
 use support::world::*;
+use support::{NOW, Unreadable};
 
 type Meta = BTreeMap<PathBuf, (u64, std::time::SystemTime, u32)>;
 
@@ -584,4 +584,147 @@ fn native_world_locked_wal_is_unavailable_never_repaired_and_hides_nothing_else(
     assert_eq!(after.files, before.files);
     assert_eq!(after.sidecars, before.sidecars);
     assert_eq!(all_paths(world.dir.path()), before_paths);
+}
+
+// ---- OMP: provider stores and decoys stay untouched and unread ---------------------
+
+#[test]
+fn omp_sessions_and_decoy_stores_are_never_written_and_decoys_never_opened() {
+    let world = World::with_omp();
+    let plant = world.omp_plant.as_ref().expect("planted OMP family");
+    let before_files = snapshot(world.dir.path());
+    let before_paths = all_paths(world.dir.path());
+    let before_meta = metadata(&world);
+
+    // The credential/history/model/statistics decoys cannot be opened while this guard
+    // holds them: a reader that tried would fail or warn, and the sessions are still
+    // all found, so none of them was opened.
+    let locks: Vec<Unreadable> = plant.decoys.iter().map(|p| Unreadable::new(p)).collect();
+    let locked = locks.iter().filter(|l| l.active).count();
+
+    let mut readers = world.readers();
+    let surface = exercise_everything(&mut readers);
+    let _ = exercise_everything(&mut readers);
+    // The three base sessions plus parent, child, nested child, fork and secret session.
+    assert_eq!(surface.sessions.len(), 8);
+    let omp: Vec<_> = surface
+        .sessions
+        .iter()
+        .filter(|s| s.meta.key.harness == agentscope::domain::Harness::Omp)
+        .collect();
+    assert_eq!(omp.len(), 5);
+    for session in &omp {
+        assert!(session.meta.source_available, "{:?}", session.meta.key);
+    }
+    for warning in &surface.warnings {
+        let text = format!("{} {}", warning.key.source, warning.message);
+        for decoy in &plant.decoys {
+            let name = decoy.file_name().unwrap().to_string_lossy();
+            assert!(
+                !text.contains(name.as_ref()),
+                "a decoy was reported: {text}"
+            );
+        }
+    }
+    // Every event's source record is served for every OMP session.
+    for session in &omp {
+        let reader = readers
+            .iter_mut()
+            .find(|r| r.harness() == session.meta.key.harness)
+            .unwrap();
+        let page = support::world::transcript_ready(
+            reader.as_mut(),
+            &session.meta.key,
+            None,
+            agentscope::domain::PageDirection::Backward,
+            PAGE,
+            BIG,
+            support::world::STEPS,
+        );
+        assert!(!page.events.is_empty());
+        for event in &page.events {
+            let record = support::world::try_source(
+                reader.as_mut(),
+                &event.provenance.locator,
+                BIG,
+                support::world::STEPS,
+            )
+            .expect("source record");
+            assert!(record.unavailable.is_none(), "{record:?}");
+        }
+    }
+    drop(readers);
+    for lock in locks {
+        lock.release();
+    }
+    // Windows holds every decoy exclusively, so a stray open would have failed.
+    #[cfg(windows)]
+    assert_eq!(locked, plant.decoys.len(), "every decoy was locked");
+    #[cfg(not(windows))]
+    let _ = locked;
+
+    assert_eq!(
+        snapshot(world.dir.path()).files,
+        before_files.files,
+        "session files and decoys are byte-identical"
+    );
+    assert_eq!(metadata(&world), before_meta);
+    assert_only_adr0002_sidecars_added(&world, &before_paths);
+    let omp_after: Vec<_> = all_paths(&world.omp_root).into_iter().collect();
+    assert!(
+        !omp_after
+            .iter()
+            .any(|p| p.to_string_lossy().contains("-wal") || p.to_string_lossy().contains("-shm")),
+        "no sidecar or runtime file appears beside OMP data"
+    );
+}
+
+#[test]
+fn omp_full_worker_and_tui_session_leaves_provider_data_unchanged() {
+    let world = World::with_omp();
+    let before = snapshot(world.dir.path());
+    let before_paths = all_paths(world.dir.path());
+    let before_meta = metadata(&world);
+
+    let worker = WorkerHandle::spawn(world.readers(), world.config());
+    let mut app = App::new(
+        support::NOW,
+        Thresholds {
+            quiet: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+        },
+    );
+    let mut ctx = RosterContext {
+        no_color: true,
+        ..RosterContext::default()
+    };
+    wait_for(&mut app, &mut ctx, &worker, |a| a.total_sessions() == 6);
+    let plant = world.omp_plant.as_ref().unwrap();
+    let key = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+    for target in [&plant.family.parent, &plant.fork, &plant.secret] {
+        assert!(app.select_row(target), "{} is a root", target.native_id);
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Inspector);
+        flush_requests(&mut app, &worker);
+        wait_for(&mut app, &mut ctx, &worker, |a| {
+            a.transcript().is_some_and(|t| t.loaded())
+        });
+        handle_key(&mut app, key(KeyCode::Char('v')));
+        if app.screen == Screen::Source {
+            flush_requests(&mut app, &worker);
+            wait_for(&mut app, &mut ctx, &worker, |a| {
+                a.source_view()
+                    .is_some_and(|v| !matches!(v.state, SourceState::Loading))
+            });
+            handle_key(&mut app, key(KeyCode::Esc));
+        }
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Roster);
+    }
+    let _ = worker.tx.send(WorkerRequest::Refresh);
+    assert!(worker.shutdown(), "worker exits cleanly");
+
+    assert_eq!(snapshot(world.dir.path()).files, before.files);
+    assert_eq!(metadata(&world), before_meta);
+    assert_only_adr0002_sidecars_added(&world, &before_paths);
 }
