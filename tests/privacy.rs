@@ -1366,3 +1366,79 @@ fn hermes_profiles_and_decoy_credentials_never_surface() {
         });
     assert!(!leaked, "the inline credential is never painted");
 }
+
+#[test]
+fn pi_metadata_and_records_never_debug_private_content() {
+    use agentscope::providers::pi::{PiCatalog, PiHydration, parse_entry, parse_header};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let prompt = format!("\u{1b}[31mapi_key={SENTINEL}\nsecond line");
+    let entries = vec![
+        support::pi::header("pi-session", Some(&format!("/work/{INLINE_SECRET}.jsonl"))),
+        support::pi::message("u1", None, "user", &prompt, None),
+        support::pi::with_response(
+            support::pi::message(
+                "a1",
+                Some("u1"),
+                "assistant",
+                "ok",
+                Some(support::pi::usage(100, 40, 20, 10)),
+            ),
+            SENTINEL,
+        ),
+    ];
+    support::pi::write_session(dir.path(), "--project--", "session", &entries);
+    fs::write(
+        dir.path().join("auth.json"),
+        format!(r#"{{"api_key":"{SENTINEL}"}}"#),
+    )
+    .expect("credential decoy");
+
+    let mut catalog = PiCatalog::new(vec![dir.path().to_path_buf()], 100, 1 << 20);
+    let meta = loop {
+        let delta = catalog
+            .step(agentscope::domain::RefreshBudget {
+                max_records: 100,
+                max_bytes: 1 << 20,
+                max_millis: 60_000,
+            })
+            .expect("discovery");
+        let found = delta.sessions.into_iter().next();
+        if delta.scan.done {
+            break found.expect("one Pi session; auth.json is not one");
+        }
+    };
+    assert_eq!(meta.key.native_id, "pi-session");
+    assert_clean("pi title", &meta.title);
+    assert!(!meta.title.contains('\u{1b}'));
+    assert_clean_debug("pi metadata", &meta);
+
+    let header = parse_header(&entries[0]).expect("header");
+    assert_clean_debug("pi header", &header);
+    let entry = parse_entry(&entries[2], 1, 0).expect("assistant entry");
+    assert_clean_debug("pi entry", &entry);
+
+    let cli = CliOverrides {
+        pi_sessions: Some(dir.path().to_path_buf()),
+        ..CliOverrides::default()
+    };
+    let config = Config::load_with_env(&cli, &Env::new()).expect("config");
+    let mut hydration = PiHydration::new(meta, &config).expect("hydration");
+    let summary = loop {
+        let delta = hydration
+            .step(agentscope::domain::RefreshBudget {
+                max_records: 100,
+                max_bytes: 1 << 20,
+                max_millis: 60_000,
+            })
+            .expect("hydrate");
+        if delta.done {
+            break delta.summary;
+        }
+    };
+    assert_clean_debug("pi summary", &summary);
+    for warning in &summary.warnings {
+        assert_clean("pi warning", &warning.message);
+        assert_clean("pi warning source", &warning.key.source);
+    }
+}

@@ -1231,3 +1231,147 @@ fn hermes_discovery_and_transcript_pages_stay_within_their_budgets() {
         "{bytes} preview bytes exceed the page budget"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Native Pi: bounded discovery windows and resumable hydration slices.
+// ---------------------------------------------------------------------------
+
+/// A Pi hydration chunk: few records and bytes, like the worker's chunk.
+const PI_CHUNK: RefreshBudget = RefreshBudget {
+    max_records: 8,
+    max_bytes: 8 * 1024,
+    max_millis: 600_000,
+};
+
+fn pi_fixture(entries: &[Value]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = support::pi::write_session(dir.path(), "proj", "long", entries);
+    (dir, path)
+}
+
+#[test]
+fn pi_discovery_reads_only_bounded_header_and_tail_windows() {
+    use agentscope::providers::pi::PiCatalog;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sessions = 40usize;
+    let padding = "x".repeat(200 * 1024);
+    for index in 0..sessions {
+        support::pi::write_session(
+            dir.path(),
+            "proj",
+            &format!("s{index:03}"),
+            &[
+                support::pi::header(&format!("pi-{index}"), None),
+                support::pi::message("u1", None, "user", &padding, None),
+                support::pi::session_info("si1", "u1", "bounded"),
+                support::pi::message(
+                    "a1",
+                    Some("si1"),
+                    "assistant",
+                    "ok",
+                    Some(support::pi::usage(1, 2, 3, 4)),
+                ),
+            ],
+        );
+    }
+    let total_bytes: u64 = fs::read_dir(dir.path().join("proj"))
+        .expect("bucket")
+        .map(|entry| entry.expect("entry").metadata().expect("metadata").len())
+        .sum();
+    perf::reset();
+    let mut catalog = PiCatalog::new(vec![dir.path().to_path_buf()], 1000, 64 << 20);
+    let mut seen = 0usize;
+    for _ in 0..10_000 {
+        let delta = catalog.step(BIG).expect("discovery");
+        seen += delta.sessions.len();
+        if delta.scan.done {
+            break;
+        }
+    }
+    let used = perf::snapshot();
+    assert_eq!(seen, sessions);
+    assert!(total_bytes > (sessions as u64) * 200 * 1024);
+    // A 4 KiB prefix plus a 32 KiB tail per source; the middle is never read.
+    let window = (sessions * (4 * 1024 + 32 * 1024 + 4 * 1024)) as u64;
+    assert!(
+        used.bytes_read <= window,
+        "read {} > {window}",
+        used.bytes_read
+    );
+    assert!(
+        used.records_parsed <= (sessions * 4) as u64,
+        "parsed {} records",
+        used.records_parsed
+    );
+}
+
+#[test]
+fn pi_hydration_respects_each_slice_budget() {
+    use agentscope::providers::pi::{PiCatalog, PiHydration};
+
+    let mut entries = vec![support::pi::header("pi-long", None)];
+    for index in 0..300u64 {
+        entries.push(support::pi::with_response(
+            support::pi::message(
+                &format!("a{index}"),
+                None,
+                "assistant",
+                "ok",
+                Some(support::pi::usage(100, 40, 20, 10)),
+            ),
+            &format!("resp-{index}"),
+        ));
+    }
+    let (dir, _path) = pi_fixture(&entries);
+    let cli = CliOverrides {
+        pi_sessions: Some(dir.path().to_path_buf()),
+        ..CliOverrides::default()
+    };
+    let config = Config::load_with_env(&cli, &Env::new()).expect("config");
+    let mut catalog = PiCatalog::new(vec![dir.path().to_path_buf()], 10, 1 << 20);
+    let mut meta = None;
+    for _ in 0..100 {
+        let delta = catalog.step(BIG).expect("discovery");
+        if let Some(found) = delta.sessions.into_iter().next() {
+            meta = Some(found);
+        }
+        if delta.scan.done {
+            break;
+        }
+    }
+    let meta = meta.expect("discovered Pi session");
+    let mut hydration = PiHydration::new(meta, &config).expect("hydration");
+    let mut slices = 0usize;
+    loop {
+        slices += 1;
+        perf::reset();
+        let delta = hydration.step(PI_CHUNK).expect("hydrate");
+        let used = perf::snapshot();
+        assert!(
+            used.records_parsed <= PI_CHUNK.max_records as u64,
+            "slice parsed {} records",
+            used.records_parsed
+        );
+        assert!(
+            used.bytes_read <= (PI_CHUNK.max_bytes + 4096) as u64,
+            "slice read {} bytes",
+            used.bytes_read
+        );
+        if delta.done {
+            assert_eq!(
+                delta
+                    .summary
+                    .usage
+                    .as_ref()
+                    .expect("usage")
+                    .coverage
+                    .observed_requests,
+                300
+            );
+            break;
+        }
+        assert!(slices < 10_000);
+    }
+    assert!(slices > 1, "the budget forces resumable slices");
+}

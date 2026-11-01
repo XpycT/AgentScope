@@ -8,6 +8,7 @@ pub mod facts;
 pub mod hermes;
 pub mod omp;
 pub mod opencode;
+pub mod pi;
 pub mod world;
 
 use std::fs::{self, File};

@@ -15,6 +15,8 @@ pub mod hermes;
 /// OMP sessions and native subagents: catalog, hydration, and the paged reader.
 pub mod omp;
 pub mod opencode;
+/// Native Pi sessions: bounded discovery, record parsing and request hydration.
+pub mod pi;
 pub(crate) mod probe;
 pub(crate) mod sqlite_guard;
 
