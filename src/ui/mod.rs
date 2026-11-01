@@ -457,6 +457,12 @@ fn handle_scroll_overlay_key(app: &mut App, code: KeyCode) -> KeyAction {
         KeyCode::Char(' ') | KeyCode::Enter if app.screen == Screen::Session => {
             app.toggle_summaries();
         }
+        KeyCode::Char('[') if app.screen == Screen::Details => {
+            app.details_step(-1);
+        }
+        KeyCode::Char(']') if app.screen == Screen::Details => {
+            app.details_step(1);
+        }
         KeyCode::Char('v') if app.screen == Screen::Details => {
             app.open_selected_source();
         }

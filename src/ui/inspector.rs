@@ -916,39 +916,6 @@ fn capped(lines: Vec<String>, cap: usize) -> (Vec<String>, bool) {
     }
 }
 
-pub(super) fn detail_lines(event: &Event) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Some(tool) = &event.tool {
-        out.push(tool_status_line(tool));
-        push_block(&mut out, "Input", tool.input.as_ref());
-        match (&tool.output, tool.status) {
-            (None, ToolStatus::Pending) => out.push("Output: pending (no result yet)".into()),
-            (None, _) => out.push("Output: none recorded".into()),
-            (Some(_), _) => push_block(&mut out, "Output", tool.output.as_ref()),
-        }
-        if tool.orphan {
-            out.push("Note: call and result could not be paired".into());
-        }
-    } else {
-        if event.kind == EventKind::Reasoning {
-            out.push(format!("{REASONING_LABEL}; not hidden chain-of-thought"));
-        }
-        push_block(&mut out, "Text", event.text.as_ref());
-    }
-    if let Some(usage) = &event.usage {
-        out.push(format!(
-            "Usage ({}): {}",
-            match usage.scope {
-                UsageScope::Session => "session",
-                UsageScope::Turn => "turn",
-                UsageScope::Message => "message",
-            },
-            super::session::categories_text(&usage.categories)
-        ));
-    }
-    out
-}
-
 /// Recorded preview blocks for an expanded row, bounded to what the row has.
 fn tool_detail_lines(tool: &ToolInteraction) -> Vec<String> {
     let mut out = Vec::new();
@@ -984,48 +951,10 @@ fn push_preview(out: &mut Vec<String>, label: &str, text: Option<&BoundedText>) 
     }
 }
 
-/// Detail-view status line for a tool event.
-fn tool_status_line(tool: &ToolInteraction) -> String {
-    let status = match tool.status {
-        ToolStatus::Pending => "Pending",
-        ToolStatus::Completed => "Completed",
-        ToolStatus::Error => "Error",
-        ToolStatus::Unknown => "Unknown",
-    };
-    let duration = match (tool.started_at, tool.completed_at) {
-        (Some(a), Some(b)) if b >= a => duration_text(b - a),
-        _ => ABSENT.to_string(),
-    };
-    let exit = tool
-        .exit_code
-        .map_or_else(|| ABSENT.to_string(), |c| c.to_string());
-    format!("Status: {status}   Duration: {duration}   Exit: {exit}")
-}
-
 fn duration_text(ms: i64) -> String {
     match ms {
         0..=999 => format!("{ms}ms"),
         1000..=59_999 => format!("{:.1}s", ms as f64 / 1000.0),
         _ => format!("{}m{:02}s", ms / 60_000, (ms / 1000) % 60),
-    }
-}
-
-fn push_block(out: &mut Vec<String>, label: &str, text: Option<&BoundedText>) {
-    let Some(text) = text else {
-        out.push(format!("{label}: —"));
-        return;
-    };
-    let mut lines = text.preview.lines();
-    out.push(format!(
-        "{label}: {}",
-        display_safe(lines.next().unwrap_or(""))
-    ));
-    out.extend(lines.map(|l| format!("  {}", display_safe(l))));
-    if text.truncated {
-        out.push(format!(
-            "  [truncated: showing {} of {} bytes]",
-            text.preview.len(),
-            text.byte_len
-        ));
     }
 }

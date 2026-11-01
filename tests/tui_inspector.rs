@@ -1419,8 +1419,9 @@ fn event_details_show_per_event_usage_categories() {
     open(&mut app, page(vec![e], None, false));
     assert!(app.open_details());
     let screen = draw(&app, 160, 30);
-    assert!(screen.contains("Usage (message):"), "{screen}");
-    assert!(screen.contains("cache read 40,000"), "{screen}");
+    assert!(screen.contains("USAGE (message)"), "{screen}");
+    assert!(screen.contains("cache read"), "{screen}");
+    assert!(screen.contains("40k"), "{screen}");
 }
 
 fn measured_model(id: &str) -> ModelDetail {

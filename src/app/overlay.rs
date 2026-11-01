@@ -138,6 +138,28 @@ impl App {
         self.overlays.diag_selected.min(len.saturating_sub(1))
     }
 
+    /// `[`/`]` in Details: move the transcript selection by one loaded event.
+    /// The step stops at the loaded window edges and returns `false` there;
+    /// it never pages in more events on its own.
+    pub fn details_step(&mut self, delta: isize) -> bool {
+        let Some(transcript) = self.transcript.as_mut() else {
+            return false;
+        };
+        let len = transcript.events().len();
+        if len == 0 {
+            return false;
+        }
+        let current = transcript.selected();
+        let last = (len - 1) as isize;
+        let target = (current as isize).saturating_add(delta).clamp(0, last) as usize;
+        if target == current {
+            return false;
+        }
+        transcript.select_index(target);
+        self.overlays.details_scroll = 0;
+        true
+    }
+
     /// `d`: details for the selected event.
     pub fn open_details(&mut self) -> bool {
         if self.screen != Screen::Inspector

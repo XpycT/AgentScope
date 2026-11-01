@@ -9,7 +9,7 @@ use crate::app::{App, DetailsState};
 use crate::domain::{
     AggregationClass, CompactionObservation, CompactionScope, CompactionSummary, ContextUsage,
     CostBreakdown, Lifecycle, ModelDetail, MoneySource, OriginSurface, SessionLink,
-    SessionMetadata, SessionSummary, TimedRate, Timestamp, TokenCategories, UsageSummary,
+    SessionMetadata, SessionSummary, TimedRate, Timestamp, UsageSummary,
 };
 use crate::ingest::text::display_safe;
 use crate::time::relative_label;
@@ -21,22 +21,6 @@ use super::widgets::{ABSENT, LOADING, harness_name, tokens_text};
 
 fn count(value: Option<u64>) -> String {
     value.map_or_else(|| "—".into(), grouped)
-}
-
-/// One-line category breakdown shared by the session view and event details.
-pub(super) fn categories_text(c: &TokenCategories) -> String {
-    format!(
-        "input {} · cached input {} · cache write {} (5m {} · 1h {}) · cache read {} · output {} · reasoning {} · total {}",
-        count(c.input),
-        count(c.cached_input),
-        count(c.cache_write),
-        count(c.cache_write_5m),
-        count(c.cache_write_1h),
-        count(c.cache_read),
-        count(c.output),
-        count(c.reasoning),
-        count(c.total),
-    )
 }
 
 pub(super) fn link_text(link: &Option<SessionLink>) -> String {

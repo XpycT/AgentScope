@@ -156,8 +156,7 @@ fn open(app: &mut App, first: TranscriptPage) {
     app.take_requests();
 }
 
-fn draw(app: &App) -> String {
-    let (w, h) = (100u16, 24u16);
+fn screen_at(app: &App, w: u16, h: u16) -> String {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     let ctx = RosterContext {
         no_color: true,
@@ -172,6 +171,38 @@ fn draw(app: &App) -> String {
         .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn draw(app: &App) -> String {
+    screen_at(app, 100, 24)
+}
+
+/// One event with recorded per-message usage and a recorded API cost.
+fn usage_event(i: u64) -> Event {
+    let mut e = event(i, EventKind::AssistantMessage, "hello world");
+    e.usage = Some(UsageObservation {
+        model: None,
+        scope: UsageScope::Message,
+        categories: TokenCategories {
+            input: Some(1_200),
+            output: Some(340),
+            reasoning: Some(60),
+            total: Some(1_600),
+            ..TokenCategories::default()
+        },
+        accounting: TokenAccounting::default(),
+        request: None,
+        money: RecordedMoney {
+            reported_api: Some(MoneyFact {
+                usd: 0.0042,
+                source: MoneySource::ReportedApi,
+                as_of: None,
+            }),
+            ..RecordedMoney::default()
+        },
+        provenance: e.provenance.clone(),
+    });
+    e
 }
 
 fn source_request(app: &mut App) -> (u64, SourceLocator) {
@@ -203,13 +234,15 @@ fn shows_tool_arguments_output_and_oversized_markers() {
     assert_eq!(app.screen, Screen::Details);
     let out = draw(&app);
     for want in [
-        "Tool: shell",
+        "SHELL",
         "call-9",
-        "Status: Error",
-        "Duration: 2.5s",
+        "Error",
+        "2.5s",
         "Exit: 1",
-        "Input: cargo test --all",
-        "Output: 2 failed assertions",
+        "input (recorded preview)",
+        "cargo test --all",
+        "output (recorded preview)",
+        "2 failed assertions",
         "second line",
         "[truncated: showing 31 of 90000 bytes]",
     ] {
@@ -226,9 +259,296 @@ fn details_rendering_is_bounded_for_huge_previews() {
     open(&mut app, page(vec![e], vec![]));
     assert!(app.open_details());
     let out = draw(&app);
-    assert!(out.contains("Input: cargo test --all"));
+    assert!(out.contains("input (recorded preview)"));
+    assert!(out.contains("cargo test --all"));
     app.overlay_scroll(isize::MAX);
     assert!(draw(&app).contains("[display limited"), "marker at the end");
+}
+
+#[test]
+fn details_wraps_at_word_boundaries() {
+    let mut app = app();
+    let words = "alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima \
+                 mike november oscar papa quebec romeo sierra tango uniform victor whiskey";
+    let body = format!("- {words}");
+    open(
+        &mut app,
+        page(vec![event(0, EventKind::AssistantMessage, &body)], vec![]),
+    );
+    assert!(app.open_details());
+    let out = screen_at(&app, 100, 40);
+    for word in words.split_whitespace() {
+        assert!(
+            out.contains(word),
+            "word {word:?} was split across rows in:\n{out}"
+        );
+    }
+    assert!(out.contains("- alpha"), "the bullet is kept:\n{out}");
+    assert!(out.contains("whiskey"), "{out}");
+}
+
+#[test]
+fn details_side_column_at_wide_width() {
+    let mut app = app();
+    open(&mut app, page(vec![usage_event(0)], vec![]));
+    assert!(app.open_details());
+    let out = screen_at(&app, 130, 30);
+    for want in [
+        "USAGE (message)",
+        "1,600",
+        "input",
+        "output",
+        "reasoning",
+        "COST",
+        "$0.0042",
+        "reported",
+        "SOURCE",
+        "response_item",
+        "file offset",
+    ] {
+        assert!(out.contains(want), "missing {want:?} in:\n{out}");
+    }
+    let side = out
+        .lines()
+        .find(|line| line.contains("USAGE (message)"))
+        .expect("a side column");
+    assert_eq!(
+        side.find("USAGE (message)"),
+        Some(100),
+        "the side column starts after 100 content columns:\n{side}"
+    );
+    assert!(
+        side[..100].contains("reply (recorded preview)"),
+        "content and facts share the row:\n{side}"
+    );
+    assert!(out.contains("hello world"), "{out}");
+}
+
+#[test]
+fn details_stacks_below_110_columns() {
+    let mut app = app();
+    open(&mut app, page(vec![usage_event(0)], vec![]));
+    assert!(app.open_details());
+    let out = screen_at(&app, 109, 40);
+    let lines: Vec<&str> = out.lines().collect();
+    let content = lines
+        .iter()
+        .position(|line| line.contains("hello world"))
+        .expect("content");
+    let usage = lines
+        .iter()
+        .position(|line| line.contains("USAGE (message)"))
+        .expect("usage section");
+    assert!(content < usage, "facts stack below the content:\n{out}");
+    assert_eq!(
+        lines[usage].find("USAGE (message)"),
+        Some(2),
+        "a stacked section uses the full width after the margin:\n{}",
+        lines[usage]
+    );
+    for want in ["COST", "SOURCE"] {
+        assert!(out.contains(want), "missing {want:?} in:\n{out}");
+    }
+}
+
+#[test]
+fn bracket_keys_move_between_events_and_stop_at_edge() {
+    let mut app = app();
+    let mut first = page(
+        vec![
+            event(0, EventKind::AssistantMessage, "one"),
+            event(1, EventKind::AssistantMessage, "two"),
+            event(2, EventKind::AssistantMessage, "three"),
+        ],
+        vec![],
+    );
+    // The page is a window: content before its first event is not loaded.
+    first.has_more = true;
+    first.next = Some(PageAnchor {
+        timestamp: Some(NOW - 3_000_000),
+        source_order: 0,
+        stable_id: "e0".into(),
+    });
+    open(&mut app, first);
+    assert_eq!(app.transcript().unwrap().selected(), 2);
+    assert!(app.open_details());
+    assert!(draw(&app).contains("event 3 of 3 loaded"));
+
+    assert!(app.details_step(-1));
+    assert_eq!(app.transcript().unwrap().selected(), 1);
+    assert!(app.details_step(-1));
+    assert_eq!(app.transcript().unwrap().selected(), 0);
+    assert!(!app.details_step(-1), "stops at the loaded edge");
+    assert_eq!(app.transcript().unwrap().selected(), 0);
+    assert!(
+        draw(&app).contains("▲ older not loaded"),
+        "the existing edge hint:\n{}",
+        draw(&app)
+    );
+
+    // The keys move one event at a time and never load implicitly.
+    press_key(&mut app, crossterm::event::KeyCode::Char(']'));
+    assert_eq!(app.transcript().unwrap().selected(), 1);
+    press_key(&mut app, crossterm::event::KeyCode::Char(']'));
+    assert_eq!(app.transcript().unwrap().selected(), 2);
+    press_key(&mut app, crossterm::event::KeyCode::Char(']'));
+    assert_eq!(app.transcript().unwrap().selected(), 2);
+    assert!(
+        app.take_requests().is_empty(),
+        "the edge key does not page in more events"
+    );
+
+    // The keys belong to Details: the inspector selection is unchanged.
+    assert!(app.close_overlay());
+    let before = app.transcript().unwrap().selected();
+    press_key(&mut app, crossterm::event::KeyCode::Char('['));
+    press_key(&mut app, crossterm::event::KeyCode::Char(']'));
+    assert_eq!(app.transcript().unwrap().selected(), before);
+}
+
+#[test]
+fn tool_details_label_recorded_input_and_output_previews() {
+    let mut app = app();
+    open(&mut app, page(vec![tool_event(0)], vec![]));
+    assert!(app.open_details());
+    let out = screen_at(&app, 100, 40);
+    for want in [
+        "SHELL",
+        "input (recorded preview)",
+        "cargo test --all",
+        "output (recorded preview)",
+        "2 failed assertions",
+        "second line",
+        "[truncated: showing 31 of 90000 bytes]",
+        "Exit: 1",
+    ] {
+        assert!(out.contains(want), "missing {want:?} in:\n{out}");
+    }
+    assert!(
+        !out.to_lowercase().contains("full"),
+        "a bounded preview is never called full:\n{out}"
+    );
+}
+
+#[test]
+fn details_never_say_full() {
+    let mut app = app();
+    open(
+        &mut app,
+        page(
+            vec![
+                tool_event(0),
+                event(1, EventKind::Reasoning, "provider reasoning text"),
+            ],
+            vec![],
+        ),
+    );
+    assert!(app.open_details());
+    for step in [0, -1] {
+        let out = screen_at(&app, 100, 40);
+        assert!(
+            !out.to_lowercase().contains("full"),
+            "details never claim a bounded preview is full:\n{out}"
+        );
+        if step != 0 {
+            assert!(app.details_step(step));
+        }
+    }
+}
+
+#[test]
+fn details_badges_use_the_specified_vocabulary() {
+    let mut app = app();
+    open(
+        &mut app,
+        page(
+            vec![
+                event(0, EventKind::Lifecycle, "started"),
+                event(1, EventKind::Compaction, "compacted"),
+            ],
+            vec![],
+        ),
+    );
+    assert!(app.open_details());
+    let out = screen_at(&app, 100, 40);
+    let header = out.lines().next().unwrap();
+    assert!(header.contains("SYSTEM"), "{header}");
+    assert!(!header.contains("COMPACTION"), "{header}");
+
+    assert!(app.details_step(-1));
+    let out = screen_at(&app, 100, 40);
+    let header = out.lines().next().unwrap();
+    assert!(header.contains("SYSTEM"), "{header}");
+    assert!(!header.contains("LIFECYCLE"), "{header}");
+}
+
+#[test]
+fn details_show_recorded_cache_write_subcategories() {
+    let mut e = event(0, EventKind::AssistantMessage, "answer");
+    e.usage = Some(UsageObservation {
+        model: None,
+        scope: UsageScope::Message,
+        categories: TokenCategories {
+            cache_write_5m: Some(250),
+            cache_write_1h: Some(150),
+            total: Some(400),
+            ..TokenCategories::default()
+        },
+        accounting: TokenAccounting::default(),
+        request: None,
+        money: RecordedMoney::default(),
+        provenance: e.provenance.clone(),
+    });
+    let mut app = app();
+    open(&mut app, page(vec![e], vec![]));
+    assert!(app.open_details());
+    let out = screen_at(&app, 130, 40);
+    for want in ["cache write 5m", "cache write 1h", "250", "150"] {
+        assert!(out.contains(want), "missing {want:?} in:\n{out}");
+    }
+    assert!(
+        !out.contains("categories not recorded"),
+        "recorded subcategories are not lost:\n{out}"
+    );
+}
+
+#[test]
+fn details_wide_side_facts_scroll_into_view() {
+    let mut event = usage_event(0);
+    let categories = &mut event.usage.as_mut().unwrap().categories;
+    categories.cached_input = Some(800);
+    categories.cache_write = Some(400);
+    categories.cache_write_5m = Some(250);
+    categories.cache_write_1h = Some(150);
+    categories.cache_read = Some(900);
+    let mut app = app();
+    open(&mut app, page(vec![event], vec![]));
+    assert!(app.open_details());
+    let before = screen_at(&app, 130, 20);
+    assert!(
+        !before.contains("redacted preview"),
+        "the side facts overflow this body:\n{before}"
+    );
+    app.overlay_scroll(isize::MAX);
+    let after = screen_at(&app, 130, 20);
+    assert!(after.contains("SOURCE"), "{after}");
+    assert!(after.contains("redacted preview"), "{after}");
+}
+
+#[test]
+fn details_bound_deep_hanging_indentation() {
+    let mut app = app();
+    let body = format!("{}deeply indented text stays visible", " ".repeat(100));
+    open(
+        &mut app,
+        page(vec![event(0, EventKind::AssistantMessage, &body)], vec![]),
+    );
+    assert!(app.open_details());
+    let out = screen_at(&app, 100, 40);
+    assert!(
+        out.contains("deeply indented text stays visible"),
+        "oversized indentation must not hide the text:\n{out}"
+    );
 }
 
 #[test]
