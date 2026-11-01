@@ -316,12 +316,18 @@ fn expands_a_tool_row_and_shows_status_duration_exit_and_truncation() {
     });
     open(&mut app, page(vec![msg(0), tool], None, false));
 
+    // The latest row opens expanded; collapsing it hides the details without
+    // recording a manual expansion.
+    let expanded = draw(&app, 110, 30);
+    assert!(expanded.contains("shell cargo test --all"), "{expanded}");
+    assert!(expanded.contains("[collapse]"), "{expanded}");
+    assert!(expanded.contains("Duration: 1.2s"), "{expanded}");
+
+    app.inspector_toggle();
     let collapsed = draw(&app, 110, 30);
-    assert!(collapsed.contains("shell cargo test --all"), "{collapsed}");
     assert!(collapsed.contains("[expand]"), "{collapsed}");
     assert!(!collapsed.contains("Duration:"), "{collapsed}");
 
-    app.inspector_move(1);
     app.inspector_toggle();
     let out = draw(&app, 110, 30);
     for want in [
@@ -523,12 +529,14 @@ fn loading_older_history_keeps_the_unread_count() {
     let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
         panic!("expected CountAfter, got {requests:?}");
     };
-    assert!(app.apply_events_after(*request_id, 42));
-    assert_eq!(app.new_event_count(), 3);
-
+    // The reader scrolls off the newest row before the count lands, so the
+    // arrival only raises the count instead of pulling the newest page in.
     app.inspector_move(isize::MIN);
     let (older_id, _, direction) = load_page(&app.take_requests());
     assert_eq!(direction, PageDirection::Backward);
+    assert!(app.apply_events_after(*request_id, 42));
+    assert_eq!(app.new_event_count(), 3);
+
     assert!(app.apply_transcript(older_id, backward_page(0..20, false)));
     assert_eq!(
         app.new_event_count(),
@@ -656,6 +664,353 @@ fn a_reload_beyond_the_window_cap_is_visible_and_retry_jumps_to_the_tail() {
     let t = app.transcript().unwrap();
     assert!(t.failed().is_none() && !t.reload_capped());
     assert_eq!(t.selected_event().unwrap().id, "e39999");
+}
+
+#[test]
+fn opening_expands_latest_row() {
+    let mut app = app_with(summary(3));
+    open(&mut app, backward_page(0..3, false));
+
+    let t = app.transcript().unwrap();
+    assert_eq!(t.selected_event().unwrap().id, "e2", "opens on the newest");
+    assert!(t.following());
+    assert!(t.is_expanded(&t.events()[2]), "the latest row is expanded");
+    assert!(!t.is_expanded(&t.events()[0]));
+    assert!(!t.is_expanded(&t.events()[1]));
+}
+
+#[test]
+fn new_events_while_following_reload_tail_and_move_expansion() {
+    let mut app = app_with(summary(3));
+    open(&mut app, backward_page(0..3, false));
+
+    app.apply_roster(vec![summary(5)], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    // The count alone pulls the newest page in: no `G` keypress.
+    assert!(app.apply_events_after(*request_id, 4));
+    let (id, from, direction) = load_page(&app.take_requests());
+    assert_eq!((from, direction), (None, PageDirection::Backward));
+    assert!(app.apply_transcript(id, backward_page(2..5, false)));
+
+    let t = app.transcript().unwrap();
+    assert_eq!(t.selected_event().unwrap().id, "e4", "lands on the newest");
+    assert!(t.following());
+    assert!(
+        t.is_expanded(&t.events()[2]),
+        "the new latest row is expanded"
+    );
+    assert!(!t.is_expanded(&t.events()[0]), "the old one collapses");
+    assert_eq!(app.new_event_count(), 0);
+}
+
+#[test]
+fn moving_up_stops_following() {
+    let mut app = app_with(summary(3));
+    open(&mut app, backward_page(0..3, false));
+    assert!(app.transcript().unwrap().following());
+
+    app.inspector_move(-1);
+    let t = app.transcript().unwrap();
+    assert!(!t.following());
+    assert_eq!(t.selected_event().unwrap().id, "e1");
+
+    // An arrival only raises the count once the reader has scrolled away.
+    app.apply_roster(vec![summary(5)], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert!(app.apply_events_after(*request_id, 4));
+    assert!(page_requests(&app.take_requests()).is_empty());
+    assert_eq!(app.new_event_count(), 2);
+
+    // Moving back onto the newest row follows again.
+    app.inspector_move(1);
+    assert!(app.transcript().unwrap().following());
+}
+
+#[test]
+fn manual_collapse_of_latest_sticks_until_next_append() {
+    let mut app = app_with(summary(3));
+    open(&mut app, backward_page(0..3, false));
+    app.inspector_toggle();
+    let t = app.transcript().unwrap();
+    assert!(!t.is_expanded(&t.events()[2]), "collapsed by hand");
+    assert!(t.following(), "collapsing does not stop following");
+
+    // Moving within the newest row does not expand it again.
+    app.inspector_move(0);
+    let t = app.transcript().unwrap();
+    assert!(!t.is_expanded(&t.events()[2]));
+
+    // The next append expands the new latest row, not the collapsed one.
+    app.apply_roster(vec![summary(4)], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert!(app.apply_events_after(*request_id, 3));
+    let (id, _, _) = load_page(&app.take_requests());
+    assert!(app.apply_transcript(id, backward_page(2..4, false)));
+
+    let t = app.transcript().unwrap();
+    assert_eq!(t.selected_event().unwrap().id, "e3");
+    assert!(
+        t.is_expanded(&t.events()[1]),
+        "the new latest row is expanded"
+    );
+    assert!(
+        !t.is_expanded(&t.events()[0]),
+        "the collapsed row stays shut"
+    );
+}
+
+#[test]
+fn reload_keeps_follow_state() {
+    let mut app = app_with(summary(3));
+    open(&mut app, backward_page(0..3, false));
+
+    app.invalidate_transcript(&key());
+    let (id, from, direction) = load_page(&app.take_requests());
+    assert_eq!((from, direction), (None, PageDirection::Backward));
+    let mut page = backward_page(0..3, false);
+    page.events[2].text = Some(text("CHANGED"));
+    assert!(app.apply_transcript(id, page));
+    let t = app.transcript().unwrap();
+    assert!(t.following());
+    assert_eq!(t.selected_event().unwrap().id, "e2", "the position is kept");
+    assert!(t.is_expanded(&t.events()[2]));
+    assert_eq!(
+        t.selected_event().unwrap().text.as_ref().unwrap().preview,
+        "CHANGED"
+    );
+
+    // A reload that reaches the tail while following lands on the newest row but
+    // leaves the automatic expansion where it was (only an append moves it).
+    app.invalidate_transcript(&key());
+    let (id, from, direction) = load_page(&app.take_requests());
+    assert_eq!((from, direction), (None, PageDirection::Backward));
+    assert!(app.apply_transcript(id, backward_page(2..5, false)));
+    let t = app.transcript().unwrap();
+    assert!(t.following());
+    assert_eq!(t.selected_event().unwrap().id, "e4");
+    assert!(
+        t.is_expanded(&t.events()[0]),
+        "the automatic expansion stays on the row it named (e2)"
+    );
+    assert!(
+        !t.is_expanded(&t.events()[2]),
+        "the reload adds no expansion"
+    );
+}
+
+#[test]
+fn manual_collapse_of_latest_survives_an_unchanged_reload() {
+    let mut app = app_with(summary(3));
+    open(&mut app, backward_page(0..3, false));
+    app.inspector_toggle();
+    assert!(
+        !app.transcript()
+            .unwrap()
+            .is_expanded(&app.transcript().unwrap().events()[2])
+    );
+
+    app.invalidate_transcript(&key());
+    let (id, from, direction) = load_page(&app.take_requests());
+    assert_eq!((from, direction), (None, PageDirection::Backward));
+    assert!(app.apply_transcript(id, backward_page(0..3, false)));
+    let t = app.transcript().unwrap();
+    assert!(t.following(), "the reload keeps following");
+    assert_eq!(t.selected_event().unwrap().id, "e2");
+    assert!(
+        !t.is_expanded(&t.events()[2]),
+        "an ordinary reload preserves the manual collapse"
+    );
+}
+
+#[test]
+fn a_count_during_a_page_load_is_fetched_once_that_load_settles() {
+    let mut app = app_with(summary(60));
+    // A short tail window still has older history: opening it requests the older
+    // page automatically while following.
+    open(&mut app, backward_page(57..60, true));
+    let (older_id, from, direction) = load_page(&app.take_requests());
+    assert_eq!(
+        (from, direction),
+        (Some(anchor(57)), PageDirection::Backward)
+    );
+
+    // Two events are appended while that page is in flight.
+    app.apply_roster(vec![summary(62)], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert!(app.apply_events_after(*request_id, 4));
+    assert!(
+        page_requests(&app.take_requests()).is_empty(),
+        "no page load while another is in flight"
+    );
+
+    // The older page lands: the arrivals were not loaded, so the count stays
+    // and the owed newest page is requested as soon as the load settles.
+    assert!(app.apply_transcript(older_id, backward_page(20..57, true)));
+    let t = app.transcript().unwrap();
+    assert!(t.following());
+    assert_eq!(
+        t.selected_event().unwrap().id,
+        "e59",
+        "still on the newest row"
+    );
+    assert_eq!(app.new_event_count(), 2, "the arrivals were not loaded");
+    let (tail_id, from, direction) = load_page(&app.take_requests());
+    assert_eq!((from, direction), (None, PageDirection::Backward));
+
+    // The newest page arrives: the arrivals are on screen and the new latest
+    // row is expanded.
+    assert!(app.apply_transcript(tail_id, backward_page(22..62, true)));
+    let t = app.transcript().unwrap();
+    assert_eq!(t.selected_event().unwrap().id, "e61");
+    assert!(t.following());
+    assert!(t.is_expanded(&t.events()[39]));
+    assert_eq!(app.new_event_count(), 0);
+}
+
+#[test]
+fn a_failed_page_load_still_fetches_the_owed_newest_page() {
+    let mut app = app_with(summary(60));
+    open(&mut app, backward_page(57..60, true));
+    let (older_id, _, _) = load_page(&app.take_requests());
+
+    // Two events are appended while the older page is in flight.
+    app.apply_roster(vec![summary(62)], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert!(app.apply_events_after(*request_id, 4));
+    assert!(page_requests(&app.take_requests()).is_empty());
+
+    // The older page fails: the catch-up is still owed, so the newest page is
+    // read now instead of waiting for another arrival or a keypress.
+    app.transcript_load_failed(older_id);
+    assert_eq!(app.new_event_count(), 2, "the arrivals are still unread");
+    let (tail_id, from, direction) = load_page(&app.take_requests());
+    assert_eq!((from, direction), (None, PageDirection::Backward));
+    assert!(app.apply_transcript(tail_id, backward_page(22..62, true)));
+    let t = app.transcript().unwrap();
+    assert!(t.failed().is_none());
+    assert_eq!(t.selected_event().unwrap().id, "e61");
+    assert!(t.is_expanded(&t.events()[39]));
+    assert_eq!(app.new_event_count(), 0);
+}
+
+#[test]
+fn restart_keeps_following_on_the_new_latest_row() {
+    let mut app = app_with(summary(3));
+    open(&mut app, backward_page(0..3, false));
+    assert!(app.transcript().unwrap().following());
+
+    app.restart_transcript();
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+        panic!("expected Select after restart, got {requests:?}");
+    };
+    // An event arrived while the worker was replaced.
+    assert!(app.apply_transcript(*request_id, backward_page(1..4, false)));
+    let t = app.transcript().unwrap();
+    assert!(t.following(), "a follower keeps following across a restart");
+    assert_eq!(t.selected_event().unwrap().id, "e3");
+    assert!(
+        t.is_expanded(&t.events()[2]),
+        "the new latest row is expanded"
+    );
+}
+
+#[test]
+fn search_navigation_updates_follow_state() {
+    let mut app = app_with(summary(3));
+    let events = vec![
+        event(0, EventKind::UserPrompt, "NEEDLE one"),
+        msg(1),
+        event(2, EventKind::AssistantMessage, "NEEDLE two"),
+    ];
+    open(&mut app, page(events, Some(anchor(0)), false));
+    assert!(app.transcript().unwrap().following());
+
+    // The search starts on the newest row and its first match keeps following.
+    assert!(app.begin_search());
+    for c in "NEEDLE".chars() {
+        app.search_push(c);
+    }
+    assert_eq!(app.transcript().unwrap().selected_event().unwrap().id, "e2");
+    assert!(app.transcript().unwrap().following());
+
+    // Stepping to an older match stops following, so an arrival is only
+    // counted instead of pulling the newest page in.
+    app.search_step(false);
+    assert_eq!(app.transcript().unwrap().selected_event().unwrap().id, "e0");
+    assert!(!app.transcript().unwrap().following());
+    app.search_commit();
+    app.apply_roster(vec![summary(5)], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert!(app.apply_events_after(*request_id, 4));
+    assert!(page_requests(&app.take_requests()).is_empty());
+    assert_eq!(app.new_event_count(), 2);
+
+    // Searching forward wraps onto the newest row and follows again.
+    app.search_step(true);
+    assert_eq!(app.transcript().unwrap().selected_event().unwrap().id, "e2");
+    assert!(app.transcript().unwrap().following());
+}
+
+#[test]
+fn moves_skip_folded_events() {
+    let events = vec![
+        event(0, EventKind::UserPrompt, "go"),
+        auxiliary(1, "title"),
+        auxiliary(2, "title"),
+        auxiliary(3, "title"),
+        msg(4),
+        auxiliary(5, "title"),
+        auxiliary(6, "title"),
+    ];
+    let mut app = app_with(summary(7));
+    open(&mut app, page(events, None, false));
+
+    let t = app.transcript().unwrap();
+    assert_eq!(t.selected(), 5, "the latest row starts at its first event");
+    assert!(t.following());
+    assert!(t.is_expanded(&t.events()[5]));
+    assert!(!t.is_expanded(&t.events()[6]), "only the row's first event");
+
+    app.inspector_move(-1);
+    assert_eq!(app.transcript().unwrap().selected(), 4);
+    app.inspector_move(-1);
+    assert_eq!(
+        app.transcript().unwrap().selected(),
+        1,
+        "a folded run is one row"
+    );
+    app.inspector_move(-1);
+    assert_eq!(app.transcript().unwrap().selected(), 0);
+    app.inspector_move(-1);
+    assert_eq!(app.transcript().unwrap().selected(), 0, "clamped");
+    assert!(!app.transcript().unwrap().following());
+
+    app.inspector_move(1);
+    assert_eq!(app.transcript().unwrap().selected(), 1);
+    app.inspector_move(1);
+    assert_eq!(app.transcript().unwrap().selected(), 4);
+    app.inspector_move(1);
+    assert_eq!(app.transcript().unwrap().selected(), 5);
+    assert!(app.transcript().unwrap().following());
 }
 
 fn tail_at_60() -> App {

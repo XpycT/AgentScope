@@ -301,6 +301,92 @@ fn live_append_updates_roster_and_counts_new_events_without_auto_scroll() {
 }
 
 #[test]
+fn following_a_live_transcript_pulls_the_newest_page_in() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    apply_worker_event(&mut app, &mut ctx, roster(60, 600, 3));
+    assert_eq!(app.selected_key(), Some(codex_key()));
+    press(&mut app, KeyCode::Enter);
+    let requests = app.take_requests();
+    let Some(WorkerRequest::Select { request_id, .. }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::Select { .. }))
+    else {
+        panic!("expected Select, got {requests:?}");
+    };
+    apply_worker_event(
+        &mut app,
+        &mut ctx,
+        WorkerEvent::Transcript {
+            request_id: *request_id,
+            page: page(&["first", "second", "third"], anchor(0)),
+        },
+    );
+    assert!(
+        app.transcript().unwrap().following(),
+        "opening follows the tail"
+    );
+
+    // Two events are appended. Following pulls the newest page in on its own:
+    // the count is not left as an `N new` badge.
+    apply_worker_event(
+        &mut app,
+        &mut ctx,
+        roster_generation(2, 5, 600, 5, vec![], true),
+    );
+    let requests = app.take_requests();
+    let Some(WorkerRequest::CountAfter { request_id, .. }) = requests
+        .iter()
+        .find(|r| matches!(r, WorkerRequest::CountAfter { .. }))
+    else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    apply_worker_event(
+        &mut app,
+        &mut ctx,
+        WorkerEvent::EventsAfter {
+            request_id: *request_id,
+            count: 4,
+        },
+    );
+    let requests = app.take_requests();
+    let pages: Vec<WorkerRequest> = requests
+        .iter()
+        .filter(|r| matches!(r, WorkerRequest::LoadPage { .. }))
+        .cloned()
+        .collect();
+    let [
+        WorkerRequest::LoadPage {
+            request_id,
+            anchor: page_anchor,
+            direction,
+            ..
+        },
+    ] = pages.as_slice()
+    else {
+        panic!("expected the newest page, got {requests:?}");
+    };
+    assert_eq!((page_anchor, direction), (&None, &PageDirection::Backward));
+    apply_worker_event(
+        &mut app,
+        &mut ctx,
+        WorkerEvent::Transcript {
+            request_id: *request_id,
+            page: page(&["first", "second", "third", "fourth", "fifth"], anchor(0)),
+        },
+    );
+
+    let t = app.transcript().unwrap();
+    assert_eq!(t.events().len(), 5);
+    assert_eq!(t.selected_event().unwrap().id, "e4");
+    assert!(t.following());
+    assert!(t.is_expanded(t.selected_event().unwrap()));
+    assert!(!t.is_expanded(&t.events()[2]), "the old latest collapses");
+    assert_eq!(app.new_event_count(), 0);
+    assert!(draw(&app, &ctx, 110, 30).contains("fifth"));
+}
+
+#[test]
 fn roster_selection_follows_its_key_when_live_updates_reorder_rows() {
     let mut app = new_app();
     let mut ctx = ctx();

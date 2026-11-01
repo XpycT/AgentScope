@@ -1079,11 +1079,29 @@ impl App {
         applied
     }
 
-    /// Apply a worker count of events after the newest loaded one.
+    /// Apply a worker count of events after the newest loaded one. While the
+    /// reader is following, an arrival pulls the newest page in (`G` without the
+    /// keypress); otherwise it only raises the `N new` count.
     pub fn apply_events_after(&mut self, request_id: u64, count: usize) -> bool {
-        self.transcript
-            .as_mut()
-            .is_some_and(|t| t.apply_count(request_id, count))
+        let Some(t) = self.transcript.as_mut() else {
+            return false;
+        };
+        if !t.apply_count(request_id, count) {
+            return false;
+        }
+        if count > 0 && t.following() {
+            if t.loading().is_none() {
+                let id = self.request_seq + 1;
+                self.request_seq = id;
+                let request = t.tail_request(id);
+                self.outbox.push(request);
+            } else {
+                // The load in flight settles first; `pump_transcript` then reads
+                // the newest page without waiting for another count.
+                t.owe_tail_refresh();
+            }
+        }
+        true
     }
 
     /// A page or count request failed for good. Only the matching in-flight
@@ -1093,6 +1111,16 @@ impl App {
             t.fail_request(request_id);
         }
         self.fail_source(request_id);
+        // A failed page load must not strand a following reader's catch-up: once
+        // it settles, the owed newest page is read without waiting for another
+        // arrival. A plain edge-load failure still waits for `r`.
+        if self
+            .transcript
+            .as_ref()
+            .is_some_and(|t| t.tail_refresh_owed() && t.loading().is_none())
+        {
+            self.pump_transcript();
+        }
     }
 
     /// `r` in the inspector: retry a failed load.
@@ -1176,14 +1204,21 @@ impl App {
         self.outbox.push(request);
     }
 
-    /// Queue the next edge page when the selection is near the window edge.
+    /// Queue the next load: the newest page a following reader owes, else the
+    /// next edge page when the selection is near the window edge.
     fn pump_transcript(&mut self) {
         let id = self.request_seq + 1;
-        if let Some(t) = &mut self.transcript
-            && let Some(request) = t.next_load(id)
-        {
-            self.request_seq = id;
-            self.outbox.push(request);
+        if let Some(t) = &mut self.transcript {
+            if t.tail_refresh_owed() && t.loading().is_none() {
+                let request = t.tail_request(id);
+                self.request_seq = id;
+                self.outbox.push(request);
+                return;
+            }
+            if let Some(request) = t.next_load(id) {
+                self.request_seq = id;
+                self.outbox.push(request);
+            }
         }
     }
 

@@ -17,6 +17,7 @@ use crate::domain::{
 use crate::worker::WorkerRequest;
 
 use super::search::TranscriptSearch;
+use super::turns::turn_rows;
 
 /// Most events kept loaded; farther pages are dropped (spec §10.3). The worker
 /// also never requests a page larger than this.
@@ -104,6 +105,17 @@ pub struct Transcript {
     /// The last load failed for good; `r` retries it.
     failed: Option<PageKind>,
     expanded: HashSet<String>,
+    /// The latest row's event, expanded automatically while following. Dismissed
+    /// by the reader's own toggle; never mixed into `expanded`. Only an opening
+    /// at the tail, explicit tail navigation or an append moves it.
+    auto_expanded: Option<String>,
+    /// The reading position follows the newest row: set by a tail page, an
+    /// append that reaches the newest end, or a selection landing on the last
+    /// row of a window that reaches the tail; cleared by leaving that row.
+    follow: bool,
+    /// A positive count arrived while following but another load was in flight:
+    /// the newest page still has to be re-read once that load settles.
+    tail_owed: bool,
     /// Events counted after the newest observed event (`N new`).
     new_events: usize,
     /// Newest-observed boundary: an anchor and how many events were already
@@ -144,6 +156,9 @@ impl Transcript {
             reload: None,
             failed: None,
             expanded: HashSet::new(),
+            auto_expanded: None,
+            follow: false,
+            tail_owed: false,
             new_events: 0,
             mark: None,
             count_pending: None,
@@ -175,8 +190,19 @@ impl Transcript {
         self.events.get(self.selected)
     }
 
+    /// Whether the row for `event` is expanded: by the reader, or because it is
+    /// the latest row while following.
     pub fn is_expanded(&self, event: &Event) -> bool {
-        self.expanded.contains(&event.id)
+        self.auto_expanded.as_deref() == Some(event.id.as_str())
+            || self.expanded.contains(&event.id)
+    }
+
+    /// The reading position follows the newest row: set by a tail page or by
+    /// landing on the last row of a window that reaches the tail, cleared by
+    /// moving off that row. Only while following does an arrival pull the newest
+    /// page in on its own.
+    pub fn following(&self) -> bool {
+        self.follow
     }
 
     /// Diagnostics for the loaded chunks, in window order.
@@ -241,13 +267,22 @@ impl Transcript {
         self.new_events
     }
 
-    /// Carry user-visible state (expansion) and the reading position over to a
-    /// replacement transcript. The event identity is resolved after the newest
-    /// page arrives; when it moved beyond the window it is chased backward.
+    /// Carry user-visible state (expansion, follow) and the reading position
+    /// over to a replacement transcript. The event identity is resolved after
+    /// the newest page arrives; when it moved beyond the window it is chased
+    /// backward.
     pub(super) fn carry_over(&mut self, previous: &Transcript) {
         self.expanded = previous.expanded.clone();
+        self.auto_expanded = previous.auto_expanded.clone();
+        self.follow = previous.follow;
         self.search.set_query(previous.search.query());
-        self.resume = previous.selected_event().map(|e| e.id.clone());
+        // A follower wants the new newest row, not the old anchor: only a reader
+        // who was reading history resumes a position.
+        self.resume = if previous.follow {
+            None
+        } else {
+            previous.selected_event().map(|e| e.id.clone())
+        };
         self.resume_scanned = 0;
     }
 
@@ -304,6 +339,7 @@ impl Transcript {
     pub(super) fn select_index(&mut self, index: usize) {
         if !self.events.is_empty() {
             self.selected = index.min(self.events.len() - 1);
+            self.settle_selection();
         }
     }
 
@@ -311,6 +347,10 @@ impl Transcript {
         self.pending = Some(Pending { request_id, kind });
         self.failed = None;
         self.reload_capped = false;
+        if kind == PageKind::Tail {
+            // The newest page is being loaded: a deferred catch-up is met.
+            self.tail_owed = false;
+        }
         if kind != PageKind::Reload {
             self.reload = None;
         }
@@ -582,32 +622,101 @@ impl Transcript {
         }
     }
 
+    /// Move by visible rows, so folded runs are skipped: the selection becomes
+    /// the target row's first event.
     pub fn move_selection(&mut self, delta: isize) {
-        if self.events.is_empty() {
+        let rows = turn_rows(&self.events);
+        let Some(current) = rows
+            .iter()
+            .position(|row| row.first <= self.selected && self.selected <= row.last)
+        else {
             return;
-        }
-        let last = self.events.len() as isize - 1;
-        self.selected = (self.selected as isize)
-            .saturating_add(delta)
-            .clamp(0, last) as usize;
+        };
+        let last = rows.len() as isize - 1;
+        let target = (current as isize).saturating_add(delta).clamp(0, last) as usize;
+        self.selected = rows[target].first;
+        self.settle_selection();
     }
 
     pub fn select_first(&mut self) {
         self.selected = 0;
+        self.settle_selection();
     }
 
     pub fn select_last(&mut self) {
-        self.selected = self.events.len().saturating_sub(1);
+        if let Some(first) = self.last_row_first() {
+            self.selected = first;
+        }
+        self.settle_selection();
     }
 
-    /// Expand or collapse the selected row.
+    /// Expand or collapse the selected row. Collapsing the row that follow mode
+    /// expanded dismisses only that automatic expansion: the row is not recorded
+    /// as manually expanded, so the next append expands the new latest row.
     pub fn toggle_selected(&mut self) {
         let Some(event) = self.events.get(self.selected) else {
             return;
         };
+        if self.auto_expanded.as_deref() == Some(event.id.as_str()) {
+            self.auto_expanded = None;
+            return;
+        }
         if !self.expanded.remove(&event.id) {
             self.expanded.insert(event.id.clone());
         }
+    }
+
+    /// First event index of the last visible row, folded runs included.
+    fn last_row_first(&self) -> Option<usize> {
+        turn_rows(&self.events).last().map(|row| row.first)
+    }
+
+    /// Whether the selection sits inside the last visible row.
+    fn on_last_row(&self) -> bool {
+        turn_rows(&self.events)
+            .last()
+            .is_some_and(|row| row.first <= self.selected && self.selected <= row.last)
+    }
+
+    /// Record a user selection change (movement or a search jump): following
+    /// means the selection sits in the last row of a window that reaches the
+    /// tail. Leaving that row also cancels a catch-up the reader no longer
+    /// wants.
+    fn settle_selection(&mut self) {
+        self.follow = self.newer.is_none() && self.on_last_row();
+        if !self.follow {
+            self.tail_owed = false;
+        }
+    }
+
+    /// Put a following reader on the newest row after the newest end was loaded.
+    fn land_on_newest(&mut self) {
+        let Some(first) = self.last_row_first() else {
+            return;
+        };
+        self.selected = first;
+        self.follow = true;
+    }
+
+    /// Expand the latest row unless the reader expanded it by hand.
+    fn expand_latest(&mut self, first: usize) {
+        let Some(id) = self.events.get(first).map(|e| e.id.clone()) else {
+            return;
+        };
+        if !self.expanded.contains(&id) {
+            self.auto_expanded = Some(id);
+        }
+    }
+
+    /// Whether the newest page still has to be read because an arrival was
+    /// counted while another load was in flight.
+    pub(super) fn tail_refresh_owed(&self) -> bool {
+        self.tail_owed
+    }
+
+    /// Record that an arrival counted while following could not be fetched yet.
+    pub(super) fn owe_tail_refresh(&mut self) {
+        self.tail_owed = true;
     }
 
     /// The newest end was just (re)loaded: nothing is unread, any count in
@@ -660,17 +769,33 @@ impl Transcript {
                 self.replace(page, PageDirection::Backward);
                 self.older = continuation;
                 self.newer = None;
-                self.selected = self.events.len().saturating_sub(1);
+                self.tail_owed = false;
+                self.selected = self.last_row_first().unwrap_or(0);
+                self.follow = true;
                 self.newest_refreshed();
                 self.resume_selection();
+                if self.resume.is_some() || !self.on_last_row() {
+                    // A restarted transcript is still walking back to the
+                    // reading position it carried over.
+                    self.follow = false;
+                } else {
+                    self.expand_latest(self.selected);
+                }
             }
             PageKind::Newer => {
                 self.append(page);
                 self.newer = continuation;
-                if self.newer.is_none() {
-                    self.newest_refreshed();
-                }
                 self.drop_front();
+                if self.newer.is_none() {
+                    // The append reached the newest end: the arrivals are on
+                    // screen, and a following reader lands on the newest row.
+                    self.tail_owed = false;
+                    self.newest_refreshed();
+                    if self.follow {
+                        self.land_on_newest();
+                        self.expand_latest(self.selected);
+                    }
+                }
             }
             PageKind::Older => {
                 if self.resume.is_some() {
@@ -682,7 +807,19 @@ impl Transcript {
                     self.resume_selection();
                 }
             }
-            PageKind::Reload => self.apply_reload(page, continuation),
+            PageKind::Reload => {
+                self.apply_reload(page, continuation);
+                if self.newer.is_none() {
+                    // The reload re-read the newest end: a pending catch-up is
+                    // met, and a follower lands on the newest row. The automatic
+                    // expansion is preserved as it was.
+                    self.tail_owed = false;
+                    if self.follow {
+                        self.newest_refreshed();
+                        self.land_on_newest();
+                    }
+                }
+            }
         }
         true
     }
@@ -693,10 +830,16 @@ impl Transcript {
         self.newer = continuation;
         self.selected = 0;
         if self.newer.is_none() {
+            // The page already ends at the tail: open on its newest row.
+            self.tail_owed = false;
+            self.follow = true;
+            self.selected = self.last_row_first().unwrap_or(0);
             self.newest_refreshed();
+            self.expand_latest(self.selected);
         } else {
             // Opened away from the tail: the newest observed event is the
             // window end; a baseline count (below) discounts later history.
+            self.follow = false;
             self.new_events = 0;
             self.count_pending = None;
             self.mark = self.newer.clone().map(|a| (a, 0));

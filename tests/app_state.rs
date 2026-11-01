@@ -1526,9 +1526,10 @@ fn restart_anchor_recovery_is_bounded_by_the_window_cap() {
         panic!("expected Select, got {requests:?}");
     };
     // The reading anchor is an event the re-read history no longer contains.
-    let mut old = backward_page(&k, 1_000_000..1_000_001, false);
+    let mut old = backward_page(&k, 1_000_000..1_000_002, false);
     old.next = Some(anchor_of(&old.events[0]));
     assert!(app.apply_transcript(*request_id, old));
+    app.inspector_move(-1); // reading history, not following the tail
     app.restart_transcript();
     let requests = app.take_requests();
     let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
