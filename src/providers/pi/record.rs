@@ -140,6 +140,26 @@ impl PiRole {
     }
 }
 
+/// The prompt occupancy one assistant call recorded: the additive prompt categories
+/// (`input` + `cacheRead` + `cacheWrite`) that call sent. It is a snapshot of one
+/// request, never live occupancy or a lifetime figure.
+#[derive(Clone, PartialEq)]
+pub struct PiPrompt {
+    pub used: u64,
+    pub recorded_at: Option<Timestamp>,
+    pub model: Option<ModelDetail>,
+}
+
+impl fmt::Debug for PiPrompt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PiPrompt")
+            .field("used", &self.used)
+            .field("recorded_at", &self.recorded_at)
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
 /// The payload of one supported record. Message bodies, summaries, tool output and
 /// extension data are never retained here; only the facts an index/accounting fold
 /// needs, which are re-read from the source for display.
@@ -151,6 +171,8 @@ pub enum PiEntryKind {
         usage: bool,
         /// Confirmed provider response identity, when recorded.
         response_id: Option<String>,
+        /// Prompt categories of an assistant call, when all of them were recorded.
+        prompt: Option<PiPrompt>,
     },
     ModelChange {
         provider: String,
@@ -198,11 +220,13 @@ impl fmt::Debug for PiEntryKind {
                 role,
                 usage,
                 response_id,
+                prompt,
             } => f
                 .debug_struct("Message")
                 .field("role", role)
                 .field("usage", usage)
                 .field("response_id", &response_id.is_some())
+                .field("prompt", &prompt.is_some())
                 .finish(),
             Self::ModelChange { .. } => named(f, "ModelChange"),
             Self::ThinkingLevelChange { .. } => named(f, "ThinkingLevelChange"),
@@ -321,10 +345,27 @@ pub fn parse_entry(value: &Value, ordinal: u64, offset: u64) -> Result<PiEntry, 
                 .get("role")
                 .and_then(Value::as_str)
                 .ok_or(PiRecordError::Malformed)?;
+            let role = PiRole::parse(role);
+            let usage = usage_present(message, "usage")?;
+            let prompt = if role == PiRole::Assistant && usage {
+                message
+                    .get("usage")
+                    .and_then(Value::as_object)
+                    .and_then(|usage| {
+                        prompt_tokens(&categories(usage)).map(|used| PiPrompt {
+                            used,
+                            recorded_at: timestamp,
+                            model: assistant_model(message, None),
+                        })
+                    })
+            } else {
+                None
+            };
             PiEntryKind::Message {
-                role: PiRole::parse(role),
-                usage: usage_present(message, "usage")?,
+                role,
+                usage,
                 response_id: optional_string(message, "responseId", ID_MAX),
+                prompt,
             }
         }
         "model_change" => PiEntryKind::ModelChange {
@@ -409,6 +450,15 @@ pub fn additive_total(categories: &TokenCategories) -> Option<u64> {
     categories
         .input?
         .checked_add(categories.output?)?
+        .checked_add(categories.cache_read?)?
+        .checked_add(categories.cache_write?)
+}
+
+/// The prompt a request sent: additive `input` + `cacheRead` + `cacheWrite`. Any
+/// missing counter leaves the snapshot Unknown; there is no total fallback.
+pub fn prompt_tokens(categories: &TokenCategories) -> Option<u64> {
+    categories
+        .input?
         .checked_add(categories.cache_read?)?
         .checked_add(categories.cache_write?)
 }
@@ -544,6 +594,38 @@ fn millis(value: Option<&Value>) -> Option<f64> {
     value?
         .as_f64()
         .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+/// The model identity an assistant message proves. `responseModel` refines the
+/// requested `model`; `providerThinkingLevel` is the only effective effort Pi
+/// records, and `thinkingLevel`/the branch setting is the configured level.
+pub fn assistant_model(message: &Map<String, Value>, level: Option<&str>) -> Option<ModelDetail> {
+    let id = message
+        .get("responseModel")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .or_else(|| message.get("model").and_then(Value::as_str))
+        .filter(|model| !model.is_empty() && model.len() <= TEXT_MAX)?;
+    Some(ModelDetail {
+        id: id.to_owned(),
+        provider: message
+            .get("provider")
+            .and_then(Value::as_str)
+            .filter(|provider| !provider.is_empty() && provider.len() <= TEXT_MAX)
+            .map(str::to_owned),
+        variant: None,
+        effort: message
+            .get("providerThinkingLevel")
+            .and_then(Value::as_str)
+            .filter(|effort| !effort.is_empty() && effort.len() <= TEXT_MAX)
+            .map(str::to_owned),
+        configured_effort: message
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .filter(|level| !level.is_empty() && level.len() <= TEXT_MAX)
+            .map(str::to_owned)
+            .or_else(|| level.map(str::to_owned)),
+    })
 }
 
 fn epoch_ms(value: Option<&Value>) -> Option<Timestamp> {

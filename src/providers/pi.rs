@@ -16,6 +16,7 @@
 pub mod hydration;
 pub mod metadata;
 pub mod record;
+pub mod tree;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -24,18 +25,19 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::discovery::plain_file;
 use crate::domain::{
-    Harness, RefreshBudget, ScanProgress, SessionKey, SessionMetadata, SourceKey, Warning,
-    WarningKey, WarningKind,
+    Harness, RefreshBudget, ScanProgress, SessionKey, SessionLink, SessionMetadata, SourceKey,
+    Warning, WarningKey, WarningKind,
 };
 use crate::providers::{DiscoveryDelta, ProviderError};
 
 pub use hydration::PiHydration;
 pub use metadata::{Probed, probe_source};
 pub use record::{
-    PiEntry, PiEntryKind, PiHeader, PiRecordError, PiRole, additive_total, categories_incomplete,
-    invalid_money, parse_entry, parse_header, parse_pi_usage, record_may_carry_usage,
-    reported_total, total_conflicts,
+    PiEntry, PiEntryKind, PiHeader, PiPrompt, PiRecordError, PiRole, additive_total,
+    assistant_model, categories_incomplete, invalid_money, parse_entry, parse_header,
+    parse_pi_usage, prompt_tokens, record_may_carry_usage, reported_total, total_conflicts,
 };
+pub use tree::{PiInsert, PiOwnership, PiTree, PiTreeError};
 
 /// Directory entries examined from one bucket.
 const DIR_CAP: usize = 16 * 1024;
@@ -187,8 +189,18 @@ struct Known {
     pass: u64,
     retry: bool,
     base: SessionMetadata,
+    /// The header's `parentSession` text, kept only to resolve the fork edge against
+    /// already-discovered sources. The path itself is never opened.
+    parent: Option<String>,
     bytes: usize,
     reported: Option<SessionMetadata>,
+}
+
+/// Whether a header reference is rooted on any platform: POSIX `/`, a Windows/UNC
+/// separator, or a drive/URI prefix. A rooted reference names one exact location, so
+/// an undiscovered file name is never a substitute for it.
+fn rooted_reference(text: &str) -> bool {
+    text.starts_with(['/', '\\']) || text.as_bytes().get(1) == Some(&b':') || text.contains("://")
 }
 
 fn warn_limit(max_sources: usize) -> Warning {
@@ -283,23 +295,32 @@ impl PiCatalog {
             known.pass = self.pass;
             return false;
         }
-        let (base, retry) = match metadata::probe_source(&source.path, source.len, source.modified)
-        {
-            Ok(probed) => {
-                *bytes = bytes.saturating_add(probed.bytes);
-                warnings.extend(probed.warnings);
-                (probed.meta, false)
-            }
-            Err(_) => {
-                warnings.push(metadata::warning(
-                    &source.path,
-                    "unavailable",
-                    WarningKind::Unavailable,
-                    "source unavailable",
-                ));
-                (metadata::unreadable(&source.path, source.modified), true)
-            }
-        };
+        let (base, retry, parent) =
+            match metadata::probe_source(&source.path, source.len, source.modified) {
+                Ok(probed) => {
+                    *bytes = bytes.saturating_add(probed.bytes);
+                    warnings.extend(probed.warnings);
+                    let parent = probed
+                        .header
+                        .as_ref()
+                        .and_then(|header| header.parent_session.clone())
+                        .filter(|parent| !parent.is_empty());
+                    (probed.meta, false, parent)
+                }
+                Err(_) => {
+                    warnings.push(metadata::warning(
+                        &source.path,
+                        "unavailable",
+                        WarningKind::Unavailable,
+                        "source unavailable",
+                    ));
+                    (
+                        metadata::unreadable(&source.path, source.modified),
+                        true,
+                        None,
+                    )
+                }
+            };
         let weight = Self::weight(&base, &source.path);
         let old_weight = self.known.get(&source.path).map_or(0, |known| known.bytes);
         let is_new = !self.known.contains_key(&source.path);
@@ -380,6 +401,7 @@ impl PiCatalog {
                 pass: self.pass,
                 retry,
                 base,
+                parent,
                 bytes: weight,
                 reported,
             },
@@ -464,20 +486,70 @@ impl PiCatalog {
         })
     }
 
-    /// Reports metadata whose published form changed since the last time.
+    /// Reports metadata whose published form changed since the last time. The fork
+    /// edge is resolved here, among already-discovered sources only.
     fn publish(&mut self) -> Vec<SessionMetadata> {
         let mut paths: Vec<PathBuf> = self.known.keys().cloned().collect();
         paths.sort();
+        let links = self.fork_links(&paths);
         let mut changed = Vec::new();
-        for path in paths {
-            let Some(known) = self.known.get_mut(&path) else {
+        for (path, link) in paths.iter().zip(links) {
+            let Some(known) = self.known.get_mut(path) else {
                 continue;
             };
+            known.base.lineage.fork = link;
             if known.reported.as_ref() != Some(&known.base) {
                 known.reported = Some(known.base.clone());
                 changed.push(known.base.clone());
             }
         }
         changed
+    }
+
+    /// The `lineage.fork` link of each source. The producer writes an absolute path
+    /// to the source session file, so a path (or, when roots are spelled
+    /// differently, a unique file name) identifies a discovered source. Nothing
+    /// outside the discovered set is ever opened, and a fork is never a parent.
+    fn fork_links(&self, paths: &[PathBuf]) -> Vec<Option<SessionLink>> {
+        let mut by_path: HashMap<&Path, &SessionKey> = HashMap::new();
+        let mut by_name: HashMap<&std::ffi::OsStr, Vec<&SessionKey>> = HashMap::new();
+        for path in paths {
+            let Some(known) = self.known.get(path) else {
+                continue;
+            };
+            by_path.insert(path.as_path(), &known.base.key);
+            if let Some(name) = path.file_name() {
+                by_name.entry(name).or_default().push(&known.base.key);
+            }
+        }
+        paths
+            .iter()
+            .map(|path| {
+                let known = self.known.get(path)?;
+                let text = known.parent.as_deref()?;
+                let target = Path::new(text);
+                let found: Vec<&SessionKey> = match by_path.get(target) {
+                    Some(key) => vec![*key],
+                    // A rooted path the discovery set does not contain is not evidence
+                    // for a same-named file elsewhere; only a bare/relative reference
+                    // may stand in for a relocated store.
+                    None if rooted_reference(text) => Vec::new(),
+                    None => target
+                        .file_name()
+                        .and_then(|name| by_name.get(name))
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                let found: Vec<&SessionKey> = found
+                    .into_iter()
+                    .filter(|key| key != &&known.base.key)
+                    .collect();
+                Some(match found.as_slice() {
+                    [only] => SessionLink::Resolved((*only).clone()),
+                    [] => SessionLink::Unresolved(metadata::name_id(target)),
+                    _ => SessionLink::Ambiguous,
+                })
+            })
+            .collect()
     }
 }

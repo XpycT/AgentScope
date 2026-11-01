@@ -11,27 +11,35 @@
 //! No timing is invented. A recorded assistant `durationMs` is measured whole-request
 //! model time and contributes to state speed; request completion, session end and
 //! active intervals remain Unknown because standard Pi records do not persist them.
-//! Tool-result durations are never model time. Context/tree ownership belongs to the
-//! next stage; this fold keeps per-request facts and the ledger only.
+//! Tool-result durations are never model time.
+//!
+//! Lifetime accounting and current context are separate: every uniquely owned call of
+//! every executed branch stays in the ledger, while [`PiTree`] selects the prompt
+//! snapshot of the recorded active path only. A copied fork prefix is excluded from
+//! direct spend only with a resolved lineage and producer-preserved identities; when
+//! that cannot be proven the call is not charged and coverage stays partial.
 
-use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::domain::{
-    ModelDetail, Provenance, RefreshBudget, RequestPurpose, SessionSummary, Timestamp, Warning,
+    CompactionObservation, CompactionScope, LocatorKind, ModelDetail, Provenance, RecordedMoney,
+    RefreshBudget, RequestMetadata, RequestPurpose, SessionSummary, Timestamp, Warning,
     WarningKind,
 };
 use crate::ingest::source::{SourceItem, SourceReader};
-use crate::metrics::{SpeedAccumulator, session_timing};
+use crate::metrics::{SpeedAccumulator, compaction_summary, session_timing};
 use crate::pricing::{PriceSchedule, ReferencePolicy};
 use crate::providers::pi::metadata::warning;
 use crate::providers::pi::record::{
-    PiEntry, PiEntryKind, PiRole, additive_total, categories_incomplete, invalid_money,
-    parse_entry, parse_header, parse_pi_usage, record_may_carry_usage, supported_version,
-    total_conflicts,
+    PiEntry, PiEntryKind, PiRecordError, PiRole, additive_total, assistant_model,
+    categories_incomplete, invalid_money, parse_entry, parse_header, parse_pi_usage,
+    record_may_carry_usage, supported_version, total_conflicts,
 };
+use crate::providers::pi::tree::{PiInsert, PiOwnership, PiTree};
 use crate::usage::{LedgerOutcome, UsageLedger, UsageUpdate};
 use crate::{
     domain::{Harness, SourceKey, UsageObservation, UsageScope},
@@ -41,6 +49,96 @@ use crate::{
 /// Requests whose full observation is retained for details/consumers. The ledger is
 /// the accounting source; this is a bounded convenience view, never a second ledger.
 const MAX_RETAINED_REQUESTS: usize = 4096;
+/// Compaction markers retained for the summary/details view. A hostile marker flood
+/// is bounded; an omitted marker makes the recorded history incomplete.
+const MAX_RETAINED_COMPACTIONS: usize = 512;
+/// Byte budget across retained markers.
+const MAX_COMPACTION_BYTES: usize = 512 * 1024;
+/// Inline structures and allocator bookkeeping reserved per retained marker.
+const COMPACTION_RESERVE: usize = 512;
+
+fn path_bytes(path: &Path) -> usize {
+    path.as_os_str().len()
+}
+
+fn source_bytes(source: &SourceKey) -> usize {
+    match source {
+        SourceKey::File(path) => path_bytes(path),
+        SourceKey::DbRow {
+            database,
+            table,
+            id,
+        } => path_bytes(database) + table.len() + id.len(),
+    }
+}
+
+fn locator_kind_bytes(kind: &LocatorKind) -> usize {
+    match kind {
+        LocatorKind::FileOffset { path, .. } | LocatorKind::CompressedRecord { path, .. } => {
+            path_bytes(path)
+        }
+        LocatorKind::DbRow { table, row_id, .. } => table.len() + row_id.len(),
+    }
+}
+
+/// Heap bytes of a provenance: every source, locator and session string is cloned
+/// per record, so a retained marker owns all of them.
+fn provenance_bytes(provenance: &Provenance) -> usize {
+    source_bytes(&provenance.source)
+        + source_bytes(&provenance.locator.session.source)
+        + provenance.locator.session.native_id.len()
+        + locator_kind_bytes(&provenance.locator.kind)
+        + provenance.record_type.len()
+        + provenance.harness_version.as_deref().map_or(0, str::len)
+}
+
+fn model_bytes(model: &ModelDetail) -> usize {
+    model.id.len()
+        + model.provider.as_deref().map_or(0, str::len)
+        + model.variant.as_deref().map_or(0, str::len)
+        + model.effort.as_deref().map_or(0, str::len)
+        + model.configured_effort.as_deref().map_or(0, str::len)
+}
+
+fn request_bytes(request: &RequestMetadata) -> usize {
+    request.id.as_deref().map_or(0, str::len)
+        + request.service_tier.as_deref().map_or(0, str::len)
+        + request.inference_region.as_deref().map_or(0, str::len)
+}
+
+fn money_bytes(money: &RecordedMoney) -> usize {
+    [&money.reported_api, &money.saved_estimate]
+        .into_iter()
+        .flatten()
+        .map(|fact| fact.as_of.as_deref().map_or(0, str::len))
+        .sum()
+}
+
+/// Owned strings of the nested usage observation. Its inline structure is already
+/// inside `size_of::<CompactionObservation>()`, which `compaction_cost` charges, so
+/// only the heap strings are added here.
+fn observation_bytes(observation: &UsageObservation) -> usize {
+    observation.model.as_ref().map_or(0, model_bytes)
+        + observation.request.as_ref().map_or(0, request_bytes)
+        + money_bytes(&observation.money)
+        + provenance_bytes(&observation.provenance)
+}
+
+/// Charged cost of one retained marker: its own structures, every owned provenance
+/// string, and the nested observation with its own cloned provenance.
+fn compaction_cost(observation: &CompactionObservation) -> usize {
+    COMPACTION_RESERVE
+        + std::mem::size_of::<CompactionObservation>()
+        + observation.id.len()
+        + observation.method.as_deref().map_or(0, str::len)
+        + observation.trigger.as_deref().map_or(0, str::len)
+        + observation
+            .summary
+            .as_ref()
+            .map_or(0, |summary| summary.preview.len())
+        + provenance_bytes(&observation.provenance)
+        + observation.usage.as_ref().map_or(0, observation_bytes)
+}
 
 struct Fold {
     path: PathBuf,
@@ -54,10 +152,49 @@ struct Fold {
     last_event_at: Option<Timestamp>,
     displayed: usize,
     hidden: usize,
+    tree: PiTree,
+    compactions: VecDeque<CompactionObservation>,
+    compaction_bytes: usize,
+    /// Markers the retention cap refused to keep.
+    compactions_omitted: usize,
+    /// A marker could have been unreadable, or the retention cap omitted one, so the
+    /// observed compaction history is not complete.
+    compactions_incomplete: bool,
     warnings: Vec<Warning>,
 }
 
 impl Fold {
+    /// Retains one compaction marker within the count/byte cap, newest-last, noting
+    /// that the recorded history is incomplete once a marker is dropped.
+    fn retain_compaction(&mut self, observation: CompactionObservation) {
+        if self
+            .compactions
+            .iter()
+            .any(|known| known.id == observation.id)
+        {
+            // The same marker again is not another event.
+            return;
+        }
+        let cost = compaction_cost(&observation);
+        if cost > MAX_COMPACTION_BYTES {
+            self.compactions_omitted = self.compactions_omitted.saturating_add(1);
+            self.compactions_incomplete = true;
+            return;
+        }
+        while !self.compactions.is_empty()
+            && (self.compactions.len() >= MAX_RETAINED_COMPACTIONS
+                || self.compaction_bytes.saturating_add(cost) > MAX_COMPACTION_BYTES)
+        {
+            if let Some(old) = self.compactions.pop_front() {
+                self.compaction_bytes = self.compaction_bytes.saturating_sub(compaction_cost(&old));
+                self.compactions_omitted = self.compactions_omitted.saturating_add(1);
+                self.compactions_incomplete = true;
+            }
+        }
+        self.compaction_bytes = self.compaction_bytes.saturating_add(cost);
+        self.compactions.push_back(observation);
+    }
+
     fn warn(&mut self, label: &str, kind: WarningKind, message: &str) {
         let warning = warning(&self.path, label, kind, message);
         match self
@@ -73,8 +210,25 @@ impl Fold {
 
 enum Phase {
     Header,
+    /// Collecting the resolved fork parent's call identities as ownership evidence.
+    Proof,
     Entries,
     Done,
+}
+
+/// Bounded read of the discovered fork parent's usage identities.
+struct Proof {
+    reader: SourceReader,
+    tree: PiTree,
+    /// An unreadable record, an unfinished tail or an unverifiable header could have
+    /// carried a model call this reader never saw.
+    incomplete: bool,
+    /// The header id the discovered predecessor must still carry.
+    expected_id: String,
+    /// The first record was examined as the header.
+    header_seen: bool,
+    /// A supported header with exactly that id was read.
+    verified: bool,
 }
 
 struct Work {
@@ -82,6 +236,27 @@ struct Work {
     fold: Fold,
     phase: Phase,
     unsupported: bool,
+    proof: Option<Proof>,
+}
+
+impl Proof {
+    fn open(
+        path: &Path,
+        expected_id: &str,
+        max_record_bytes: usize,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Option<Self> {
+        let reader = SourceReader::open(path, max_record_bytes).ok()?;
+        Some(Self {
+            reader,
+            tree: PiTree::new(max_entries, max_bytes),
+            incomplete: false,
+            expected_id: expected_id.to_owned(),
+            header_seen: false,
+            verified: false,
+        })
+    }
 }
 
 /// Resumable lifetime facts of one Pi session.
@@ -93,6 +268,9 @@ pub struct PiHydration {
     max_entries: usize,
     max_bytes: usize,
     max_record_bytes: usize,
+    /// The discovered fork parent's file and native id, when the lineage resolved to
+    /// one inside the allowed roots. An unresolved reference is never opened.
+    fork_parent: Option<(PathBuf, String)>,
     work: Option<Work>,
 }
 
@@ -113,6 +291,15 @@ impl PiHydration {
                 ));
             }
         };
+        let fork_parent = match meta.lineage.fork.as_ref() {
+            Some(crate::domain::SessionLink::Resolved(key)) => match &key.source {
+                SourceKey::File(parent) if key.harness == Harness::Pi => {
+                    Some((parent.clone(), key.native_id.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
         Ok(Self {
             prices: config.pricing.clone(),
             policy: config.reference_policy(Harness::Pi),
@@ -120,6 +307,7 @@ impl PiHydration {
             max_bytes: config.dedup_ledger_bytes,
             max_record_bytes: config.max_record_bytes,
             path,
+            fork_parent,
             meta,
             work: None,
         })
@@ -149,8 +337,31 @@ impl PiHydration {
             .map_or(&[], |work| work.fold.requests.as_slice())
     }
 
+    /// Compaction markers the bounded view currently retains (zero once cancelled).
+    pub fn retained_compactions(&self) -> usize {
+        self.work
+            .as_ref()
+            .map_or(0, |work| work.fold.compactions.len())
+    }
+
+    /// Bytes charged for those retained markers, including owned provenance paths.
+    pub fn retained_compaction_bytes(&self) -> usize {
+        self.work
+            .as_ref()
+            .map_or(0, |work| work.fold.compaction_bytes)
+    }
+
+    /// Markers the retention cap omitted from the bounded view.
+    pub fn omitted_compactions(&self) -> usize {
+        self.work
+            .as_ref()
+            .map_or(0, |work| work.fold.compactions_omitted)
+    }
+
     fn fresh(&self) -> Result<Work, ProviderError> {
-        let fold = Fold {
+        let mut tree = PiTree::new(self.max_entries, self.max_bytes);
+        tree.set_fork(self.meta.lineage.fork.as_ref());
+        let mut fold = Fold {
             path: self.path.clone(),
             ledger: UsageLedger::new(self.max_entries, self.max_bytes),
             speed: SpeedAccumulator::new(self.max_entries),
@@ -161,6 +372,11 @@ impl PiHydration {
             last_event_at: None,
             displayed: 0,
             hidden: 0,
+            tree,
+            compactions: VecDeque::new(),
+            compaction_bytes: 0,
+            compactions_omitted: 0,
+            compactions_incomplete: false,
             warnings: Vec::new(),
         };
         let reader = SourceReader::open(&self.path, self.max_record_bytes).map_err(|error| {
@@ -170,11 +386,37 @@ impl PiHydration {
                 ProviderError::Io(error.to_string())
             }
         })?;
+        // The fork parent's identities must be known before any of this file's
+        // requests are attributed, so that phase runs first and never shares a slice
+        // with a partially-folded entry batch.
+        let (phase, proof) = match &self.fork_parent {
+            Some((parent, id)) => match Proof::open(
+                parent,
+                id,
+                self.max_record_bytes,
+                self.max_entries,
+                self.max_bytes,
+            ) {
+                Some(proof) => (Phase::Proof, Some(proof)),
+                None => {
+                    fold.warnings.push(warning(
+                        &self.path,
+                        "fork",
+                        WarningKind::Unavailable,
+                        "the linked fork parent could not be read; copied requests stay \
+                         unattributed and coverage is partial",
+                    ));
+                    (Phase::Header, None)
+                }
+            },
+            None => (Phase::Header, None),
+        };
         Ok(Work {
             reader,
             fold,
-            phase: Phase::Header,
+            phase,
             unsupported: false,
+            proof,
         })
     }
 
@@ -238,6 +480,9 @@ impl PiHydration {
         if matches!(work.phase, Phase::Done) {
             return Ok(Advance::Done);
         }
+        if matches!(work.phase, Phase::Proof) {
+            return self.proof(work, budget);
+        }
         let batch = work.reader.step(budget).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 ProviderError::Unavailable("session source is unavailable".into())
@@ -267,6 +512,7 @@ impl PiHydration {
                     }
                     let Ok(entry) = parse_entry(value, item.ordinal, offset) else {
                         work.fold.hidden += 1;
+                        work.fold.compactions_incomplete = true;
                         if record_may_carry_usage(value) {
                             // Dropping an unreadable model call must never leave a
                             // complete-looking total or cost.
@@ -304,6 +550,7 @@ impl PiHydration {
                 }
                 SourceItem::Invalid | SourceItem::TooLarge => {
                     work.fold.hidden += 1;
+                    work.fold.compactions_incomplete = true;
                     work.fold
                         .ledger
                         .mark_partial("an unreadable Pi record could contain usage");
@@ -315,6 +562,7 @@ impl PiHydration {
                     );
                 }
                 SourceItem::Damaged(_) => {
+                    work.fold.compactions_incomplete = true;
                     work.fold
                         .ledger
                         .mark_partial("a damaged Pi source may hide usage");
@@ -326,6 +574,7 @@ impl PiHydration {
                     );
                 }
                 SourceItem::Skipping => {
+                    work.fold.compactions_incomplete = true;
                     work.fold
                         .ledger
                         .mark_partial("an oversized Pi record could contain usage");
@@ -339,6 +588,105 @@ impl PiHydration {
         } else {
             Ok(Advance::Pending)
         }
+    }
+
+    /// Collects the resolved fork parent's call identities. Bounded and resumable:
+    /// the parent is only ever a source discovery already reported inside the allowed
+    /// roots, never an arbitrary path from the header.
+    fn proof(&mut self, work: &mut Work, budget: RefreshBudget) -> Result<Advance, ProviderError> {
+        let Some(mut proof) = work.proof.take() else {
+            work.phase = Phase::Header;
+            return Ok(Advance::Pending);
+        };
+        let batch = match proof.reader.step(budget) {
+            Ok(batch) => batch,
+            Err(_) => {
+                work.fold.tree.mark_inherited_incomplete();
+                work.fold.warn(
+                    "fork",
+                    WarningKind::Io,
+                    "the linked fork parent became unreadable; copied requests stay \
+                     unattributed and coverage is partial",
+                );
+                work.phase = Phase::Header;
+                return Ok(Advance::Pending);
+            }
+        };
+        if batch.invalidated {
+            work.proof = self.fork_parent.as_ref().and_then(|(parent, id)| {
+                Proof::open(
+                    parent,
+                    id,
+                    self.max_record_bytes,
+                    self.max_entries,
+                    self.max_bytes,
+                )
+            });
+            work.fold.tree.mark_inherited_incomplete();
+            return Ok(Advance::Pending);
+        }
+        for item in &batch.records {
+            match &item.item {
+                SourceItem::Json(value) => {
+                    if !proof.header_seen {
+                        proof.header_seen = true;
+                        match parse_header(value) {
+                            Some(header) => {
+                                // The predecessor must still be the source discovery
+                                // resolved: a truncated/replaced file is not evidence.
+                                if header.id == proof.expected_id
+                                    && supported_version(header.version)
+                                {
+                                    proof.verified = true;
+                                } else {
+                                    proof.incomplete = true;
+                                }
+                                continue;
+                            }
+                            None => proof.incomplete = true,
+                        }
+                    }
+                    match parse_entry(value, item.ordinal, 0) {
+                        Ok(entry) => {
+                            if matches!(proof.tree.insert(&entry), PiInsert::Limited) {
+                                proof.incomplete = true;
+                            }
+                        }
+                        Err(PiRecordError::Unsupported) => {}
+                        Err(PiRecordError::Malformed) => proof.incomplete = true,
+                    }
+                }
+                SourceItem::Invalid
+                | SourceItem::TooLarge
+                | SourceItem::Damaged(_)
+                | SourceItem::Skipping => proof.incomplete = true,
+                // A torn trailing line could hide a request the fork copied.
+                SourceItem::Incomplete => proof.incomplete = true,
+            }
+        }
+        if batch.done {
+            if !proof.verified {
+                work.fold.tree.mark_inherited_incomplete();
+                work.fold.warn(
+                    "fork",
+                    WarningKind::Unsupported,
+                    "the linked fork parent no longer carries its recorded session \
+                     header, so copied requests stay unattributed and coverage is partial",
+                );
+            } else if !work.fold.tree.adopt(&proof.tree) || proof.incomplete {
+                work.fold.tree.mark_inherited_incomplete();
+                work.fold.warn(
+                    "fork",
+                    WarningKind::Parse,
+                    "the linked fork parent's usage could not be read completely; \
+                     copied requests stay partial",
+                );
+            }
+            work.phase = Phase::Header;
+        } else {
+            work.proof = Some(proof);
+        }
+        Ok(Advance::Pending)
     }
 
     /// Interprets the header. `false` means the path now holds another session.
@@ -371,6 +719,10 @@ impl PiHydration {
         if let Some(at) = entry.timestamp {
             work.fold.last_event_at = work.fold.last_event_at.max(Some(at));
         }
+        // The tree keeps only structure, call identities and prompt totals. An entry
+        // the bounded index could not hold stays unattributable rather than owned.
+        work.fold.tree.insert(entry);
+        let ownership = work.fold.tree.ownership(&entry.id);
         match &entry.kind {
             PiEntryKind::Message { role, usage, .. } => {
                 work.fold.displayed += 1;
@@ -397,13 +749,14 @@ impl PiHydration {
                             return;
                         }
                         let value = Value::Object(message);
-                        let mut observation = parse_pi_usage(&value, model, provenance);
-                        self.observe(
+                        let observation = parse_pi_usage(&value, model, provenance);
+                        self.count(
                             work,
-                            &mut observation,
+                            observation,
                             &value,
                             &entry.id,
                             RequestPurpose::Conversation,
+                            ownership,
                         );
                     }
                     // Tool-result usage is tool execution accounting, and its
@@ -440,30 +793,52 @@ impl PiHydration {
                     configured_effort: work.fold.level.clone(),
                 };
                 work.fold.model = Some(detail.clone());
-                let mut observation = parse_pi_usage(value, Some(detail), provenance);
-                self.observe(
+                let observation = parse_pi_usage(value, Some(detail), provenance);
+                self.count(
                     work,
-                    &mut observation,
+                    observation,
                     value,
                     &entry.id,
                     RequestPurpose::Auxiliary(kind.clone()),
+                    ownership,
                 );
             }
             PiEntryKind::Compaction { usage, .. } | PiEntryKind::BranchSummary { usage, .. } => {
-                if *usage {
-                    // A summary entry persists no provider/model route, and Pi resolves
-                    // summarization auth independently of the conversation model. Keep
-                    // its recorded categories/money, but leave route-dependent pricing
-                    // Unknown instead of charging the preceding conversation model.
-                    let mut observation = parse_pi_usage(value, None, provenance);
-                    self.observe(
+                // A summary entry persists no provider/model route, and Pi resolves
+                // summarization auth independently of the conversation model. Its
+                // categories/money are kept, but route-dependent pricing stays Unknown
+                // instead of charging the preceding conversation model.
+                let observed = if *usage {
+                    let observation = parse_pi_usage(value, None, provenance.clone());
+                    self.count(
                         work,
-                        &mut observation,
+                        observation,
                         value,
                         &entry.id,
                         RequestPurpose::Compaction,
-                    );
-                }
+                        ownership,
+                    )
+                } else {
+                    None
+                };
+                // A copied marker is still shown as an observed event, but its cost
+                // belongs to the linked predecessor and is never charged here.
+                work.fold.retain_compaction(CompactionObservation {
+                    id: entry.id.clone(),
+                    timestamp: entry.timestamp,
+                    method: None,
+                    trigger: None,
+                    summary: None,
+                    before_tokens: match &entry.kind {
+                        PiEntryKind::Compaction { tokens_before, .. } => *tokens_before,
+                        _ => None,
+                    },
+                    after_tokens: None,
+                    duration_ms: None,
+                    usage: observed,
+                    scope: CompactionScope::Event,
+                    provenance,
+                });
             }
             PiEntryKind::SessionInfo { .. }
             | PiEntryKind::ContextEdit { .. }
@@ -485,17 +860,20 @@ impl PiHydration {
         }
     }
 
-    fn observe(
+    /// Normalizes one recorded call and counts it only when this file owns it.
+    /// `None` means the call is a linked predecessor's spend or cannot be told.
+    fn count(
         &self,
         work: &mut Work,
-        observation: &mut UsageObservation,
+        mut observation: UsageObservation,
         value: &Value,
         entry_id: &str,
         purpose: RequestPurpose,
-    ) {
+        ownership: PiOwnership,
+    ) -> Option<UsageObservation> {
         observation.scope = UsageScope::Message;
         if let Some(request) = &mut observation.request {
-            request.purpose = purpose;
+            request.purpose = purpose.clone();
             // A confirmed provider response id wins; otherwise the native entry id
             // is the record's ownership identity, so a literal duplicate counts once.
             request.id = request.id.take().or_else(|| Some(entry_id.to_owned()));
@@ -528,31 +906,55 @@ impl PiHydration {
                 "a recorded cost was unusable and is not retained",
             );
         }
-        let duration = observation
-            .request
-            .as_ref()
-            .and_then(|request| request.duration_ms);
-        match work
-            .fold
-            .ledger
-            .observe(UsageUpdate::Initial(observation), &self.prices, self.policy)
-        {
-            LedgerOutcome::Counted => {
-                work.fold.speed.observe(observation);
-                if let Some(duration) = duration {
-                    work.fold.model_ms += duration;
-                }
-                if work.fold.requests.len() < MAX_RETAINED_REQUESTS {
-                    work.fold.requests.push(observation.clone());
-                }
-            }
-            LedgerOutcome::Duplicate => {}
-            LedgerOutcome::Revised | LedgerOutcome::Uncountable => {
+        match ownership {
+            // A copy of a linked source's call is that source's spend.
+            PiOwnership::Inherited => None,
+            PiOwnership::Unknown => {
+                work.fold
+                    .ledger
+                    .mark_partial("ownership of a copied Pi request could not be proven");
                 work.fold.warn(
-                    "usage",
+                    "ownership",
                     WarningKind::Parse,
-                    "a Pi request could not be attributed and is not counted",
+                    "a Pi request could not be attributed to this or a linked session, \
+                     so it is not charged and coverage is partial",
                 );
+                None
+            }
+            PiOwnership::Owned => {
+                let duration = observation
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.duration_ms);
+                match work.fold.ledger.observe(
+                    UsageUpdate::Initial(&observation),
+                    &self.prices,
+                    self.policy,
+                ) {
+                    LedgerOutcome::Counted => {
+                        // Throughput is conversation output only: a summary or an
+                        // auxiliary model call is billed but is not the timed stream.
+                        if purpose == RequestPurpose::Conversation {
+                            work.fold.speed.observe(&observation);
+                        }
+                        if let Some(duration) = duration {
+                            work.fold.model_ms += duration;
+                        }
+                        if work.fold.requests.len() < MAX_RETAINED_REQUESTS {
+                            work.fold.requests.push(observation.clone());
+                        }
+                        Some(observation)
+                    }
+                    LedgerOutcome::Duplicate => None,
+                    LedgerOutcome::Revised | LedgerOutcome::Uncountable => {
+                        work.fold.warn(
+                            "usage",
+                            WarningKind::Parse,
+                            "a Pi request could not be attributed and is not counted",
+                        );
+                        None
+                    }
+                }
             }
         }
     }
@@ -583,7 +985,14 @@ impl PiHydration {
                 // request durations are measured.
                 timing: session_timing(self.meta.created_at, None, &[], false, model_ms),
                 speed: fold.speed.snapshot(),
-                ..crate::domain::SessionMetrics::default()
+                // Occupancy follows the recorded active path, never lifetime tokens.
+                context: fold.tree.fold_context(&self.prices),
+                compactions: compaction_summary(
+                    &fold.compactions,
+                    !fold.compactions_incomplete,
+                    &self.prices,
+                    self.policy,
+                ),
             },
             lifecycle: crate::domain::Lifecycle::Unknown,
             unfinished_work: false,
@@ -602,39 +1011,4 @@ enum Advance {
     Pending,
     Done,
     Restart,
-}
-
-/// The model identity an assistant message proves. `responseModel` refines the
-/// requested `model`; `providerThinkingLevel` is the only effective effort Pi
-/// records, and `thinkingLevel`/the branch setting is the configured level.
-fn assistant_model(
-    message: &serde_json::Map<String, Value>,
-    level: Option<&str>,
-) -> Option<ModelDetail> {
-    let id = message
-        .get("responseModel")
-        .and_then(Value::as_str)
-        .filter(|model| !model.is_empty())
-        .or_else(|| message.get("model").and_then(Value::as_str))
-        .filter(|model| !model.is_empty() && model.len() <= 256)?;
-    Some(ModelDetail {
-        id: id.to_owned(),
-        provider: message
-            .get("provider")
-            .and_then(Value::as_str)
-            .filter(|provider| !provider.is_empty() && provider.len() <= 256)
-            .map(str::to_owned),
-        variant: None,
-        effort: message
-            .get("providerThinkingLevel")
-            .and_then(Value::as_str)
-            .filter(|effort| !effort.is_empty() && effort.len() <= 256)
-            .map(str::to_owned),
-        configured_effort: message
-            .get("thinkingLevel")
-            .and_then(Value::as_str)
-            .filter(|level| !level.is_empty() && level.len() <= 256)
-            .map(str::to_owned)
-            .or_else(|| level.map(str::to_owned)),
-    })
 }

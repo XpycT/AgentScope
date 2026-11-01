@@ -180,6 +180,40 @@ pub fn compaction(id: &str, parent: &str, usage: Option<Value>) -> Value {
     entry
 }
 
+/// A branch-summary marker: `parent` is where the new branch continues and `from`
+/// is the abandoned leaf it summarizes. Optional attributable summary usage.
+pub fn branch_summary(
+    id: &str,
+    parent: Option<&str>,
+    from: Option<&str>,
+    usage: Option<Value>,
+) -> Value {
+    let mut entry = entry(
+        id,
+        parent,
+        "branch_summary",
+        json!({"summary": "synthetic branch summary"}),
+    );
+    if let Some(from) = from {
+        entry["fromId"] = json!(from);
+    }
+    if let Some(usage) = usage {
+        entry["usage"] = usage;
+    }
+    entry
+}
+
+/// An append-only context edit of an earlier entry. `replacement: None` omits the
+/// target from the model context.
+pub fn context_edit(id: &str, parent: &str, target: &str, replacement: Option<&str>) -> Value {
+    entry(
+        id,
+        Some(parent),
+        "context_edit",
+        json!({"targetId": target, "replacement": replacement}),
+    )
+}
+
 /// Sets an entry's ISO timestamp.
 pub fn at(mut entry: Value, iso: &str) -> Value {
     entry["timestamp"] = json!(iso);

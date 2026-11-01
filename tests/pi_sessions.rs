@@ -405,8 +405,11 @@ fn same_model_through_another_provider_is_priced_separately() {
 #[test]
 fn copied_files_with_one_header_id_are_distinct_sources() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // A byte-copied file is still its own source and names no fork parent. (A
+    // declared but undiscovered parent makes ownership unproven instead; see
+    // `pi_tree`.)
     let entries = vec![
-        fx::header("same-id", Some("/work/parent.jsonl")),
+        fx::header("same-id", None),
         fx::message("u1", None, "user", "x", None),
         fx::message(
             "a1",
