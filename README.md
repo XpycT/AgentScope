@@ -1,8 +1,30 @@
 # AgentScope
 
-**Read-only observability for AI coding agents.**
+**One terminal dashboard for all your AI coding agents.** See what they're doing, what they're using, and whether they're actually stuck.
 
-AgentScope is a local, keyboard-first terminal application that discovers **Codex CLI**, **Claude Code**, **OpenCode**, **OMP (oh-my-pi)**, **Hermes**, and **native Pi** sessions on one machine, lets you read what each session did, and reports token usage, estimated cost, and health only with visible evidence — without changing how those agents run.
+You run Codex in one terminal, Claude Code in another, and OpenCode somewhere else. Each keeps its own logs in its own format. Which session burned all those tokens? Is that agent still working, or did it quietly die twenty minutes ago? What did it actually do?
+
+AgentScope puts every session on one machine into a single keyboard-driven TUI. It reads the logs your agents already write. It never launches, stops or messages them, and it never changes their data.
+
+**Works with:** Codex CLI · Claude Code (CLI and Desktop) · OpenCode · OMP (oh-my-pi) · Hermes · Pi
+
+## Why AgentScope
+
+- **See everything in one place.** One roster across all harnesses, with search, filter and sort. Subagents, forks and continuations are nested under their parent session.
+- **Read what really happened.** Browse the full transcript: messages, reasoning summaries, tool calls and results, errors. Huge records load lazily, and the raw source record is always one key away.
+- **Trust the numbers.** Token counts follow each provider's own usage rules, so duplicated streaming events and cumulative counters aren't double-counted. Costs are labeled as estimates. Unknown stays `Unknown`, never `$0.00`.
+- **Know if an agent is stuck, with proof.** Status comes from evidence (`Active`, `Quiet`, `Possibly stalled`, `Complete`, `Failed`, and more) and always shows its reason. Silence is never presented as a crash.
+- **Safe to point at your real sessions.** It's read-only and local, with no telemetry and no network. Terminal escape sequences in untrusted transcripts are neutralized, and common secrets are masked by default.
+
+## Quick start
+
+```bash
+git clone <this repo>
+cd AgentScope
+cargo run --release
+```
+
+AgentScope finds the default session folders of each supported agent on its own. Press `?` for the key map, `Enter` to open a session, `/` to search and `q` to quit. Custom locations and every option are covered in [Run](#run).
 
 **Project status: v1 implemented (pre-release).** All six readers (Codex, Claude Code, OpenCode, OMP, Hermes and native Pi), the transcript explorer, usage accounting, process candidates, and the TUI are implemented and covered by synthetic-fixture tests. Native child sessions and forks are implemented where the provider records them: children for Codex, Claude Code, OpenCode, OMP and Hermes, forks for Codex, OpenCode, OMP and Pi. Local Claude Desktop Code/Cowork stores are implemented and were exercised end to end on synthetic stores (see Verification status). Native Pi is read from its standard JSONL tree format; Pi extension subagents are explicitly unsupported. Validation against real installations is partial; see [Verification status](#verification-status) and [Known limitations](#known-limitations) before relying on it.
 
