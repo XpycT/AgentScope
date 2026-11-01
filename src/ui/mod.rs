@@ -298,8 +298,12 @@ fn handle_roster_key(app: &mut App, code: KeyCode) -> KeyAction {
         KeyCode::Char('q') => return KeyAction::Quit,
         KeyCode::Char('j') | KeyCode::Down => app.move_focus(1),
         KeyCode::Char('k') | KeyCode::Up => app.move_focus(-1),
-        KeyCode::Left | KeyCode::Char('h') => app.scroll_columns(-1),
-        KeyCode::Right | KeyCode::Char('l') => app.scroll_columns(1),
+        KeyCode::Left | KeyCode::Char('h') => {
+            app.fold_selected(false);
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            app.fold_selected(true);
+        }
         KeyCode::Char('J') => app.scroll_preview(1),
         KeyCode::Char('K') => app.scroll_preview(-1),
         KeyCode::PageDown => app.move_selection(10),
@@ -582,7 +586,7 @@ pub fn handle_event(app: &mut App, event: Event, area: Rect) -> KeyAction {
         Event::Mouse(mouse) => {
             // Pointer motion carries no action; skip building the geometry for it.
             if mouse.kind != MouseEventKind::Moved {
-                let layout = RosterLayout::for_area(area, app.horizontal_column());
+                let layout = RosterLayout::for_area(area);
                 handle_mouse(app, mouse, &layout);
             }
             KeyAction::None

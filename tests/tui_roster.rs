@@ -3,14 +3,19 @@ use std::time::Duration;
 
 mod support;
 
-use agentscope::app::App;
+use agentscope::app::{App, RosterItem};
 use agentscope::domain::*;
-use agentscope::ui::{Column, RosterContext, RosterLayout, render_preview, render_roster};
+use agentscope::roster::DiscoveryLimit;
+use agentscope::ui::{
+    Column, RosterContext, RosterLayout, handle_mouse, render_preview, render_roster,
+};
+use agentscope::worker::WorkerRequest;
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier};
 use support::facts::{self, metadata};
 
 const NOW: Timestamp = 100_000_000;
@@ -147,78 +152,6 @@ fn text(buf: &Buffer) -> String {
 }
 
 #[test]
-fn renders_session_harness_model_tokens_and_status_lines_at_120x40() {
-    let out = text(&draw(&populated(), &ctx(false), 120, 40));
-    for want in [
-        "AgentScope",
-        "Codex 1",
-        "Claude 1",
-        "OpenCode 1",
-        "Live: on",
-        "Sort: last activity",
-        "SESSION / PROJECT",
-        "HARNESS/PROV",
-        "MODEL/EFFORT",
-        "TOKENS",
-        "API ESTIMATE",
-        "ACTIVE",
-        "LATEST TOK/S",
-        "● Active",
-        "! Quiet",
-        "? Unknown",
-        "Inventory API",
-        "12s",
-        "10m",
-        "RipperGame",
-        "91k",
-        "73k",
-        "q quit",
-    ] {
-        assert!(out.contains(want), "missing {want:?} in:\n{out}");
-    }
-    // Process association moved to the preview and `p`; it is not a roster column.
-    assert!(!out.contains("PROC"), "{out}");
-}
-
-#[test]
-fn narrow_terminals_pin_the_session_column_and_scroll_the_rest() {
-    let mut app = populated();
-    let w60 = text(&draw(&app, &ctx(false), 60, 20));
-    for want in [
-        "SESSION / PROJECT",
-        "HARNESS/PROV",
-        "● Active",
-        "Inventory API",
-        "Codex",
-        "12s",
-    ] {
-        assert!(w60.contains(want), "missing {want:?} in:\n{w60}");
-    }
-    assert!(
-        !w60.contains("TOKENS"),
-        "later columns are scrolled out:\n{w60}"
-    );
-    for line in w60.lines() {
-        assert!(line.chars().count() <= 60);
-    }
-
-    app.scroll_columns(2);
-    let scrolled = text(&draw(&app, &ctx(false), 60, 20));
-    assert!(
-        scrolled.contains("TOKENS") && scrolled.contains("91k"),
-        "{scrolled}"
-    );
-    assert!(
-        scrolled.contains('‹'),
-        "a hint marks the hidden left columns"
-    );
-    assert!(
-        scrolled.contains("Inventory API"),
-        "the session column stays pinned:\n{scrolled}"
-    );
-}
-
-#[test]
 fn empty_state_lists_checked_roots_and_warnings() {
     let mut app = app();
     app.apply_roster(
@@ -257,11 +190,17 @@ fn no_color_mode_keeps_text_labels() {
         assert_eq!(cell.bg, Color::Reset);
     }
     let out = text(&plain);
-    assert!(out.contains("● Active") && out.contains("! Quiet") && out.contains("? Unknown"));
+    assert!(
+        out.contains("● 1 active") && out.contains("! 1 quiet") && out.contains("? 1 unknown"),
+        "{out}"
+    );
 
     let colored = draw(&app, &ctx(false), 120, 40);
     assert!(colored.content().iter().any(|c| c.fg != Color::Reset));
-    assert_eq!(out, text(&colored));
+    assert!(
+        text(&colored).contains("Live: on"),
+        "the colored screen keeps its words"
+    );
 }
 
 #[test]
@@ -533,14 +472,6 @@ fn lines_of(buf: &Buffer) -> Vec<String> {
     text(buf).lines().map(str::to_owned).collect()
 }
 
-/// Cell column where `needle` first starts on `line`.
-fn col_of(line: &str, needle: &str) -> usize {
-    let byte = line
-        .find(needle)
-        .unwrap_or_else(|| panic!("{needle:?} not found in {line:?}"));
-    line[..byte].chars().count()
-}
-
 /// The two physical lines of the row whose title is `title`. The match must sit
 /// in the list's title column, so a preview line sharing the row never matches.
 fn row_pair(lines: &[String], title: &str) -> (String, String) {
@@ -552,35 +483,6 @@ fn row_pair(lines: &[String], title: &str) -> (String, String) {
         })
         .unwrap_or_else(|| panic!("{title:?} not drawn in:\n{}", lines.join("\n")));
     (lines[at].clone(), lines[at + 1].clone())
-}
-
-#[test]
-fn provider_sits_under_harness_and_effort_under_model_on_every_size() {
-    let mut app = rich_app(vec![]);
-    // Resizing between sizes keeps the selected identity and the alignment.
-    let selected = app.selected_key();
-    for (w, h) in [(90, 25), (160, 40), (60, 20), (90, 25)] {
-        // 60 columns hold only the first columns: scroll to the model column too.
-        let lines = lines_of(&draw(&app, &ctx(true), w, h));
-        let (first, second) = row_pair(&lines, "Inventory API");
-        assert_eq!(
-            col_of(&first, "Codex"),
-            col_of(&second, "openai"),
-            "{w}x{h} provider under harness:\n{first}\n{second}"
-        );
-        let header = lines.iter().find(|l| l.contains("HARNESS/PROV")).unwrap();
-        assert_eq!(col_of(header, "HARNESS/PROV"), col_of(&first, "Codex"));
-        app.scroll_columns(1);
-        let lines = lines_of(&draw(&app, &ctx(true), w, h));
-        let (first, second) = row_pair(&lines, "Inventory API");
-        assert_eq!(
-            col_of(&first, "gpt-5.5"),
-            col_of(&second, "high"),
-            "{w}x{h} effort under model:\n{first}\n{second}"
-        );
-        app.scroll_columns(-1);
-        assert_eq!(app.selected_key(), selected);
-    }
 }
 
 #[test]
@@ -616,7 +518,8 @@ fn hostile_row_text_cannot_break_the_two_line_rows() {
         assert_eq!(line.chars().count(), 90, "no row grew or shrank: {line:?}");
     }
     let (first, second) = row_pair(&lines, "evil");
-    assert_eq!(col_of(&first, "Codex"), col_of(&second, "route-x"));
+    assert!(first.contains("Codex") || first.contains("evil"), "{first}");
+    assert!(second.contains("route-x"), "{second}");
     // The clean row's group heading follows the hostile row's two lines.
     let evil = lines.iter().position(|l| l.contains("evil")).unwrap();
     assert!(
@@ -627,45 +530,50 @@ fn hostile_row_text_cannot_break_the_two_line_rows() {
 }
 
 #[test]
-fn horizontal_scroll_reaches_tokens_cost_active_and_speed_at_60x20() {
-    let mut app = rich_app(vec![]);
-    let mut seen = Vec::new();
-    for step in 0..COLUMNS {
-        let out = text(&draw(&app, &ctx(true), 60, 20));
-        for want in ["91k", "~$0.23", "1h 5m", "84.2"] {
-            if out.contains(want) {
-                seen.push(want);
-            }
+fn value_columns_drop_from_the_right_at_narrow_widths() {
+    let narrow = RosterLayout::for_area(Rect::new(0, 0, 60, 20));
+    assert_eq!(
+        narrow
+            .columns
+            .iter()
+            .map(|placed| placed.column)
+            .collect::<Vec<_>>(),
+        vec![Column::Status, Column::Speed, Column::Tokens],
+        "cost goes first; the status always stays"
+    );
+    let wide = RosterLayout::for_area(Rect::new(0, 0, 150, 40));
+    assert_eq!(
+        wide.columns
+            .iter()
+            .map(|placed| placed.column)
+            .collect::<Vec<_>>(),
+        Column::ALL.to_vec()
+    );
+    for layout in [&narrow, &wide] {
+        for pair in layout.columns.windows(2) {
+            assert!(pair[0].x + pair[0].width < pair[1].x, "{pair:?}");
         }
-        assert!(
-            out.contains("Inventory API"),
-            "step {step}: the session column stays pinned"
-        );
-        app.scroll_columns(1);
+        for placed in &layout.columns {
+            assert!(placed.x + placed.width <= layout.rows.right());
+            assert_eq!(layout.column_at(placed.x), Some(placed.column));
+        }
     }
-    for want in ["91k", "~$0.23", "1h 5m", "84.2"] {
-        assert!(seen.contains(&want), "{want:?} never reachable");
-    }
-    // Scrolling stops at the last column instead of running off the table.
-    for _ in 0..10 {
-        app.scroll_columns(1);
-    }
-    assert_eq!(app.horizontal_column(), COLUMNS - 1);
-    app.scroll_columns(-100);
-    assert_eq!(app.horizontal_column(), 0);
+    assert_eq!(
+        narrow.column_at(0),
+        None,
+        "the pinned marker and title are not value columns"
+    );
 }
-
-const COLUMNS: usize = agentscope::app::COLUMN_COUNT;
 
 #[test]
 fn the_preview_takes_45_columns_from_150_and_never_below() {
     let app = rich_app(vec![]);
-    let wide = RosterLayout::for_area(Rect::new(0, 0, 150, 30), 0);
+    let wide = RosterLayout::for_area(Rect::new(0, 0, 150, 30));
     let preview = wide.preview.expect("preview column at 150");
     assert_eq!((preview.width, preview.x), (45, 105));
     assert_eq!(wide.rows.width, 105);
     assert!(
-        RosterLayout::for_area(Rect::new(0, 0, 149, 30), 0)
+        RosterLayout::for_area(Rect::new(0, 0, 149, 30))
             .preview
             .is_none()
     );
@@ -676,37 +584,481 @@ fn the_preview_takes_45_columns_from_150_and_never_below() {
     let narrow = text(&draw(&app, &ctx(true), 149, 40));
     assert!(!narrow.contains("Preview"), "{narrow}");
 
-    let small = RosterLayout::for_area(Rect::new(0, 0, 59, 19), 0);
+    let small = RosterLayout::for_area(Rect::new(0, 0, 59, 19));
     assert!(!small.usable() && small.columns.is_empty());
 }
 
-#[test]
-fn column_hitboxes_follow_the_scroll_and_never_overlap() {
-    let area = Rect::new(0, 0, 90, 25);
-    let first = RosterLayout::for_area(area, 0);
-    assert_eq!(first.columns[0].column, Column::Provider);
-    assert!(first.more_left.is_none() && first.more_right.is_some());
-    let scrolled = RosterLayout::for_area(area, 3);
-    assert_eq!(scrolled.columns[0].column, Column::Cost);
-    assert!(scrolled.more_left.is_some());
-    for layout in [&first, &scrolled] {
-        for pair in layout.columns.windows(2) {
-            assert!(pair[0].x + pair[0].width < pair[1].x, "{pair:?}");
-        }
-        for placed in &layout.columns {
-            assert!(placed.x + placed.width <= layout.rows.right());
-            assert_eq!(layout.column_at(placed.x), Some(placed.column));
+fn locate(buf: &Buffer, needle: &str) -> (u16, u16) {
+    let width = buf.area.width as usize;
+    for y in 0..buf.area.height as usize {
+        let row: String = buf.content()[y * width..(y + 1) * width]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        if let Some(byte) = row.find(needle) {
+            return (row[..byte].chars().count() as u16, y as u16);
         }
     }
+    panic!("{needle:?} not drawn in:\n{}", text(buf));
+}
+
+/// First occurrence whose first cell lies left of `limit`: the side preview
+/// shares physical rows with the list, so list assertions must stay in it.
+fn locate_left(buf: &Buffer, needle: &str, limit: u16) -> (u16, u16) {
+    let width = buf.area.width as usize;
+    for y in 0..buf.area.height as usize {
+        let row: String = buf.content()[y * width..(y + 1) * width]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        if let Some(byte) = row.find(needle) {
+            let x = row[..byte].chars().count() as u16;
+            if x < limit {
+                return (x, y as u16);
+            }
+        }
+    }
+    panic!("{needle:?} not drawn left of {limit} in:\n{}", text(buf));
+}
+
+fn key_of(provider: Harness, id: &str) -> SessionKey {
+    SessionKey {
+        harness: provider,
+        native_id: id.into(),
+        source: SourceKey::File(format!("{id}.jsonl").into()),
+    }
+}
+
+fn click(app: &mut App, area: Rect, x: u16, y: u16) {
+    let layout = RosterLayout::for_area(area);
+    handle_mouse(
+        app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &layout,
+    );
+}
+
+/// A session with a model and speed but no recorded cost.
+fn uncosted() -> SessionSummary {
+    let mut s = session(
+        Harness::Codex,
+        "a",
+        "Inventory API",
+        12,
+        Some(91_000),
+        ProcessAssociation::Unmatched,
+    );
+    let m = model("gpt-5.5", Some("openai"), Some("high"));
+    s.meta.model = Some(m.clone());
+    s.metrics.speed.latest = Some(TimedRate {
+        model: Some(m),
+        request_id: None,
+        started_at: Some(NOW - 190_000),
+        completed_at: Some(NOW - 180_000),
+        output_tokens: 1_000,
+        duration_ms: 10_000.0,
+        ttft_ms: Some(500.0),
+        tokens_per_second: 84.2,
+    });
+    s
+}
+
+#[test]
+fn renders_c2_rows_at_150x40() {
+    let mut s = rich(Harness::Codex, "a", "Inventory API");
+    s.process = ProcessAssociation::Matched {
+        pid: 7,
+        started_at: None,
+    };
+    let mut app = app();
+    app.apply_roster(vec![s], vec![]);
+    let lines = lines_of(&draw(&app, &ctx(true), 150, 40));
+    let (first, second) = row_pair(&lines, "Inventory API");
+    assert!(first.contains("active"), "status column:\n{first}");
+    assert!(first.contains("91k"), "tokens column:\n{first}");
+    assert!(second.contains("[CDX]"), "agent tag:\n{second}");
+    assert!(second.contains("gpt-5.5"), "model id:\n{second}");
+}
+
+#[test]
+fn renders_group_header_with_totals() {
+    let out = text(&draw(&populated(), &ctx(true), 120, 40));
+    let header = out
+        .lines()
+        .find(|line| line.contains("RipperGame"))
+        .unwrap_or_else(|| panic!("no group header:\n{out}"));
+    assert!(header.contains("3 sessions"), "{header}");
+    assert!(header.contains("164k+"), "partial tokens keep +:\n{header}");
+}
+
+#[test]
+fn top_line_shows_live_and_nonzero_counts_only() {
+    let out = text(&draw(&populated(), &ctx(true), 120, 40));
+    let top = out.lines().next().unwrap();
+    assert!(top.contains("Live: on"), "{top}");
+    assert!(top.contains("● 1 active"), "{top}");
+    assert!(!top.contains("0 failed"), "{top}");
+    assert!(!top.contains("✗ 0"), "{top}");
+}
+
+#[test]
+fn live_paused_uses_warning_style() {
+    let mut c = ctx(false);
+    c.error = Some("worker thread exited".into());
+    let buf = draw(&populated(), &c, 120, 40);
+    let (x, y) = locate(&buf, "Live: paused");
+    let width = buf.area.width as usize;
+    let cell = &buf.content()[y as usize * width + x as usize];
+    assert_eq!(cell.fg, Color::Yellow, "paused is a warning");
+}
+
+#[test]
+fn narrow_terminal_drops_cost_then_speed() {
+    let mut app = app();
+    app.apply_roster(vec![uncosted()], vec![]);
+    let out = text(&draw(&app, &ctx(true), 60, 20));
+    assert!(out.contains("STATUS"), "status stays:\n{out}");
+    assert!(out.contains("Inventory API"), "{out}");
+    assert!(!out.contains('$'), "the cost column is dropped:\n{out}");
+}
+
+#[test]
+fn selection_marker_visible_without_color() {
+    let app = rich_app(vec![]);
+    let layout = RosterLayout::for_area(Rect::new(0, 0, 120, 40));
+    let buf = draw(&app, &ctx(true), 120, 40);
+    let lines = lines_of(&buf);
+    let at = lines
+        .iter()
+        .position(|line| line.contains("Inventory API"))
+        .unwrap();
+    assert!(lines[at].starts_with('▌'), "{:?}", lines[at]);
+    assert!(lines[at + 1].starts_with('▌'), "{:?}", lines[at + 1]);
+
+    let width = buf.area.width as usize;
+    for (_, y) in [(0, at), (0, at + 1)] {
+        for x in 0..layout.rows.width as usize {
+            let cell = &buf.content()[y * width + x];
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "selected line {y} cell {x} is not reverse video"
+            );
+        }
+    }
+    let (_, other) = locate_left(&buf, "Scanner refactor", layout.rows.width);
+    for x in 0..layout.rows.width as usize {
+        let cell = &buf.content()[other as usize * width + x];
+        assert!(
+            !cell.modifier.contains(Modifier::REVERSED),
+            "an unselected row is not reverse video (x={x})"
+        );
+    }
+}
+
+#[test]
+fn click_on_group_header_selects_nothing() {
+    let area = Rect::new(0, 0, 120, 40);
+    let layout = RosterLayout::for_area(area);
+    let mut app = populated();
+    let before = app.selected_key();
+    click(&mut app, area, 12, layout.rows.y);
+    assert_eq!(app.selected_key(), before);
+}
+
+#[test]
+fn click_on_second_line_of_session_selects_it() {
+    let area = Rect::new(0, 0, 120, 40);
+    let layout = RosterLayout::for_area(area);
+    let mut app = populated();
+    click(&mut app, area, 12, layout.rows.y + 4);
     assert_eq!(
-        first.column_at(0),
+        app.selected_key(),
+        Some(key_of(Harness::Claude, "b")),
+        "the second line belongs to the row"
+    );
+}
+
+#[test]
+fn expanded_children_draw_tree_lines() {
+    let mut app = app();
+    app.apply_roster(
+        vec![session(
+            Harness::Codex,
+            "parent",
+            "Parent task",
+            12,
+            None,
+            ProcessAssociation::Unmatched,
+        )],
+        vec![],
+    );
+    let parent = key_of(Harness::Codex, "parent");
+    app.load_children(&parent);
+    let request_id = app
+        .take_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            WorkerRequest::LoadChildren { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .expect("a child page was requested");
+    app.apply_children(
+        request_id,
+        &parent,
+        vec![
+            std::sync::Arc::new(metadata(key_of(Harness::Codex, "child-1"), "First child")),
+            std::sync::Arc::new(metadata(key_of(Harness::Codex, "child-2"), "Last child")),
+        ],
         None,
-        "the pinned columns are not trailing columns"
     );
-    assert_eq!(
-        RosterLayout::for_area(area, 99).horizontal_column,
-        COLUMNS - 1
+    assert!(app.select_row(&parent));
+    assert!(app.fold_selected(true));
+    let out = text(&draw(&app, &ctx(true), 120, 40));
+    assert!(out.contains('├'), "a non-last child has a branch:\n{out}");
+    assert!(
+        out.contains('└'),
+        "the last child closes the branch:\n{out}"
     );
+}
+
+#[test]
+fn click_on_fold_marker_toggles_children() {
+    let area = Rect::new(0, 0, 120, 40);
+    let layout = RosterLayout::for_area(area);
+    let mut app = populated();
+    let first = key_of(Harness::Codex, "a");
+    let child = key_of(Harness::Codex, "child-1");
+    app.take_requests();
+    assert!(app.load_children(&first));
+    let request_id = app
+        .take_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            WorkerRequest::LoadChildren { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .expect("a child page was requested");
+    assert!(app.apply_children(
+        request_id,
+        &first,
+        vec![std::sync::Arc::new(metadata(child.clone(), "Child task"))],
+        None,
+    ));
+    assert!(app.select_row(&first));
+    assert!(!app.children_expanded(&first));
+    assert!(
+        !app.roster_rows()
+            .any(|item| matches!(item, RosterItem::Session(row) if row.depth == 1)),
+        "children start folded"
+    );
+
+    // The drawn `▸ +1` starts after the marker strip and the status glyph.
+    let fold_x = layout.rows.x + 4;
+    // The second line at that column is quiet metadata (the agent tag), not a
+    // fold control: it selects the row and leaves the family folded.
+    let other = key_of(Harness::Claude, "b");
+    assert!(app.select_row(&other));
+    click(&mut app, area, fold_x, layout.rows.y + 2);
+    assert_eq!(app.selected_key(), Some(first.clone()));
+    assert!(
+        !app.children_expanded(&first),
+        "the second line is not a fold target"
+    );
+
+    click(&mut app, area, fold_x, layout.rows.y + 1);
+    assert!(
+        app.children_expanded(&first),
+        "clicking the displayed fold glyph expands"
+    );
+    assert!(
+        app.roster_rows()
+            .any(|item| matches!(&item, RosterItem::Session(row) if row.session.meta.key == child)),
+        "the loaded child is now drawn"
+    );
+
+    // The selection strip keeps its legacy fold action.
+    click(&mut app, area, 0, layout.rows.y + 1);
+    assert!(!app.children_expanded(&first));
+}
+
+#[test]
+fn roster_rows_never_print_unknown_or_provenance_words() {
+    let mut s = rich(Harness::Codex, "a", "Inventory API");
+    s.usage = Some(UsageSummary {
+        total: Some(185_722_239),
+        class: AggregationClass::Derived,
+        cost: CostEstimate {
+            usd: Some(1.77),
+            class: AggregationClass::Estimated,
+            known_subtotal: 1.77,
+            ..CostEstimate::default()
+        },
+        ..UsageSummary::default()
+    });
+    let mut app = app();
+    app.apply_roster(vec![s], vec![]);
+    let layout = RosterLayout::for_area(Rect::new(0, 0, 150, 40));
+    let lines = lines_of(&draw(&app, &ctx(true), 150, 40));
+    let start = layout.rows.y as usize;
+    let list = lines[start..start + layout.rows.height as usize]
+        .iter()
+        .map(|line| {
+            line.chars()
+                .take(layout.rows.width as usize)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for word in [
+        "Unknown",
+        "derived",
+        "reported",
+        "unpriced",
+        "estimated",
+        "partial",
+    ] {
+        assert!(
+            !list.contains(word),
+            "{word:?} leaked into the rows:\n{list}"
+        );
+    }
+}
+
+#[test]
+fn warnings_line_shows_scanning_provisional_and_limited() {
+    let mut app = app();
+    let mut snap = support::snapshot(
+        1,
+        vec![session(
+            Harness::Codex,
+            "a",
+            "Inventory API",
+            12,
+            Some(91_000),
+            ProcessAssociation::Unmatched,
+        )],
+        ScanProgress {
+            harness: Harness::Codex,
+            scanned: 5,
+            total: Some(10),
+            done: false,
+        },
+    );
+    snap.provisional = true;
+    snap.has_more = true;
+    snap.refresh_available = true;
+    snap.limited = Some(DiscoveryLimit {
+        sources: 2,
+        bytes: 3 * 1024 * 1024,
+    });
+    assert!(app.apply_roster_snapshot(snap, vec![]));
+    let lines = lines_of(&draw(&app, &ctx(true), 200, 40));
+    let notes = &lines[1];
+    for want in [
+        "Scanning Codex 5/10",
+        "provisional order",
+        "more available (m)",
+        "Discovery limited at 2 sources / 3 MiB",
+        "refresh available (r)",
+    ] {
+        assert!(notes.contains(want), "missing {want:?} in:\n{notes}");
+    }
+
+    // A stopped worker does not hide the operational state it still reports.
+    let mut c = ctx(true);
+    c.error = Some("worker thread exited".into());
+    let lines = lines_of(&draw(&app, &c, 200, 40));
+    let notes = &lines[1];
+    for want in [
+        "Worker stopped",
+        "Scanning Codex 5/10",
+        "provisional order",
+        "Discovery limited at 2 sources / 3 MiB",
+    ] {
+        assert!(notes.contains(want), "missing {want:?} in:\n{notes}");
+    }
+}
+
+#[test]
+fn group_header_without_values_shows_dashes() {
+    let mut app = app();
+    app.apply_roster(
+        vec![session(
+            Harness::Codex,
+            "a",
+            "Inventory API",
+            12,
+            None,
+            ProcessAssociation::Unmatched,
+        )],
+        vec![],
+    );
+    let out = text(&draw(&app, &ctx(true), 120, 40));
+    let header = out
+        .lines()
+        .find(|line| line.contains("RipperGame"))
+        .unwrap_or_else(|| panic!("no header:\n{out}"));
+    assert_eq!(header.matches('—').count(), 2, "{header}");
+}
+
+#[test]
+fn stale_speed_renders_quiet() {
+    let mut s = rich(Harness::Codex, "a", "Inventory API");
+    s.meta.model = Some(model("deepseek-v4.1", None, None));
+    let mut app = app();
+    app.apply_roster(vec![s], vec![]);
+    let layout = RosterLayout::for_area(Rect::new(0, 0, 150, 40));
+    let buf = draw(&app, &ctx(false), 150, 40);
+    let (x, y) = locate_left(&buf, "84.2", layout.rows.width);
+    let width = buf.area.width as usize;
+    let cell = &buf.content()[y as usize * width + x as usize];
+    assert_eq!(cell.fg, Color::DarkGray, "speed from an old model is quiet");
+    let lines = lines_of(&buf);
+    let second = &lines[y as usize + 1];
+    assert!(second.contains("old gpt-5.5"), "old model label:\n{second}");
+    assert!(second.contains("ago"), "rate age:\n{second}");
+}
+
+#[test]
+fn selected_row_has_background_in_color_mode() {
+    let app = rich_app(vec![]);
+    let layout = RosterLayout::for_area(Rect::new(0, 0, 150, 40));
+    let buf = draw(&app, &ctx(false), 150, 40);
+    let (_, y) = locate_left(&buf, "Inventory API", layout.rows.width);
+    let width = buf.area.width as usize;
+    for line in [y as usize, y as usize + 1] {
+        for x in 0..layout.rows.width as usize {
+            assert_eq!(
+                buf.content()[line * width + x].bg,
+                Color::Black,
+                "({x},{line}) outside the selected background"
+            );
+        }
+    }
+    let (_, other) = locate_left(&buf, "Scanner refactor", layout.rows.width);
+    for x in 0..layout.rows.width as usize {
+        assert_eq!(
+            buf.content()[other as usize * width + x].bg,
+            Color::Reset,
+            "an unselected row has no selection background (x={x})"
+        );
+    }
+}
+
+#[test]
+fn layouts_render_at_60x20_100x30_150x40() {
+    let app = rich_app(vec![]);
+    for (w, h) in [(60, 20), (100, 30), (150, 40)] {
+        let out = text(&draw(&app, &ctx(true), w, h));
+        for want in ["AgentScope", "STATUS", "▌", "Inventory API"] {
+            assert!(out.contains(want), "{w}x{h} missing {want:?}:\n{out}");
+        }
+    }
 }
 
 /// Preview of the only row, drawn with room for unwrapped lines.

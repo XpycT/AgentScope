@@ -99,7 +99,10 @@ fn help_lines(screen: Screen) -> Vec<String> {
             out.push(key("Enter", "Open the inspector / load more"));
             out.push(key("Tab", "Wide: inspector. Narrow: list/preview"));
             out.push(key("Space", "Show or hide a family's children"));
-            out.push(key("Left/Right, h/l", "Scroll the trailing columns"));
+            out.push(key(
+                "Right/Left, l/h",
+                "Expand / collapse; Left on a child selects its parent",
+            ));
             out.push(key("J/K", "Scroll the preview"));
             out.push(key("Mouse", "Click selects; marker expands; wheel"));
             out.push(key("Shift+drag", "Terminal text selection (capture)"));

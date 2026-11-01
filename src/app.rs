@@ -27,8 +27,7 @@ pub use input::{FilterItem, FilterTarget, Panel, ProcessView, SearchScope};
 pub use overlay::{MAX_SOURCE_BYTES, SourceState, SourceView};
 pub use preview::{DetailsState, PreviewState};
 pub use roster::{
-    COLUMN_COUNT, GroupHeader, GroupTotals, LoadFocus, PREVIEW_SPLIT_WIDTH, RosterItem, RosterRows,
-    RosterSession,
+    GroupHeader, GroupTotals, LoadFocus, PREVIEW_SPLIT_WIDTH, RosterItem, RosterRows, RosterSession,
 };
 pub use transcript::{MAX_LOADED_EVENTS, PageKind, Transcript};
 

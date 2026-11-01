@@ -11,9 +11,6 @@ use crate::domain::{SessionKey, SessionSummary, Status};
 
 use super::App;
 
-/// Trailing roster columns: harness/provider, model/effort, tokens, API estimate,
-/// active time and latest tok/s.
-pub const COLUMN_COUNT: usize = 6;
 /// Terminal width at and above which the preview sits beside the list.
 pub const PREVIEW_SPLIT_WIDTH: u16 = 150;
 
@@ -36,11 +33,10 @@ impl LoadFocus {
     }
 }
 
-/// Responsive roster state that is not session data: horizontal column scroll,
-/// preview pane and its independent scroll, and focus on a Load more row.
+/// Responsive roster state that is not session data: the preview pane and its
+/// independent scroll, and focus on a Load more row.
 #[derive(Default)]
 pub(super) struct RosterView {
-    horizontal: usize,
     preview_scroll: usize,
     /// Largest preview scroll of the last rendered preview.
     preview_extent: Cell<usize>,
@@ -327,20 +323,6 @@ impl App {
         true
     }
 
-    /// Index of the first visible trailing column.
-    pub fn horizontal_column(&self) -> usize {
-        self.roster_view.horizontal
-    }
-
-    /// Scroll whole trailing columns left (`< 0`) or right (`> 0`).
-    pub fn scroll_columns(&mut self, delta: isize) {
-        let view = &mut self.roster_view;
-        view.horizontal = view
-            .horizontal
-            .saturating_add_signed(delta)
-            .min(COLUMN_COUNT - 1);
-    }
-
     pub fn preview_scroll(&self) -> usize {
         self.roster_view.preview_scroll
     }
@@ -462,5 +444,45 @@ impl App {
         self.recompute_visual_selection();
         self.select_session(key);
         true
+    }
+
+    /// `→`/`l` expands the selected root, `←`/`h` collapses it. On a child,
+    /// `←` selects its parent root and collapses nothing; on a header, a
+    /// Load more row or no selection nothing happens. Returns whether the
+    /// visible rows changed (or the selection moved).
+    pub fn fold_selected(&mut self, expand: bool) -> bool {
+        if self.roster_view.load_focus.is_some() {
+            return false;
+        }
+        let Some(key) = self.selected.clone() else {
+            return false;
+        };
+        if let Some(parent) = self.child_parent.get(&key).cloned() {
+            if expand {
+                return false; // No deeper levels are rendered today.
+            }
+            return self.select_row(&parent);
+        }
+        if !self.roster_rows().any(|item| {
+            matches!(&item, RosterItem::Session(row)
+                if row.depth == 0 && row.session.meta.key == key)
+        }) {
+            return false;
+        }
+        let before = self.roster_rows().count();
+        if expand {
+            if self.expanded_children.contains(&key) {
+                return false;
+            }
+            self.expanded_children.insert(key.clone());
+            if !self.children.contains_key(&key) {
+                self.load_children(&key);
+            }
+        } else if !self.expanded_children.remove(&key) {
+            return false;
+        }
+        let previous = self.selected_root_position();
+        self.rebuild(previous);
+        self.roster_rows().count() != before
     }
 }
