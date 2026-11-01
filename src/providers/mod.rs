@@ -10,10 +10,13 @@
 
 pub mod claude;
 pub mod codex;
+/// Hermes native `state.db` discovery: homes/profiles, shape probes, metadata.
+pub mod hermes;
 /// OMP sessions and native subagents: catalog, hydration, and the paged reader.
 pub mod omp;
 pub mod opencode;
 pub(crate) mod probe;
+pub(crate) mod sqlite_guard;
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -381,16 +384,22 @@ impl<K: Eq + std::hash::Hash + Clone, V> Forgotten<K, V> {
     }
 
     pub fn insert(&mut self, key: K, value: V) {
+        let _ = self.insert_displacing(key, value);
+    }
+
+    /// Inserts and returns the key displaced to stay within the cap, so a caller
+    /// can drop other bookkeeping for exactly that key.
+    pub fn insert_displacing(&mut self, key: K, value: V) -> Option<K> {
         if self.map.insert(key.clone(), value).is_none() {
             self.order.push_back(key);
         }
-        while self.map.len() > self.cap {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
-            } else {
-                break;
-            }
+        if self.map.len() > self.cap
+            && let Some(old) = self.order.pop_front()
+        {
+            self.map.remove(&old);
+            return Some(old);
         }
+        None
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {

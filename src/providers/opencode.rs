@@ -13,10 +13,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-use rusqlite::{Connection, ErrorCode, OpenFlags, params};
+use rusqlite::{Connection, params};
 use serde_json::Value;
 
+use super::sqlite_guard::{
+    Allowlist, INTERRUPTED, has_rows, map_error, open_read_only_with, shape_present,
+};
 use super::{
     Admit, DiscoveryDelta, FORGOTTEN_CAP, Forgotten, HydrationDelta, JobLedger, ProviderError,
     ProviderReader, ReadJobId, ReadProgress, Retention, SourceRecord, WorkProgress,
@@ -42,8 +44,6 @@ const DEFAULT_BUSY_MS: u64 = 2000;
 const ACTIVITY_WINDOW: usize = 256;
 /// Message rows counted before the per-session activity count saturates.
 const COUNT_CAP: usize = 100_000;
-/// Marks the error a progress-handler interrupt produces.
-const INTERRUPTED: &str = "interrupted at the work-slice deadline";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Schema {
@@ -55,177 +55,91 @@ pub enum Schema {
 }
 
 /// Tables and the only columns of each that SQL may read. Anything else is denied.
-const ALLOWED: &[(&str, &[&str])] = &[
-    (
-        "session_v2",
-        &[
-            "id",
-            "title",
-            "directory",
-            "project_id",
-            "parent_id",
-            "fork_session_id",
-            "model",
-            "version",
-            "time_created",
-            "time_updated",
-            "time_archived",
-            "tokens_input",
-            "tokens_output",
-            "tokens_reasoning",
-            "tokens_cache_read",
-            "tokens_cache_write",
-            "cost",
-            "idle_outcome",
-            "agent",
-        ],
-    ),
-    (
-        "session_message",
-        &[
-            "id",
-            "session_id",
-            "type",
-            "data",
-            "time_created",
-            "time_updated",
-        ],
-    ),
-    ("project", &["id", "name"]),
-    (
-        "session",
-        &[
-            "id",
-            "title",
-            "directory",
-            "project_id",
-            "parent_id",
-            "version",
-            "time_created",
-            "time_updated",
-            "time_archived",
-        ],
-    ),
-    (
-        "message",
-        &["id", "session_id", "time_created", "time_updated", "data"],
-    ),
-    (
-        "part",
-        &[
-            "id",
-            "message_id",
-            "session_id",
-            "time_created",
-            "time_updated",
-            "data",
-        ],
-    ),
-    // Only the table-existence count used to force the WAL/shm handshake on open.
-    ("sqlite_master", &["name"]),
-    ("sqlite_schema", &["name"]),
-];
-
-/// Aggregates only; no extension, file, or text-producing functions.
-const ALLOWED_FUNCTIONS: &[&str] = &["count", "max", "min", "substr", "length", "coalesce"];
-
-fn authorize(ctx: AuthContext<'_>) -> Authorization {
-    match ctx.action {
-        AuthAction::Select => Authorization::Allow,
-        AuthAction::Read {
-            table_name,
-            column_name,
-        } => {
-            let allowed = ALLOWED.iter().any(|(table, columns)| {
-                table.eq_ignore_ascii_case(table_name)
-                    && (column_name.is_empty()
-                        || columns.iter().any(|c| c.eq_ignore_ascii_case(column_name)))
-            });
-            if allowed {
-                Authorization::Allow
-            } else {
-                Authorization::Deny
-            }
-        }
-        AuthAction::Function { function_name } => {
-            if ALLOWED_FUNCTIONS
-                .iter()
-                .any(|f| f.eq_ignore_ascii_case(function_name))
-            {
-                Authorization::Allow
-            } else {
-                Authorization::Deny
-            }
-        }
-        _ => Authorization::Deny,
-    }
-}
-
-fn map_error(error: rusqlite::Error) -> ProviderError {
-    match &error {
-        rusqlite::Error::SqliteFailure(failure, _)
-        | rusqlite::Error::SqlInputError { error: failure, .. } => match failure.code {
-            ErrorCode::DatabaseBusy
-            | ErrorCode::DatabaseLocked
-            | ErrorCode::CannotOpen
-            | ErrorCode::ReadOnly
-            | ErrorCode::SystemIoFailure
-            | ErrorCode::DiskFull
-            | ErrorCode::OutOfMemory
-            | ErrorCode::FileLockingProtocolFailed
-            | ErrorCode::NoLargeFileSupport => ProviderError::Unavailable(error.to_string()),
-            ErrorCode::OperationInterrupted => {
-                ProviderError::Unavailable(format!("OpenCode query {INTERRUPTED}"))
-            }
-            ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt => {
-                ProviderError::Parse(error.to_string())
-            }
-            _ => ProviderError::Internal(error.to_string()),
-        },
-        _ => ProviderError::Internal(error.to_string()),
-    }
-}
+static OPENCODE_ALLOWLIST: Allowlist = Allowlist {
+    tables: &[
+        (
+            "session_v2",
+            &[
+                "id",
+                "title",
+                "directory",
+                "project_id",
+                "parent_id",
+                "fork_session_id",
+                "model",
+                "version",
+                "time_created",
+                "time_updated",
+                "time_archived",
+                "tokens_input",
+                "tokens_output",
+                "tokens_reasoning",
+                "tokens_cache_read",
+                "tokens_cache_write",
+                "cost",
+                "idle_outcome",
+                "agent",
+            ],
+        ),
+        (
+            "session_message",
+            &[
+                "id",
+                "session_id",
+                "type",
+                "data",
+                "time_created",
+                "time_updated",
+            ],
+        ),
+        ("project", &["id", "name"]),
+        (
+            "session",
+            &[
+                "id",
+                "title",
+                "directory",
+                "project_id",
+                "parent_id",
+                "version",
+                "time_created",
+                "time_updated",
+                "time_archived",
+            ],
+        ),
+        (
+            "message",
+            &["id", "session_id", "time_created", "time_updated", "data"],
+        ),
+        (
+            "part",
+            &[
+                "id",
+                "message_id",
+                "session_id",
+                "time_created",
+                "time_updated",
+                "data",
+            ],
+        ),
+        // Only the table-existence count used to force the WAL/shm handshake on open.
+        ("sqlite_master", &["name"]),
+        ("sqlite_schema", &["name"]),
+    ],
+    // Aggregates only; no extension, file, or text-producing functions.
+    functions: &["count", "max", "min", "substr", "length", "coalesce"],
+};
 
 /// Opens `path` read-only behind the authorizer. The first schema read happens
 /// here so a WAL that needs a sidecar SQLite cannot create surfaces as
 /// `Unavailable` immediately rather than on a later query.
 pub fn open_read_only(path: &Path) -> Result<Connection, ProviderError> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let mut conn = Connection::open_with_flags(path, flags).map_err(map_error)?;
-    conn.busy_timeout(Duration::from_millis(DEFAULT_BUSY_MS))
-        .map_err(map_error)?;
-    conn.pragma_update(None, "query_only", true)
-        .map_err(map_error)?;
-    conn.authorizer(Some(authorize)).map_err(map_error)?;
-    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
-        r.get::<_, i64>(0)
-    })
-    .map_err(map_error)?;
-    Ok(conn)
+    open_read_only_with(path, &OPENCODE_ALLOWLIST, DEFAULT_BUSY_MS)
 }
 
 const V2_SESSION_COLUMNS: &str = "id, title, directory, project_id, parent_id, fork_session_id, \
      model, version, time_created, time_updated, time_archived";
 const LEGACY_SESSION_COLUMNS: &str = "id, title, directory, project_id, parent_id, version, time_created, time_updated, time_archived";
-
-/// True when `sql` prepares. A SQLite "no such table/column" error means the shape
-/// is absent; authorization and I/O failures are real errors.
-fn shape_present(conn: &Connection, sql: &str) -> Result<bool, ProviderError> {
-    match conn.prepare(sql) {
-        Ok(_) => Ok(true),
-        Err(
-            rusqlite::Error::SqliteFailure(f, _) | rusqlite::Error::SqlInputError { error: f, .. },
-        ) if f.code == ErrorCode::Unknown => Ok(false),
-        Err(e) => Err(map_error(e)),
-    }
-}
-
-fn has_rows(conn: &Connection, table: &str) -> Result<bool, ProviderError> {
-    conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table})"), [], |r| {
-        r.get::<_, bool>(0)
-    })
-    .map_err(map_error)
-}
 
 /// v2 when its tables are recognised and populated; legacy when v2 is absent or
 /// empty and the legacy shape is recognised; otherwise unsupported. Never guesses.
