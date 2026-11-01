@@ -9,13 +9,15 @@
 //! assistant `durationMs` is the only request timing this adapter treats as
 //! measured. Forks are separate files with their own `parentSession` evidence.
 //!
-//! No [`crate::providers::ProviderReader`] is registered for Pi yet: this stage
-//! exposes the discovery, parsing and hydration components that the reader will
-//! drive, and never a test-only provider path.
+//! [`PiScanner`] drives those components as the registered adapter: budgeted
+//! discovery/hydration, a bounded transcript/source index per opened session, and
+//! job-scoped cancellation. There is no test-only provider path.
 
+pub mod events;
 pub mod hydration;
 pub mod metadata;
 pub mod record;
+pub mod scanner;
 pub mod tree;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -37,6 +39,7 @@ pub use record::{
     assistant_model, categories_incomplete, invalid_money, parse_entry, parse_header,
     parse_pi_usage, prompt_tokens, record_may_carry_usage, reported_total, total_conflicts,
 };
+pub use scanner::PiScanner;
 pub use tree::{PiInsert, PiOwnership, PiTree, PiTreeError};
 
 /// Directory entries examined from one bucket.

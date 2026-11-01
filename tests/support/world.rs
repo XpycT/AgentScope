@@ -43,6 +43,11 @@ pub struct World {
     pub omp_on: bool,
     /// The OMP family of [`World::with_omp`] (the native world keeps it in [`Grown`]).
     pub omp_plant: Option<OmpPlant>,
+    /// Directory `plant_pi` fills; configured only when `pi_on`.
+    pub pi_root: PathBuf,
+    pub pi_on: bool,
+    /// The Pi family of [`World::with_pi`] (the native world keeps it in [`Grown`]).
+    pub pi_plant: Option<PiPlant>,
     /// Hermes home (its own `state.db` and a `profiles/work` database).
     pub hermes_home: PathBuf,
     /// Held open like a live Hermes writer so committed rows stay in the WAL.
@@ -178,6 +183,7 @@ impl World {
             .unwrap();
 
         let omp_root = dir.path().join("omp").join("agent").join("sessions");
+        let pi_root = dir.path().join("pi").join("agent").join("sessions");
         let hermes_home = dir.path().join("hermes");
         World {
             dir,
@@ -189,6 +195,9 @@ impl World {
             omp_root,
             omp_on: false,
             omp_plant: None,
+            pi_root,
+            pi_on: false,
+            pi_plant: None,
             hermes_home,
             hermes_writers: Vec::new(),
             hermes_on: false,
@@ -203,6 +212,7 @@ impl World {
             opencode_db: Some(self.db.clone()),
             no_processes: true,
             omp_sessions: self.omp_on.then(|| self.omp_root.clone()),
+            pi_sessions: self.pi_on.then(|| self.pi_root.clone()),
             ..CliOverrides::default()
         };
         cli.claude_desktop = self.grown.as_ref().map(|g| g.desktop.data.clone());
@@ -222,6 +232,11 @@ impl World {
         ];
         if self.omp_on {
             readers.push(Box::new(OmpScanner::new(&config).expect("omp")));
+        }
+        if self.pi_on {
+            readers.push(Box::new(
+                agentscope::providers::pi::PiScanner::new(&config).expect("pi"),
+            ));
         }
         if self.hermes_on {
             readers.push(Box::new(
@@ -245,6 +260,22 @@ impl World {
                 nested: NOW_MS - 380_000,
                 fork: NOW_MS - 370_000,
                 secret: NOW_MS - 360_000,
+            },
+        ));
+        world
+    }
+
+    /// The three-provider World plus a Pi family (parent, fork, secret-bearing
+    /// session) and Pi credential/extension decoys.
+    pub fn with_pi() -> Self {
+        let mut world = World::new();
+        world.pi_on = true;
+        world.pi_plant = Some(plant_pi(
+            &world.pi_root,
+            PiTimes {
+                parent: NOW_MS - 400_000,
+                fork: NOW_MS - 390_000,
+                secret: NOW_MS - 380_000,
             },
         ));
         world
@@ -848,6 +879,7 @@ pub struct Grown {
     pub secret_codex: SessionKey,
     pub secret_opencode: SessionKey,
     pub omp: OmpPlant,
+    pub pi: PiPlant,
     /// An OpenCode database whose WAL cannot be opened without a sidecar SQLite may not
     /// create (a directory occupies the `-shm` name).
     pub locked_db: PathBuf,
@@ -906,6 +938,7 @@ impl World {
     pub fn native() -> Self {
         let mut world = World::new();
         world.omp_on = true;
+        world.pi_on = true;
         let grown = grow(&world);
         world.grown = Some(grown);
         world
@@ -934,6 +967,11 @@ impl World {
         ];
         if self.omp_on {
             readers.push(Box::new(OmpScanner::new(&config).expect("omp")));
+        }
+        if self.pi_on {
+            readers.push(Box::new(
+                agentscope::providers::pi::PiScanner::new(&config).expect("pi"),
+            ));
         }
         readers.push(Box::new(opencode));
         readers
@@ -1453,6 +1491,27 @@ fn grow(world: &World) -> Grown {
     direct_tokens.extend(omp.tokens.clone());
     tails.push((omp.family.parent.clone(), OMP_TAIL.into()));
 
+    // ---- Pi: a native parent with a recorded request, a fork that copies its history
+    // verbatim (only its own call is charged), a secret-bearing root, and decoys that
+    // are never read: no extension child exists in the native format.
+    let pi_parent_t = next();
+    let pi_fork_t = next();
+    let pi_secret_t = next();
+    let pi = plant_pi(
+        &world.pi_root,
+        PiTimes {
+            parent: pi_parent_t,
+            fork: pi_fork_t,
+            secret: pi_secret_t,
+        },
+    );
+    roots.push((pi.parent.clone(), pi_parent_t));
+    roots.push((pi.fork.clone(), pi_fork_t));
+    roots.push((pi.secret.clone(), pi_secret_t));
+    forks.push((pi.fork.clone(), pi.parent.clone()));
+    direct_tokens.extend(pi.tokens.clone());
+    tails.extend(pi.tails.clone());
+
     // ---- Plain roots up to exactly ROOT_COUNT, spread across the three harnesses.
     let fillers = ROOT_COUNT - roots.len();
     for n in 0..fillers {
@@ -1559,6 +1618,7 @@ fn grow(world: &World) -> Grown {
         secret_codex,
         secret_opencode,
         omp,
+        pi,
         locked_db,
         _locked_writer: locked_writer,
     }
@@ -1777,6 +1837,163 @@ pub fn plant_omp(root: &Path, t: OmpTimes) -> OmpPlant {
         secret: key("omp-secret", secret),
         decoys,
         family,
+    }
+}
+
+// ---- Pi -----------------------------------------------------------------------------
+
+/// Text of the newest transcript entry of the planted Pi family parent.
+pub const PI_TAIL: &str = "pi family tail entry";
+
+/// Recorded activity (epoch ms) of each planted Pi session.
+pub struct PiTimes {
+    pub parent: i64,
+    pub fork: i64,
+    pub secret: i64,
+}
+
+/// What [`plant_pi`] wrote.
+pub struct PiPlant {
+    pub parent: SessionKey,
+    pub fork: SessionKey,
+    pub secret: SessionKey,
+    /// Exact lifetime tokens each planted session owns (a fork's copied history is not
+    /// its own spend).
+    pub tokens: Vec<(SessionKey, u64)>,
+    /// The newest entry text of each session the roster can open.
+    pub tails: Vec<(SessionKey, String)>,
+    /// Credential/extension decoys: never read, never listed.
+    pub decoys: Vec<PathBuf>,
+}
+
+/// Plants a native Pi sessions tree under `root` (the `sessions` directory of an agent
+/// directory) with credential decoys. Native Pi has no child-session record, so this
+/// plants a fork (its own root) and no extension children.
+pub fn plant_pi(root: &Path, t: PiTimes) -> PiPlant {
+    use super::pi as px;
+
+    let bucket = "work";
+    let stamped = |entry: Value, ms: i64| px::at(entry, &iso(ms));
+    let key = |id: &str, name: &str| {
+        file_key(
+            Harness::Pi,
+            id,
+            &root.join(bucket).join(format!("{name}.jsonl")),
+        )
+    };
+
+    let prompt = "Pi family prompt";
+    let copied = [
+        stamped(
+            px::message("pu0", None, "user", prompt, None),
+            t.parent - 3_000,
+        ),
+        stamped(
+            px::model_change("pm1", "pu0", "anthropic", "claude-test"),
+            t.parent - 2_500,
+        ),
+        stamped(
+            px::message(
+                "pa1",
+                Some("pm1"),
+                "assistant",
+                PI_TAIL,
+                Some(px::usage(600, 0, 400, 0)),
+            ),
+            t.parent,
+        ),
+    ];
+    let parent_file = px::write_session(root, bucket, "pi-parent", &{
+        let mut entries = vec![px::header("pi-parent", None)];
+        entries.extend(copied.iter().cloned());
+        entries
+    });
+
+    // A producer fork: a new header naming the source file and every earlier entry
+    // copied verbatim, then one new request of its own.
+    let fork = "pi-fork";
+    let mut fork_entries = vec![px::header("pi-fork", Some(&parent_file.to_string_lossy()))];
+    fork_entries.extend(copied.iter().cloned());
+    fork_entries.push(stamped(
+        px::message(
+            "f1",
+            Some("pa1"),
+            "assistant",
+            "pi fork answer",
+            Some(px::usage(10, 5, 0, 0)),
+        ),
+        t.fork,
+    ));
+    px::write_session(root, bucket, fork, &fork_entries);
+
+    // A credential-shaped prompt in a discoverable session: it must never surface
+    // outside the explicit raw source view.
+    let secret = "pi-secret";
+    px::write_session(
+        root,
+        bucket,
+        secret,
+        &[
+            stamped(px::header("pi-secret", None), t.secret - 2_000),
+            stamped(
+                px::message(
+                    "su0",
+                    None,
+                    "user",
+                    &format!("Pi private password={INLINE_SECRET} \u{1b}[2J"),
+                    None,
+                ),
+                t.secret - 1_000,
+            ),
+            stamped(
+                px::session_info("si1", "su0", &format!("ops token={INLINE_SECRET}")),
+                t.secret - 900,
+            ),
+            stamped(
+                px::message(
+                    "sa1",
+                    Some("si1"),
+                    "assistant",
+                    "acknowledged",
+                    Some(px::usage(1, 1, 0, 0)),
+                ),
+                t.secret,
+            ),
+        ],
+    );
+
+    // Decoys in places no native session lives: beside the root, inside a bucket as a
+    // non-JSONL file, and one level below a bucket (never entered). A backup copy of a
+    // real session name is not a session either.
+    let body = format!("{{\"token\":\"{SENTINEL}\"}}");
+    let mut decoys = Vec::new();
+    for path in [
+        root.join("auth.json"),
+        root.join("notes.jsonl"),
+        root.join(bucket).join("credentials.json"),
+        root.join(bucket).join("pi-secret.jsonl.bak"),
+        root.join(bucket).join("blobs").join("sha256-pi.jsonl"),
+        root.join(bucket).join("ext").join("child.jsonl"),
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &body).unwrap();
+        decoys.push(path);
+    }
+
+    let parent_key = key("pi-parent", "pi-parent");
+    let fork_key = key("pi-fork", fork);
+    let secret_key = key("pi-secret", secret);
+    PiPlant {
+        tokens: vec![
+            (parent_key.clone(), 1_000),
+            (fork_key.clone(), 15),
+            (secret_key.clone(), 2),
+        ],
+        tails: vec![(parent_key.clone(), PI_TAIL.into())],
+        parent: parent_key,
+        fork: fork_key,
+        secret: secret_key,
+        decoys,
     }
 }
 

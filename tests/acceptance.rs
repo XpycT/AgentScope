@@ -1328,3 +1328,151 @@ fn ac_hermes_profiles_chains_and_compaction_surface_end_to_end() {
     }));
     worker.shutdown();
 }
+
+#[test]
+fn pi_family_opens_through_the_real_worker_app_and_renderer() {
+    use support::pi as px;
+
+    let world = World::with_pi();
+    let plant = world.pi_plant.as_ref().expect("planted Pi family");
+    let (parent, fork, secret) = (
+        plant.parent.clone(),
+        plant.fork.clone(),
+        plant.secret.clone(),
+    );
+    let mut h = Driver::start(&world);
+    // Three native sessions plus the Pi parent, its fork root and the secret-bearing
+    // root. Native Pi has no child-session record, so nothing is nested.
+    h.pump_until("roster", |a| a.total_sessions() == 6);
+    let screen = h.screen();
+    assert!(screen.contains("Pi"), "{screen}");
+
+    // The family has no children: a Pi row toggles nothing and invents no subagent.
+    assert!(h.app.select_row(&parent));
+    h.ch(' ');
+    assert!(
+        h.app
+            .children_of(&parent)
+            .is_none_or(|c| c.metadata.is_empty())
+    );
+
+    // Direct lifetime usage only: the fork's copied history belongs to its parent.
+    h.pump_until("parent facts", |a| {
+        a.session(&parent)
+            .and_then(|r| r.session.usage.as_ref().map(|u| u.total))
+            == Some(Some(1_000))
+    });
+    let parent_row = h.app.session(&parent).unwrap();
+    let summary = parent_row.session.clone();
+    assert_eq!(
+        summary.meta.model.as_ref().map(|m| m.provider.as_deref()),
+        Some(Some("anthropic"))
+    );
+    assert!(
+        summary.metrics.speed.latest.is_none(),
+        "no recorded duration means Unknown speed"
+    );
+    assert_eq!(summary.metrics.timing.ended_at, None);
+    assert_eq!(summary.lifecycle, Lifecycle::Unknown);
+
+    // Open the parent at its true latest event.
+    h.key(KeyCode::Enter);
+    assert_eq!(h.app.screen, Screen::Inspector);
+    h.pump_until("latest page", |a| {
+        a.transcript().is_some_and(|t| t.loaded())
+    });
+    let last = h
+        .app
+        .transcript()
+        .unwrap()
+        .events()
+        .last()
+        .and_then(|e| e.text.as_ref())
+        .map(|t| t.preview.clone());
+    assert_eq!(last.as_deref(), Some(support::world::PI_TAIL));
+    let screen = h.screen();
+    assert!(screen.contains(support::world::PI_TAIL), "{screen}");
+
+    // Record-level details: the owned request's categories, and the model change.
+    assert!(h.app.request_details());
+    h.pump_until("details", |a| a.details().complete());
+    let page = h.app.details().page().clone();
+    assert_eq!(page.requests.len(), 1);
+    assert_eq!(page.requests[0].categories.input, Some(600));
+    assert_eq!(page.requests[0].categories.cache_read, Some(400));
+    assert!(page.compactions.is_empty());
+    h.ch('i');
+    let info = h.screen();
+    assert!(info.contains("Tokens: 1,000"), "{info}");
+    assert!(info.contains("Provider: Pi"), "{info}");
+    assert!(info.contains("Effort: Unknown"), "{info}");
+
+    // The capability text says extension children are unsupported instead of
+    // claiming a verified zero.
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Esc);
+    assert_eq!(h.app.screen, Screen::Roster);
+    h.ch('?');
+    assert_eq!(h.app.panel(), agentscope::app::Panel::Help);
+    let help = h.screen();
+    assert!(
+        help.contains("Pi extension subagents: unsupported in this release"),
+        "{help}"
+    );
+
+    // A live append arrives through refresh, is counted once and is loaded.
+    h.key(KeyCode::Esc);
+    assert!(h.app.select_row(&parent));
+    h.key(KeyCode::Enter);
+    h.pump_until("reopened transcript", |a| {
+        a.transcript().is_some_and(|t| t.loaded())
+    });
+    let path = match &parent.source {
+        SourceKey::File(path) => path.clone(),
+        other => panic!("{other:?}"),
+    };
+    px::append(
+        &path,
+        &[px::message(
+            "pu2",
+            Some("pa1"),
+            "user",
+            "Pi live append",
+            None,
+        )],
+    );
+    h.worker.tx.send(WorkerRequest::Refresh).unwrap();
+    h.pump_until("new events", |a| a.new_event_count() == 1);
+    h.ch('G');
+    h.pump_until("appended event", |a| {
+        a.transcript().is_some_and(|t| {
+            t.events()
+                .last()
+                .and_then(|e| e.text.as_ref())
+                .is_some_and(|t| t.preview == "Pi live append")
+        })
+    });
+
+    // The source view serves the exact record.
+    h.ch('v');
+    h.pump_until("source", |a| {
+        a.source_view()
+            .is_some_and(|v| !matches!(v.state, agentscope::app::SourceState::Loading))
+    });
+    assert!(h.screen().contains("Pi live append"), "{}", h.screen());
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Esc);
+
+    // The fork lists only its own request; the copied parent call is not charged.
+    assert!(h.app.select_row(&fork));
+    h.pump_until("fork facts", |a| {
+        a.session(&fork)
+            .and_then(|r| r.session.usage.as_ref().map(|u| u.total))
+            == Some(Some(15))
+    });
+    // The secret-bearing root is listed, and its title is masked.
+    let masked = h.app.session(&secret).unwrap().session.meta.title.clone();
+    assert!(masked.contains("[REDACTED]"), "{masked}");
+    assert!(h.worker.shutdown());
+}

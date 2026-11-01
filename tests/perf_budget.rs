@@ -967,9 +967,9 @@ fn native_world_discovery_and_hydration_stay_within_each_call_budget() {
     let record_cap = world.config().max_record_bytes;
     let mut readers = world.readers();
     let mut sessions = 0;
-    // Codex, Claude and OMP are file readers (OMP is registered after Claude); the
+    // Codex, Claude, OMP and Pi are file readers (registered before OpenCode); the
     // OpenCode database is covered by its own tests.
-    for reader in readers.iter_mut().take(3) {
+    for reader in readers.iter_mut().take(4) {
         let mut keys = Vec::new();
         let mut calls = 0usize;
         loop {
@@ -1374,4 +1374,130 @@ fn pi_hydration_respects_each_slice_budget() {
         assert!(slices < 10_000);
     }
     assert!(slices > 1, "the budget forces resumable slices");
+}
+
+/// P3: a multi-MiB native Pi session is probed by prefix/tail only, then hydrated and
+/// indexed in bounded calls, and a transcript page afterwards reads the page, not the
+/// whole file.
+#[test]
+fn pi_large_session_is_probed_hydrated_and_indexed_in_bounded_calls() {
+    use agentscope::providers::pi::PiScanner;
+    use agentscope::providers::{ProviderReader, ReadProgress};
+    use support::pi as px;
+    use support::world::new_job;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sessions");
+    let text = "word ".repeat(40);
+    let mut entries = vec![px::header("big", None)];
+    let mut last: Option<String> = None;
+    for n in 0..20_000 {
+        let id = format!("e{n}");
+        entries.push(if n % 4 == 3 {
+            px::message(
+                &id,
+                last.as_deref(),
+                "assistant",
+                &text,
+                Some(px::usage(0, 10, 0, 0)),
+            )
+        } else {
+            px::message(&id, last.as_deref(), "user", &text, None)
+        });
+        last = Some(id);
+    }
+    let path = px::write_session(&root, "b", "t1_big", &entries);
+    let len = fs::metadata(&path).unwrap().len();
+    assert!(len > 4 * 1024 * 1024, "a multi-MiB source: {len}");
+    let cli = CliOverrides {
+        pi_sessions: Some(root.clone()),
+        ..CliOverrides::default()
+    };
+    let config = Config::load_with_env(&cli, &Env::new()).unwrap();
+    let record_cap = config.max_record_bytes;
+    let mut scanner = PiScanner::new(&config).unwrap();
+
+    // Discovery reads the bounded prefix and tail of the source, never its middle.
+    perf::reset();
+    let mut keys = Vec::new();
+    loop {
+        let before = perf::snapshot().bytes_read;
+        let delta = scanner.discover(NOW, CHUNK).expect("discover");
+        assert!(perf::snapshot().bytes_read - before <= CHUNK.max_bytes as u64 + PROBE_MAX);
+        keys.extend(delta.sessions.into_iter().map(|m| m.key));
+        if delta.scan.done {
+            break;
+        }
+    }
+    assert!(
+        perf::snapshot().bytes_read <= PROBE_MAX,
+        "prefix and tail only"
+    );
+    keys.dedup();
+    assert_eq!(keys.len(), 1);
+    let key = keys.remove(0);
+
+    // Hydration: every call stays inside the slice budget.
+    let job = new_job();
+    let mut calls = 0usize;
+    loop {
+        perf::reset();
+        let delta = scanner.hydrate(job, &key, NOW, CHUNK).expect("hydrate");
+        let used = perf::snapshot();
+        assert!(used.bytes_read <= (CHUNK.max_bytes + record_cap + 1) as u64);
+        assert!(used.records_parsed <= CHUNK.max_records as u64);
+        calls += 1;
+        if delta.done {
+            assert_eq!(delta.summary.displayed_event_count, 20_000);
+            break;
+        }
+        assert!(calls < 10_000, "hydration never finished");
+    }
+    assert!(calls > 20, "{calls} slices for 20k records");
+
+    // Indexing yields between slices; the finishing call also reads one page.
+    let request = PageRequest {
+        max_events: 50,
+        max_bytes: 262_144,
+    };
+    let job = new_job();
+    let mut pending = 0usize;
+    let page = loop {
+        perf::reset();
+        let result = scanner
+            .transcript_page(job, &key, None, PageDirection::Backward, request, CHUNK)
+            .expect("page");
+        let used = perf::snapshot();
+        match result {
+            ReadProgress::Pending(_) => {
+                pending += 1;
+                assert!(used.bytes_read <= (CHUNK.max_bytes + record_cap + 1) as u64);
+                assert!(used.records_parsed <= CHUNK.max_records as u64);
+            }
+            ReadProgress::Ready(page) => {
+                assert!(used.bytes_read <= CHUNK.max_bytes as u64 + 50 * 4096);
+                break page;
+            }
+        }
+        assert!(pending < 10_000, "indexing never finished");
+    };
+    assert!(pending > 20, "{pending} indexing slices");
+    assert_eq!(page.events.len(), 50);
+    assert!(page.has_more);
+
+    // An older page afterwards reads about its own events, not the file.
+    perf::reset();
+    let older = support::world::transcript_ready(
+        &mut scanner,
+        &key,
+        page.next.clone(),
+        PageDirection::Backward,
+        request,
+        CHUNK,
+        support::world::STEPS,
+    );
+    let used = perf::snapshot();
+    assert_eq!(older.events.len(), 50);
+    assert!(used.bytes_read < len / 50, "{} of {len}", used.bytes_read);
+    assert!(used.bytes_read <= 50 * 4096);
 }

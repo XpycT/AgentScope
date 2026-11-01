@@ -68,7 +68,7 @@ pub struct CliOverrides {
     pub opencode_db: Option<PathBuf>,
     /// Exact OMP sessions root (resolved only; no OMP reader exists yet).
     pub omp_sessions: Option<PathBuf>,
-    /// Exact Pi sessions root (resolved only; no Pi reader exists yet).
+    /// Exact Pi sessions root (resolved only; read by the native Pi reader).
     pub pi_sessions: Option<PathBuf>,
     /// Exact Hermes `state.db` (resolved only; no Hermes reader exists yet).
     pub hermes_db: Option<PathBuf>,

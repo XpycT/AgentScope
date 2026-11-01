@@ -119,8 +119,12 @@ fn help_lines(screen: Screen) -> Vec<String> {
             out.push("Codex records cumulative usage only, so it has no request list.".into());
             out.push("A Claude ID beyond the probe window is flagged approximate.".into());
             out.push("Not read: Desktop chat history (only Code manifests and".into());
-            out.push("Cowork project stores), WSL, remote and cloud sessions, and".into());
-            out.push("Pi sessions (no reader yet).".into());
+            out.push("Cowork project stores), WSL, remote and cloud sessions.".into());
+            out.push("Pi extension subagents: unsupported in this release (the".into());
+            out.push("native format has no child-session records, so none are".into());
+            out.push("listed rather than a verified zero). Pi request speed stays".into());
+            out.push("Unknown unless an assistant record carries durationMs; the".into());
+            out.push("producer records no session end or active interval.".into());
             out.push("OMP: compaction cost is Unknown (the producer persists no".into());
             out.push("summarization usage); child links and totals follow the".into());
             out.push("artifact tree, and a parent's quoted child cost is not added.".into());

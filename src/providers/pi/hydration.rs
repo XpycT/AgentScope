@@ -323,6 +323,33 @@ impl PiHydration {
         &self.meta
     }
 
+    /// Ownership of a recorded entry's call, as the bounded tree proved it. Before
+    /// any slice (or after cancellation) nothing is owned, so it is `Unknown`.
+    pub fn ownership(&self, entry_id: &str) -> PiOwnership {
+        self.work.as_ref().map_or(PiOwnership::Unknown, |work| {
+            work.fold.tree.ownership(entry_id)
+        })
+    }
+
+    /// Continues a completed fold after append-only growth: the source reader keeps
+    /// its consumed position, so the next [`PiHydration::step`] reads the appended
+    /// records once. A finished fold of an unsupported header stays finished.
+    pub fn resume(&mut self) {
+        if let Some(work) = &mut self.work
+            && matches!(work.phase, Phase::Done)
+            && !work.unsupported
+        {
+            work.phase = Phase::Entries;
+        }
+    }
+
+    /// Refreshes the discovery metadata a fold reports (title, project, activity, model
+    /// fallback) without touching accounting state or the source position. Identity and
+    /// relationships must be unchanged; the scanner only rebases within one identity.
+    pub fn rebase(&mut self, meta: crate::domain::SessionMetadata) {
+        self.meta = meta;
+    }
+
     /// Requests the ledger currently holds (zero once cancelled).
     pub fn retained_requests(&self) -> usize {
         self.work

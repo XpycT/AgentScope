@@ -39,7 +39,7 @@ fn string_field(object: &Map<String, Value>, key: &str, max: usize) -> Option<St
     clean(object.get(key)?.as_str()?, max)
 }
 
-fn parse_time(text: &str) -> Option<Timestamp> {
+pub(super) fn parse_time(text: &str) -> Option<Timestamp> {
     DateTime::parse_from_rfc3339(text)
         .ok()
         .map(|t| t.timestamp_millis())

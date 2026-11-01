@@ -1442,3 +1442,94 @@ fn pi_metadata_and_records_never_debug_private_content() {
         assert_clean("pi warning source", &warning.key.source);
     }
 }
+
+#[test]
+fn pi_titles_prompts_and_decoys_never_surface() {
+    let world = World::with_pi();
+    let plant = world.pi_plant.as_ref().expect("planted Pi family");
+    let mut readers = world.readers();
+    let surface = exercise_everything(&mut readers);
+    let forbidden = [SENTINEL, INLINE_SECRET, "\u{1b}", "\u{7}"];
+    let clean = |label: &str, text: &str| {
+        for needle in forbidden {
+            assert!(
+                !text.contains(needle),
+                "{label} leaked {needle:?}: {}",
+                text.chars().take(200).collect::<String>()
+            );
+        }
+    };
+    for session in &surface.sessions {
+        let m = &session.meta;
+        clean("meta", &format!("{m:?} {m:#?}"));
+        clean("title", &m.title);
+        clean("project", m.project.as_deref().unwrap_or(""));
+        clean("summary", &format!("{session:?}"));
+    }
+    for w in &surface.warnings {
+        clean("warning", &format!("{w:?} {}", w.message));
+    }
+    for page in &surface.pages {
+        clean("page", &format!("{page:?}"));
+        for e in &page.events {
+            if let Some(t) = &e.text {
+                clean("event text", &t.preview);
+            }
+            if let Some(tool) = &e.tool {
+                clean("tool", &tool.name);
+            }
+        }
+        for d in &page.diagnostics {
+            clean("diagnostic", &d.label);
+        }
+    }
+    // The secret-bearing session is listed with a masked title, and its prompt and
+    // extension-name notices are masked rather than missing.
+    let secret = surface
+        .sessions
+        .iter()
+        .find(|s| s.meta.key == plant.secret)
+        .expect("secret session");
+    assert!(
+        secret.meta.title.contains("[REDACTED]"),
+        "{}",
+        secret.meta.title
+    );
+    let reader = readers
+        .iter_mut()
+        .find(|r| r.harness() == Harness::Pi)
+        .unwrap();
+    let page = transcript_ready(
+        reader.as_mut(),
+        &plant.secret,
+        None,
+        PageDirection::Backward,
+        PAGE,
+        BIG,
+        STEPS,
+    );
+    let prompt = page
+        .events
+        .iter()
+        .filter_map(|e| e.text.as_ref())
+        .map(|t| t.preview.as_str())
+        .find(|t| t.contains("password="))
+        .expect("the credential-shaped prompt is shown");
+    assert!(prompt.contains("[REDACTED]"), "{prompt}");
+    assert!(
+        page.events
+            .iter()
+            .filter_map(|e| e.text.as_ref())
+            .any(|t| t.preview.contains("session name: ops token=[REDACTED]"))
+    );
+    // The raw source view is the explicit opt-in; its display form is still sanitized
+    // and masked, and event Debug output carries no content.
+    for event in &page.events {
+        assert!(!format!("{event:?}").contains("Pi private"));
+        let record = try_source(reader.as_mut(), &event.provenance.locator, BIG, STEPS).unwrap();
+        for needle in [SENTINEL, INLINE_SECRET, "\u{1b}"] {
+            assert!(!record.display.contains(needle), "{needle:?}");
+        }
+        assert!(!format!("{record:?}").contains("Pi private"));
+    }
+}

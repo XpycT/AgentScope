@@ -761,3 +761,94 @@ fn hermes_profiles_and_decoy_credentials_leave_provider_content_unchanged() {
         assert!(messages > 0);
     }
 }
+
+// ---- Pi: the native store and its decoys stay untouched and unread ----------------
+
+#[test]
+fn pi_sessions_and_decoy_stores_are_never_written_and_decoys_never_opened() {
+    let world = World::with_pi();
+    let plant = world.pi_plant.as_ref().expect("planted Pi family");
+    let before_files = snapshot(world.dir.path());
+    let before_paths = all_paths(world.dir.path());
+    let before_meta = metadata(&world);
+
+    // Every decoy is held exclusively; a reader that tried to open one would fail or
+    // warn, and all three sessions are still found with records served.
+    let locks: Vec<Unreadable> = plant.decoys.iter().map(|p| Unreadable::new(p)).collect();
+    let locked = locks.iter().filter(|l| l.active).count();
+
+    let mut readers = world.readers();
+    let surface = exercise_everything(&mut readers);
+    let _ = exercise_everything(&mut readers);
+    // Three base sessions plus the Pi parent, fork and secret-bearing session.
+    assert_eq!(surface.sessions.len(), 6);
+    let pi: Vec<_> = surface
+        .sessions
+        .iter()
+        .filter(|s| s.meta.key.harness == agentscope::domain::Harness::Pi)
+        .collect();
+    assert_eq!(pi.len(), 3);
+    for session in &pi {
+        assert!(session.meta.source_available, "{:?}", session.meta.key);
+        assert!(session.meta.lineage.parent.is_none());
+    }
+    for warning in &surface.warnings {
+        let text = format!("{} {}", warning.key.source, warning.message);
+        for decoy in &plant.decoys {
+            let name = decoy.file_name().unwrap().to_string_lossy();
+            assert!(
+                !text.contains(name.as_ref()),
+                "a decoy was reported: {text}"
+            );
+        }
+    }
+    for session in &pi {
+        let reader = readers
+            .iter_mut()
+            .find(|r| r.harness() == session.meta.key.harness)
+            .unwrap();
+        let page = support::world::transcript_ready(
+            reader.as_mut(),
+            &session.meta.key,
+            None,
+            agentscope::domain::PageDirection::Backward,
+            PAGE,
+            BIG,
+            support::world::STEPS,
+        );
+        assert!(!page.events.is_empty());
+        for event in &page.events {
+            let record = support::world::try_source(
+                reader.as_mut(),
+                &event.provenance.locator,
+                BIG,
+                support::world::STEPS,
+            )
+            .expect("source record");
+            assert!(record.unavailable.is_none(), "{record:?}");
+        }
+    }
+    drop(readers);
+    for lock in locks {
+        lock.release();
+    }
+    #[cfg(windows)]
+    assert_eq!(locked, plant.decoys.len(), "every decoy was locked");
+    #[cfg(not(windows))]
+    let _ = locked;
+
+    assert_eq!(
+        snapshot(world.dir.path()).files,
+        before_files.files,
+        "session files and decoys are byte-identical"
+    );
+    assert_eq!(metadata(&world), before_meta);
+    assert_only_adr0002_sidecars_added(&world, &before_paths);
+    let pi_after: Vec<_> = all_paths(&world.pi_root).into_iter().collect();
+    assert!(
+        !pi_after
+            .iter()
+            .any(|p| p.to_string_lossy().contains("-wal") || p.to_string_lossy().contains("-shm")),
+        "no sidecar or runtime file appears beside Pi data"
+    );
+}
