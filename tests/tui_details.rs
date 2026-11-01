@@ -1029,8 +1029,7 @@ fn compaction(
     }
 }
 
-fn session_screen(app: &App) -> String {
-    let (w, h) = (130u16, 60u16);
+fn session_screen_at(app: &App, w: u16, h: u16) -> String {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     let ctx = RosterContext {
         no_color: true,
@@ -1047,11 +1046,395 @@ fn session_screen(app: &App) -> String {
         .join("\n")
 }
 
+fn session_screen(app: &App) -> String {
+    session_screen_at(app, 130, 60)
+}
+
+/// A session whose dashboard panels all have recorded facts.
+fn dashboard_summary() -> SessionSummary {
+    let model = ModelDetail {
+        id: "gpt-5.5".into(),
+        provider: Some("openai".into()),
+        variant: Some("xhigh".into()),
+        effort: Some("high".into()),
+        configured_effort: None,
+    };
+    let mut s = summary();
+    s.meta.model = Some(model.clone());
+    s.server_tools = Some(ServerToolCounts {
+        web_search: 3,
+        web_fetch: 1,
+    });
+    s.usage = Some(UsageSummary {
+        categories: TokenCategories {
+            input: Some(1_200),
+            cached_input: Some(400),
+            cache_write: Some(300),
+            cache_write_5m: Some(200),
+            cache_write_1h: Some(100),
+            cache_read: Some(40_000),
+            output: Some(5_555),
+            reasoning: Some(77),
+            total: Some(47_055),
+            ..TokenCategories::default()
+        },
+        total: Some(47_055),
+        class: AggregationClass::Reported,
+        cost: CostEstimate {
+            usd: None,
+            class: AggregationClass::Partial,
+            as_of: Some("2026-10-01".into()),
+            known_subtotal: 0.05,
+            breakdown: CostBreakdown {
+                input: Some(0.05),
+                ..CostBreakdown::default()
+            },
+            ..CostEstimate::default()
+        },
+        coverage: UsageCoverage {
+            observed_requests: 4,
+            priced_requests: 2,
+            complete: false,
+            reason: Some("two requests had no recorded price".into()),
+        },
+        models: vec![ModelUsageSummary {
+            model: model.clone(),
+            categories: TokenCategories::default(),
+            total: None,
+            cost: CostEstimate::default(),
+            coverage: UsageCoverage::default(),
+        }],
+        ..UsageSummary::default()
+    });
+    s.metrics = SessionMetrics {
+        timing: SessionTiming {
+            started_at: Some(NOW - 3_600_000),
+            ended_at: None,
+            elapsed_ms: Some(3_600_000),
+            active_ms: Some(300_000),
+            model_ms: Some(240_000.0),
+            active_complete: true,
+        },
+        speed: SpeedSummary {
+            latest: Some(TimedRate {
+                model: Some(ModelDetail {
+                    id: "old-model".into(),
+                    provider: None,
+                    variant: None,
+                    effort: None,
+                    configured_effort: None,
+                }),
+                request_id: None,
+                started_at: Some(NOW - 180_000),
+                completed_at: Some(NOW - 120_000),
+                output_tokens: 1_600,
+                duration_ms: 19_000.0,
+                ttft_ms: Some(400.0),
+                tokens_per_second: 84.2,
+            }),
+            weighted_tokens_per_second: Some(78.6),
+            measured_output: 5_500,
+            measured_duration_ms: 70_000.0,
+            measured_requests: 5,
+            total_requests: 8,
+            complete: false,
+        },
+        context: ContextUsage {
+            used: Some(215_000),
+            capacity: Some(1_000_000),
+            class: AggregationClass::Reported,
+            recorded_at: Some(NOW - 5_000),
+            model: Some(model),
+            compaction_epoch: Some("c2".into()),
+        },
+        compactions: CompactionSummary {
+            observed: 2,
+            history_complete: false,
+            known_cost_usd: Some(0.5),
+            cost_scope: CompactionScope::Event,
+            unpriced: 1,
+            latest: Some(compaction(
+                "latest",
+                CompactionScope::Event,
+                None,
+                Some(0.5),
+            )),
+        },
+    };
+    s
+}
+
+fn app_with_summary(s: SessionSummary) -> App {
+    let mut app = App::new(
+        NOW,
+        Thresholds {
+            quiet: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+        },
+    );
+    app.apply_roster(vec![s], vec![]);
+    app.take_requests();
+    open(
+        &mut app,
+        page(vec![event(0, EventKind::AssistantMessage, "hello")], vec![]),
+    );
+    app
+}
+
+/// Open session info and return the pending details request id.
+fn open_session_details(app: &mut App) -> u64 {
+    assert!(app.open_session_info());
+    let requests = app.take_requests();
+    let [WorkerRequest::LoadDetails { request_id, .. }] = requests.as_slice() else {
+        panic!("expected one details request, got {requests:?}");
+    };
+    *request_id
+}
+
 fn press_key(app: &mut App, code: crossterm::event::KeyCode) {
     agentscope::ui::handle_key(
         app,
         crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
     );
+}
+
+#[test]
+fn session_info_panels_two_columns_at_120() {
+    let mut app = app_with_summary(dashboard_summary());
+    app.take_requests();
+    assert!(app.open_session_info());
+    app.take_requests();
+    let screen = session_screen_at(&app, 120, 60);
+    for title in [
+        "TOKENS",
+        "COST",
+        "TIME & SPEED",
+        "CONTEXT",
+        "FAMILY",
+        "PROCESS",
+    ] {
+        assert!(screen.contains(title), "missing {title:?}:\n{screen}");
+    }
+    assert!(
+        screen
+            .lines()
+            .any(|line| line.contains("TOKENS") && line.contains("COST")),
+        "expected two columns:\n{screen}"
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|line| line.contains("TIME & SPEED") && line.contains("CONTEXT")),
+        "{screen}"
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|line| line.contains("FAMILY") && line.contains("PROCESS")),
+        "{screen}"
+    );
+}
+
+#[test]
+fn session_info_stacks_below_90() {
+    let mut app = app_with_summary(dashboard_summary());
+    app.take_requests();
+    assert!(app.open_session_info());
+    app.take_requests();
+    let screen = session_screen_at(&app, 80, 90);
+    for title in [
+        "TOKENS",
+        "COST",
+        "TIME & SPEED",
+        "CONTEXT",
+        "FAMILY",
+        "PROCESS",
+    ] {
+        assert!(screen.contains(title), "missing {title:?}:\n{screen}");
+    }
+    assert!(
+        !screen
+            .lines()
+            .any(|line| line.contains("TOKENS") && line.contains("COST")),
+        "panels must stack in one column:\n{screen}"
+    );
+}
+
+#[test]
+fn not_recorded_line_lists_absent_facts() {
+    let mut app = app();
+    open(
+        &mut app,
+        page(vec![event(0, EventKind::AssistantMessage, "hello")], vec![]),
+    );
+    assert!(app.open_session_info());
+    app.take_requests();
+    let screen = session_screen_at(&app, 160, 60);
+    let line = screen
+        .lines()
+        .find(|line| line.contains("Not recorded:"))
+        .unwrap_or_else(|| panic!("missing Not recorded line:\n{screen}"));
+    for field in [
+        "end time",
+        "origin",
+        "model variant",
+        "server tools",
+        "compaction cost",
+        "reasoning tokens",
+        "context window",
+        "process start",
+    ] {
+        assert!(line.contains(field), "missing {field:?} in {line:?}");
+    }
+}
+
+#[test]
+fn cost_panel_explains_unpriced_requests() {
+    let mut app = app_with_summary(dashboard_summary());
+    app.take_requests();
+    assert!(app.open_session_info());
+    app.take_requests();
+    let screen = session_screen_at(&app, 120, 70);
+    assert!(screen.contains("2 of 4 priced · incomplete"), "{screen}");
+    assert!(
+        screen.contains("█████░░░░░"),
+        "priced-request bar:\n{screen}"
+    );
+    assert!(
+        screen.contains("Unpriced because two requests had no recorded price."),
+        "{screen}"
+    );
+}
+
+#[test]
+fn no_recent_events_list() {
+    let mut app = app_with_summary(dashboard_summary());
+    let request_id = open_session_details(&mut app);
+    let detail = SessionDetailPage {
+        recent: vec![event(
+            0,
+            EventKind::AssistantMessage,
+            "RECENT-EVENT-DO-NOT-SHOW",
+        )],
+        compactions: vec![compaction(
+            "c1",
+            CompactionScope::Event,
+            Some("summary stays visible"),
+            Some(0.42),
+        )],
+        ..SessionDetailPage::default()
+    };
+    assert!(app.apply_details(request_id, key(), detail));
+    let screen = session_screen_at(&app, 120, 70);
+    assert!(!screen.contains("RECENT-EVENT-DO-NOT-SHOW"), "{screen}");
+    assert!(!screen.contains("Recent events"), "{screen}");
+    assert!(screen.contains("summary stays visible"), "{screen}");
+}
+
+#[test]
+fn space_toggles_compaction_summaries() {
+    let mut app = app_with_summary(dashboard_summary());
+    let request_id = open_session_details(&mut app);
+    // Longer than the CONTEXT panel's inner width, so a collapsed summary that
+    // wrapped would show the tail marker before Space is pressed.
+    let long_summary = format!("{}TAIL-MARKER", "one ".repeat(20));
+    let detail = SessionDetailPage {
+        compactions: vec![compaction(
+            "c1",
+            CompactionScope::Event,
+            Some(&long_summary),
+            Some(0.42),
+        )],
+        ..SessionDetailPage::default()
+    };
+    assert!(app.apply_details(request_id, key(), detail));
+    let collapsed = session_screen_at(&app, 130, 70);
+    let summary_line = collapsed
+        .lines()
+        .find(|line| line.contains("Summary:"))
+        .unwrap_or_else(|| panic!("missing summary row:\n{collapsed}"));
+    assert!(
+        summary_line.contains('…'),
+        "collapsed summary is ellipsized"
+    );
+    assert!(
+        !collapsed.contains("TAIL-MARKER"),
+        "collapsed summary stays on one row:\n{collapsed}"
+    );
+    assert!(collapsed.contains("(Space expands)"), "{collapsed}");
+
+    press_key(&mut app, crossterm::event::KeyCode::Char(' '));
+    assert!(app.summaries_expanded());
+    let expanded = session_screen_at(&app, 130, 70);
+    assert!(!expanded.contains("(Space expands)"), "{expanded}");
+    assert!(expanded.contains("TAIL-MARKER"), "{expanded}");
+}
+
+#[test]
+fn expanded_summary_pages_stay_bounded_and_keep_the_bottom_facts_reachable() {
+    let mut app = app_with_summary(dashboard_summary());
+    let mut request_id = open_session_details(&mut app);
+    // Twenty pages of long compactions: far more expanded summary rows than the
+    // dashboard's scrollable budget. The renderer must stop materializing rows at
+    // the budget and still keep the closing facts reachable by scrolling.
+    for page_index in 0..20 {
+        let compactions: Vec<CompactionObservation> = (0..60)
+            .map(|record| {
+                let summary = format!("page {page_index} record {record} {}", "detail ".repeat(12));
+                compaction(
+                    &format!("c-{page_index}-{record}"),
+                    CompactionScope::Event,
+                    Some(&summary),
+                    Some(0.01),
+                )
+            })
+            .collect();
+        let page = SessionDetailPage {
+            compactions,
+            next: Some(PageAnchor {
+                timestamp: Some(NOW - page_index),
+                source_order: page_index as u64,
+                stable_id: format!("page-{page_index}"),
+            }),
+            has_more: true,
+            ..SessionDetailPage::default()
+        };
+        assert!(app.apply_details(request_id, key(), page));
+        if page_index + 1 < 20 {
+            assert!(app.load_more_details());
+            let requests = app.take_requests();
+            let [
+                WorkerRequest::LoadDetails {
+                    request_id: next, ..
+                },
+            ] = requests.as_slice()
+            else {
+                panic!("expected another details page, got {requests:?}");
+            };
+            request_id = *next;
+        }
+    }
+    press_key(&mut app, crossterm::event::KeyCode::Char(' '));
+    assert!(app.summaries_expanded());
+
+    // Render once so the overlay extent reflects the bounded dashboard, then
+    // scroll to the end. The quiet closing lines must remain in the buffer.
+    let _ = session_screen_at(&app, 120, 60);
+    press_key(&mut app, crossterm::event::KeyCode::End);
+    let bottom = session_screen_at(&app, 120, 60);
+    assert!(bottom.contains("Not recorded:"), "{bottom}");
+    assert!(bottom.contains("Priced models:"), "{bottom}");
+}
+
+#[test]
+fn time_panel_shows_old_model_speed_note() {
+    let mut app = app_with_summary(dashboard_summary());
+    app.take_requests();
+    assert!(app.open_session_info());
+    app.take_requests();
+    let screen = session_screen_at(&app, 120, 60);
+    assert!(screen.contains("Latest speed: 84.2 tok/s"), "{screen}");
+    assert!(screen.contains("old old-model · 2m ago"), "{screen}");
 }
 
 #[test]
@@ -1110,16 +1493,11 @@ fn session_details_list_compactions_with_separate_event_cost_and_reduction() {
 
     let collapsed = session_screen(&app);
     assert!(
-        collapsed.contains("1 requests · 3 compactions · 0 events loaded"),
+        collapsed.contains("Loaded compaction records: 3"),
         "{collapsed}"
     );
     assert!(
         collapsed.contains("older records exist (m loads the next page)"),
-        "{collapsed}"
-    );
-    assert!(collapsed.contains("Request"), "{collapsed}");
-    assert!(
-        collapsed.contains("input 1,200 · output 340"),
         "{collapsed}"
     );
     // Context reduction and event cost are separate facts on separate lines.
@@ -1137,7 +1515,7 @@ fn session_details_list_compactions_with_separate_event_cost_and_reduction() {
     );
     // An aggregate is never attributed to an event, even when money was recorded.
     assert!(
-        collapsed.contains("Event cost: session aggregate only, not attributed to this event"),
+        collapsed.contains("Event cost: session aggregate only"),
         "{collapsed}"
     );
     assert!(!collapsed.contains("9.99"), "{collapsed}");
@@ -1175,7 +1553,7 @@ fn session_details_list_compactions_with_separate_event_cost_and_reduction() {
         ),
         "{requests:?}"
     );
-    assert!(session_screen(&app).contains("Loading detailed facts"));
+    assert!(session_screen(&app).contains("Loading older records"));
 }
 
 #[test]
@@ -1226,94 +1604,11 @@ fn partial_category_costs_keep_their_subtotal_and_coverage_in_session_details() 
         "{screen}"
     );
     assert!(screen.contains("Unpriced coverage: output"), "{screen}");
-    assert!(screen.contains("Priced requests: 1 of 2"), "{screen}");
-    assert!(screen.contains("Cost: $0.05+ partial 1/2"), "{screen}");
+    assert!(screen.contains("1 of 2 priced"), "{screen}");
+    assert!(screen.contains("Cost: $0.05+ · partial 1/2"), "{screen}");
     assert!(
         !screen.contains("Cost: $0.05 "),
         "no complete total is claimed:\n{screen}"
-    );
-}
-
-#[test]
-fn m_on_a_session_without_request_rows_pages_visible_recent_events() {
-    let mut app = app();
-    open(
-        &mut app,
-        page(vec![event(0, EventKind::AssistantMessage, "hello")], vec![]),
-    );
-    assert!(app.open_session_info());
-    let requests = app.take_requests();
-    let [
-        WorkerRequest::LoadDetails {
-            request_id: first, ..
-        },
-    ] = requests.as_slice()
-    else {
-        panic!("{requests:?}");
-    };
-    // A Codex-style session: cumulative usage only, so pages carry events alone.
-    let anchor = |i: u64| PageAnchor {
-        timestamp: Some(NOW),
-        source_order: i,
-        stable_id: format!("e{i}"),
-    };
-    let page_of = |events: Vec<Event>, next: Option<PageAnchor>| SessionDetailPage {
-        recent: events,
-        next: next.clone(),
-        has_more: next.is_some(),
-        ..SessionDetailPage::default()
-    };
-    let newest = vec![
-        event(9, EventKind::AssistantMessage, "newest reply one"),
-        event(
-            8,
-            EventKind::UserPrompt,
-            "newest prompt\x1b[31m red\nsecond line",
-        ),
-    ];
-    assert!(app.apply_details(*first, key(), page_of(newest, Some(anchor(8)))));
-    let one = session_screen(&app);
-    assert!(
-        one.contains("0 requests · 0 compactions · 2 events loaded"),
-        "{one}"
-    );
-    assert!(
-        one.contains("newest reply one") && one.contains("newest prompt"),
-        "{one}"
-    );
-    assert!(!one.contains('\x1b'), "{one}");
-    assert!(
-        one.contains("older records exist (m loads the next page)"),
-        "{one}"
-    );
-    assert!(!one.contains("older reply"));
-
-    press_key(&mut app, crossterm::event::KeyCode::Char('m'));
-    let requests = app.take_requests();
-    let [
-        WorkerRequest::LoadDetails {
-            request_id: second,
-            anchor: Some(_),
-            ..
-        },
-    ] = requests.as_slice()
-    else {
-        panic!("{requests:?}");
-    };
-    let older = vec![event(7, EventKind::AssistantMessage, "older reply two")];
-    assert!(app.apply_details(*second, key(), page_of(older, None)));
-    let two = session_screen(&app);
-    assert!(
-        two.contains("0 requests · 0 compactions · 3 events loaded"),
-        "{two}"
-    );
-    assert!(
-        two.contains("older reply two") && two.contains("newest reply one"),
-        "{two}"
-    );
-    assert!(
-        !two.contains("older records exist"),
-        "the last page ends the hint:\n{two}"
     );
 }
 

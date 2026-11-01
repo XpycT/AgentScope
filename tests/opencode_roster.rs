@@ -1116,7 +1116,8 @@ fn live_wal_family_provider_effort_and_confirmed_link_smoke() {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    // Session info first: provider below harness, effort below model.
+    // Session info: the header carries the harness tag, model and effort; the
+    // cost panel carries the recorded billing route.
     assert!(app.open_session_info());
     let info = draw(&app);
     assert_eq!(
@@ -1124,20 +1125,17 @@ fn live_wal_family_provider_effort_and_confirmed_link_smoke() {
         Some(SessionLink::Resolved(parent.meta.key.clone()))
     );
     for needle in [
-        "Provider: OpenCode",
+        "[OC]",
         "Billing provider: openai",
-        "Model: gpt-5",
-        "Effort: high",
+        "model gpt-5",
+        "thinking high",
         "Agent: build",
     ] {
         assert!(info.contains(needle), "missing {needle:?}:\n{info}");
     }
-    // Provider sits below the harness; effort sits below the model.
-    let provider_at = info.find("Provider: OpenCode").unwrap();
+    let header_at = info.find("model gpt-5").unwrap();
     let billing_at = info.find("Billing provider: openai").unwrap();
-    let model_at = info.find("Model: gpt-5").unwrap();
-    let effort_at = info.find("Effort: high").unwrap();
-    assert!(provider_at < billing_at && billing_at < model_at && model_at < effort_at);
+    assert!(header_at < billing_at, "{info}");
 
     // Details shows the confirmed link; `o` opens the child session rather than
     // leaving the parent transcript on screen.

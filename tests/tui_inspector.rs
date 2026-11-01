@@ -299,7 +299,10 @@ fn renders_reported_context_window_and_server_tool_counts_and_unknown_otherwise(
     assert!(!out.contains("context "), "{out}");
     assert!(app.open_session_info());
     let info = draw(&app, 140, 40);
-    assert!(info.contains("Server tools: Unknown"), "{info}");
+    assert!(
+        info.contains("Not recorded:") && info.contains("server tools"),
+        "{info}"
+    );
 }
 
 #[test]
@@ -1318,7 +1321,7 @@ fn session_info_shows_categories_dated_pricing_and_fee_exclusion_note() {
     );
     assert!(app.open_session_info());
     assert_eq!(app.screen, agentscope::app::Screen::Session);
-    let screen = draw(&app, 140, 40);
+    let screen = draw(&app, 140, 60);
     for needle in [
         "Input: 1,200",
         "Cached input: —",
@@ -1331,7 +1334,7 @@ fn session_info_shows_categories_dated_pricing_and_fee_exclusion_note() {
         "Total: 47,055",
         "Pricing as of: 2026-10-01",
         "Cost note: server-tool fees excluded",
-        "Priced model: claude-sonnet-test",
+        "Priced models: claude-sonnet-test",
         "web_search 3",
     ] {
         assert!(screen.contains(needle), "missing {needle:?}:\n{screen}");
@@ -1498,18 +1501,21 @@ fn session_info_renders_measured_speed_context_timing_and_compaction_facts() {
     assert!(app.open_session_info());
     let screen = draw(&app, 160, 60);
     for needle in [
-        "# Measured",
+        "TIME & SPEED",
         "Elapsed: Unknown",
         "Active: 1s (incomplete coverage)",
         "Model time: 1m 10s",
-        "Latest speed: 84.2 tok/s — gpt-5.0-codex (measured on an earlier model) at ",
-        "Latest request: 1,600 output in 19s · TTFT 400 ms",
-        "Weighted speed: 78.6 tok/s — 5,500 output over 1m 10s across 5 of 8 requests (incomplete coverage)",
-        "Context: 215,000 of 1.0M window (reported, recorded ",
+        "Latest speed: 84.2 tok/s",
+        "old gpt-5.0-codex · 1s ago",
+        "1,600 output in 19s · TTFT 400 ms",
+        "Weighted speed: 78.6 tok/s",
+        "across 5 of 8 requests",
+        "Context: 215,000 of 1.0M window",
         "epoch c2",
         "Compactions: 2 observed · cost Unknown · 1 unpriced",
         "Latest compaction: ",
-        "trigger auto · tokens removed 138,000",
+        "trigger auto",
+        "removed 138,000",
         "Cost by category: input Unknown",
     ] {
         assert!(screen.contains(needle), "missing {needle:?} in:\n{screen}");
@@ -1603,9 +1609,11 @@ fn incomplete_compaction_history_labels_money_as_a_subtotal_and_unknown_model_is
         "an unknown current model is not evidence of a stale rate:\n{screen}"
     );
     assert!(
-        screen.contains("Compactions: 256 observed (history incomplete) · cost $0.50 known subtotal (not a total) · 0 unpriced"),
+        screen.contains("256 observed (history incomplete)"),
         "{screen}"
     );
+    assert!(screen.contains("known subtotal (not a total)"), "{screen}");
+    assert!(screen.contains("0 unpriced"), "{screen}");
 }
 
 fn usage_with_purpose(purpose: RequestPurpose) -> UsageObservation {

@@ -1236,8 +1236,8 @@ fn omp_family_opens_through_the_real_worker_app_and_renderer() {
     // Session info shows the usage facts and the lineage.
     h.ch('i');
     let info = h.screen();
-    assert!(info.contains("Tokens: 1,000"), "{info}");
-    assert!(info.contains("Provider: OMP"), "{info}");
+    assert!(info.contains("Total: 1,000"), "{info}");
+    assert!(info.contains("[OMP]"), "{info}");
     assert!(info.contains("Effort: Unknown"), "{info}");
 
     // A live append arrives through refresh and is counted, then loaded.
@@ -1407,8 +1407,8 @@ fn pi_family_opens_through_the_real_worker_app_and_renderer() {
     assert!(page.compactions.is_empty());
     h.ch('i');
     let info = h.screen();
-    assert!(info.contains("Tokens: 1,000"), "{info}");
-    assert!(info.contains("Provider: Pi"), "{info}");
+    assert!(info.contains("Total: 1,000"), "{info}");
+    assert!(info.contains("[PI]"), "{info}");
     assert!(info.contains("Effort: Unknown"), "{info}");
 
     // The capability text says extension children are unsupported instead of

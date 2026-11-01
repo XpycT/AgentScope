@@ -16,7 +16,7 @@ use crate::app::{
 };
 use crate::domain::{
     AggregationClass, BoundedText, ContextUsage, Event, EventKind, ProcessAssociation, SessionLink,
-    SessionSummary, StatusLabel, Timestamp, ToolInteraction, ToolStatus, UsageScope, UsageSummary,
+    SessionSummary, StatusLabel, Timestamp, ToolInteraction, ToolStatus, UsageScope,
 };
 use crate::ingest::text::display_safe;
 use crate::time::format_local;
@@ -99,7 +99,7 @@ pub fn render_inspector(frame: &mut Frame, app: &App, ctx: &RosterContext) {
 }
 
 /// Exactly three lines: identity and state, quiet provenance, key numbers.
-fn header_lines(
+pub(super) fn header_lines(
     app: &App,
     transcript: &Transcript,
     width: usize,
@@ -321,17 +321,6 @@ pub(super) fn money_text(usd: f64) -> String {
         format!("${usd:.4}")
     } else {
         format!("${usd:.2}")
-    }
-}
-
-pub(super) fn cost_text(usage: Option<&UsageSummary>) -> String {
-    let fact = super::session::cost_fact(usage, true);
-    if fact.head == ABSENT {
-        "Unknown".into()
-    } else if fact.sub.is_empty() {
-        fact.head
-    } else {
-        format!("{} {}", fact.head, fact.sub)
     }
 }
 

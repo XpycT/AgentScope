@@ -486,6 +486,16 @@ fn bar_widths(shares: &[Share; 4], width: usize) -> [usize; 4] {
     out
 }
 
+/// A stacked token bar over the recorded categories, shared with the session
+/// dashboard so both surfaces use one visual grammar.
+pub(super) fn token_bar(
+    categories: &TokenCategories,
+    width: usize,
+    palette: Palette,
+) -> Line<'static> {
+    bar_line(&token_shares(categories), width, palette)
+}
+
 fn legend_line(shares: &[Share; 4], width: usize, palette: Palette) -> Line<'static> {
     let mut order: Vec<usize> = (0..4).filter(|&i| shares[i].value > 0).collect();
     order.sort_by(|&a, &b| shares[b].value.cmp(&shares[a].value).then(a.cmp(&b)));
