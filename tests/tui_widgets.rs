@@ -3,8 +3,10 @@
 mod support;
 
 use agentscope::domain::{
-    Harness, SessionKey, SessionMetadata, SourceKey, StatusLabel, ToolStatus,
+    AggregationClass, CostEstimate, Harness, ModelDetail, SessionKey, SessionMetadata, SourceKey,
+    StatusLabel, TimedRate, Timestamp, ToolStatus, UsageSummary,
 };
+use agentscope::ui::facts::{active_fact, cost_fact, speed_fact, tokens_fact};
 use agentscope::ui::widgets::{
     ABSENT, LOADING, Palette, READ_FAILED, agent_tag, display_title, effort_span, status_chip,
     status_word, tool_glyph,
@@ -255,4 +257,107 @@ fn display_title_sanitizes_escape_sequences() {
 
     let recorded = meta("\x1b[31mred", false);
     assert!(!display_title(&recorded).contains('\x1b'));
+}
+
+// ---- compact facts: `—`, `…`, `+`, `~` ------------------------------------
+
+const NOW: Timestamp = 100_000_000;
+
+fn fact_model(id: &str) -> ModelDetail {
+    ModelDetail {
+        id: id.into(),
+        provider: None,
+        variant: None,
+        effort: None,
+        configured_effort: None,
+    }
+}
+
+#[test]
+fn unknown_tokens_and_cost_are_dash() {
+    assert_eq!(tokens_fact(None, true).head, ABSENT);
+    assert_eq!(cost_fact(None, true).head, ABSENT);
+
+    let recorded_nothing = UsageSummary::default();
+    assert_eq!(tokens_fact(Some(&recorded_nothing), true).head, ABSENT);
+    assert_eq!(cost_fact(Some(&recorded_nothing), true).head, ABSENT);
+}
+
+#[test]
+fn unhydrated_facts_are_ellipsis() {
+    let s = facts::summary(meta("Unread", false));
+    assert_eq!(tokens_fact(None, false).head, LOADING);
+    assert_eq!(cost_fact(None, false).head, LOADING);
+    assert_eq!(active_fact(&s, false).head, LOADING);
+    assert_eq!(speed_fact(&s, false, NOW).head, LOADING);
+}
+
+#[test]
+fn partial_tokens_keep_plus_and_estimated_cost_keeps_tilde() {
+    let usage = UsageSummary {
+        total: Some(185_722_239),
+        class: AggregationClass::Partial,
+        cost: CostEstimate {
+            usd: Some(1.77),
+            class: AggregationClass::Estimated,
+            ..CostEstimate::default()
+        },
+        ..UsageSummary::default()
+    };
+    let tokens = tokens_fact(Some(&usage), true);
+    assert_eq!(tokens.head, "185.7M+");
+    assert_eq!(tokens.sub, "partial");
+    let cost = cost_fact(Some(&usage), true);
+    assert_eq!(cost.head, "~$1.77");
+    assert_eq!(cost.sub, "estimated");
+    assert!(!cost.quiet);
+}
+
+#[test]
+fn known_subtotal_without_total_keeps_plus() {
+    let usage = UsageSummary {
+        cost: CostEstimate {
+            usd: None,
+            class: AggregationClass::Partial,
+            known_subtotal: 4.58,
+            ..CostEstimate::default()
+        },
+        ..UsageSummary::default()
+    };
+    let cost = cost_fact(Some(&usage), true);
+    assert_eq!(cost.head, "$4.58+");
+    assert_eq!(cost.sub, "partial");
+}
+
+#[test]
+fn provenance_word_moves_to_sub() {
+    let usage = UsageSummary {
+        total: Some(185_722_239),
+        class: AggregationClass::Derived,
+        ..UsageSummary::default()
+    };
+    let tokens = tokens_fact(Some(&usage), true);
+    assert_eq!(tokens.head, "185.7M");
+    assert!(!tokens.head.contains("derived"), "{}", tokens.head);
+    assert_eq!(tokens.sub, "derived");
+}
+
+#[test]
+fn speed_fact_marks_old_model_quiet() {
+    let mut s = facts::summary(meta("Speed", false));
+    s.meta.model = Some(fact_model("deepseek"));
+    s.metrics.speed.latest = Some(TimedRate {
+        model: Some(fact_model("gpt-6.1-sol")),
+        request_id: None,
+        started_at: Some(NOW - 190_000),
+        completed_at: Some(NOW - 180_000),
+        output_tokens: 385,
+        duration_ms: 10_000.0,
+        ttft_ms: None,
+        tokens_per_second: 38.5,
+    });
+    let speed = speed_fact(&s, true, NOW);
+    assert_eq!(speed.head, "38.5");
+    assert!(speed.quiet);
+    assert!(speed.sub.starts_with("old gpt-6.1-sol"), "{}", speed.sub);
 }

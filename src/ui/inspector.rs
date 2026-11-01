@@ -16,7 +16,7 @@ use crate::time::format_local;
 
 use super::RosterContext;
 use super::roster::{MIN_HEIGHT, MIN_WIDTH};
-use super::widgets::{Palette, fit, harness_name, search_prompt, status_text, tokens_text};
+use super::widgets::{ABSENT, Palette, fit, harness_name, search_prompt, status_text, tokens_text};
 
 const MARKER_W: usize = 2;
 const TIME_W: usize = 5;
@@ -211,8 +211,10 @@ pub(super) fn money_text(usd: f64) -> String {
 
 pub(super) fn cost_text(usage: Option<&UsageSummary>) -> String {
     let fact = super::session::cost_fact(usage, true);
-    if fact.head == "Unknown" {
+    if fact.head == ABSENT {
         "Unknown".into()
+    } else if fact.sub.is_empty() {
+        fact.head
     } else {
         format!("{} {}", fact.head, fact.sub)
     }

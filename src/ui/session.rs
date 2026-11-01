@@ -17,7 +17,7 @@ use crate::time::relative_label;
 use super::RosterContext;
 use super::details::{chrome, draw_rows, put, wrap_into};
 use super::inspector::{class_name, cost_text, grouped, money_text, process_line};
-use super::widgets::{harness_name, tokens_text};
+use super::widgets::{ABSENT, LOADING, harness_name, tokens_text};
 
 fn count(value: Option<u64>) -> String {
     value.map_or_else(|| "—".into(), grouped)
@@ -126,9 +126,13 @@ fn rate_text(rate: Option<f64>) -> String {
 
 /// A headline value and its qualifier, shared by the roster row, the preview and
 /// the details view so no surface prices, times or rates anything itself.
-pub(super) struct Fact {
+pub struct Fact {
+    /// The compact value printed in the roster column or preview line.
     pub head: String,
+    /// Provenance shown beside the value where the surface has room for it.
     pub sub: String,
+    /// The value is real but no longer describes the current model.
+    pub quiet: bool,
 }
 
 impl Fact {
@@ -136,12 +140,18 @@ impl Fact {
         Self {
             head: head.into(),
             sub: sub.into(),
+            quiet: false,
         }
     }
 
     /// Facts of a metadata-only row: not read yet, which is not zero.
     fn loading() -> Self {
-        Self::new("…", "loading")
+        Self::new(LOADING, "loading")
+    }
+
+    /// Hydrated, but the source recorded no value: absent, which is not zero.
+    fn absent() -> Self {
+        Self::new(ABSENT, "")
     }
 }
 
@@ -158,15 +168,15 @@ fn short_span(ms: u64) -> String {
 }
 
 /// Lifetime tokens. A partial total is a lower bound, not the whole.
-pub(super) fn tokens_fact(usage: Option<&UsageSummary>, hydrated: bool) -> Fact {
+pub fn tokens_fact(usage: Option<&UsageSummary>, hydrated: bool) -> Fact {
     if !hydrated {
         return Fact::loading();
     }
     let Some(usage) = usage else {
-        return Fact::new("Unknown", "no usage");
+        return Fact::absent();
     };
     match (usage.total, usage.class) {
-        (None, class) => Fact::new("Unknown", class_name(class)),
+        (None, class) => Fact::new(ABSENT, class_name(class)),
         (Some(total), AggregationClass::Partial) => {
             Fact::new(format!("{}+", tokens_text(Some(total))), "partial")
         }
@@ -200,12 +210,12 @@ fn missing_legs(usage: &UsageSummary) -> Vec<&'static str> {
 
 /// API-equivalent estimate. Only a complete amount reads as a total; a priced
 /// subset reads as a lower bound with its missing coverage.
-pub(super) fn cost_fact(usage: Option<&UsageSummary>, hydrated: bool) -> Fact {
+pub fn cost_fact(usage: Option<&UsageSummary>, hydrated: bool) -> Fact {
     if !hydrated {
         return Fact::loading();
     }
     let Some(usage) = usage else {
-        return Fact::new("Unknown", "no usage");
+        return Fact::absent();
     };
     let cost = &usage.cost;
     match (cost.usd, cost.class) {
@@ -229,12 +239,12 @@ pub(super) fn cost_fact(usage: Option<&UsageSummary>, hydrated: bool) -> Fact {
             };
             Fact::new(format!("{}+", money_text(cost.known_subtotal)), sub)
         }
-        _ => Fact::new("Unknown", "unpriced"),
+        _ => Fact::absent(),
     }
 }
 
 /// Measured active time; an incomplete history is a lower bound.
-pub(super) fn active_fact(s: &SessionSummary, hydrated: bool) -> Fact {
+pub fn active_fact(s: &SessionSummary, hydrated: bool) -> Fact {
     if !hydrated {
         return Fact::loading();
     }
@@ -242,7 +252,7 @@ pub(super) fn active_fact(s: &SessionSummary, hydrated: bool) -> Fact {
     match t.active_ms {
         Some(ms) if t.active_complete => Fact::new(short_span(ms), "active"),
         Some(ms) => Fact::new(format!("{}+", short_span(ms)), "partial"),
-        None => Fact::new("Unknown", ""),
+        None => Fact::absent(),
     }
 }
 
@@ -256,16 +266,16 @@ fn speed_is_stale(s: &SessionSummary, latest: &TimedRate) -> bool {
 }
 
 /// Latest timed whole-request speed with its model and age. Unknown is never 0.
-pub(super) fn speed_fact(s: &SessionSummary, hydrated: bool, now: Timestamp) -> Fact {
+pub fn speed_fact(s: &SessionSummary, hydrated: bool, now: Timestamp) -> Fact {
     if !hydrated {
         return Fact::loading();
     }
     let Some(latest) = &s.metrics.speed.latest else {
-        return Fact::new("Unknown", "");
+        return Fact::absent();
     };
     let rate = latest.tokens_per_second;
     if !rate.is_finite() || rate <= 0.0 {
-        return Fact::new("Unknown", "");
+        return Fact::absent();
     }
     let age = latest
         .completed_at
@@ -275,7 +285,8 @@ pub(super) fn speed_fact(s: &SessionSummary, hydrated: bool, now: Timestamp) -> 
         .model
         .as_ref()
         .map(|m| super::widgets::one_line(&m.id));
-    let mut sub = match (speed_is_stale(s, latest), model) {
+    let stale = speed_is_stale(s, latest);
+    let mut sub = match (stale, model) {
         (true, Some(model)) => format!("old {model}"),
         (true, None) => "old model".to_string(),
         (false, Some(model)) => model,
@@ -287,7 +298,10 @@ pub(super) fn speed_fact(s: &SessionSummary, hydrated: bool, now: Timestamp) -> 
         }
         sub.push_str(&age);
     }
-    Fact::new(format!("{rate:.1} tok/s"), sub)
+    Fact {
+        quiet: stale,
+        ..Fact::new(format!("{rate:.1}"), sub)
+    }
 }
 
 /// Occupancy of the recorded window. Without both figures there is no percentage.

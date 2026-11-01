@@ -628,7 +628,7 @@ fn horizontal_scroll_reaches_tokens_cost_active_and_speed_at_60x20() {
     let mut seen = Vec::new();
     for step in 0..COLUMNS {
         let out = text(&draw(&app, &ctx(true), 60, 20));
-        for want in ["91k", "~$0.23", "1h 5m", "84.2 tok/s"] {
+        for want in ["91k", "~$0.23", "1h 5m", "84.2"] {
             if out.contains(want) {
                 seen.push(want);
             }
@@ -639,7 +639,7 @@ fn horizontal_scroll_reaches_tokens_cost_active_and_speed_at_60x20() {
         );
         app.scroll_columns(1);
     }
-    for want in ["91k", "~$0.23", "1h 5m", "84.2 tok/s"] {
+    for want in ["91k", "~$0.23", "1h 5m", "84.2"] {
         assert!(seen.contains(&want), "{want:?} never reachable");
     }
     // Scrolling stops at the last column instead of running off the table.
@@ -770,7 +770,7 @@ fn unknown_speed_is_not_zero_and_an_old_model_keeps_its_qualifier() {
     let mut none = rich(Harness::Codex, "n", "No speed");
     none.metrics.speed.latest = None;
     let out = preview_of(none);
-    assert!(out.contains("Latest speed: Unknown"), "{out}");
+    assert!(out.contains("Latest speed: —"), "{out}");
     assert!(!out.contains("0.0 tok/s"), "{out}");
 
     let mut zero = rich(Harness::Codex, "z", "Zero speed");
@@ -782,7 +782,7 @@ fn unknown_speed_is_not_zero_and_an_old_model_keeps_its_qualifier() {
         .tokens_per_second = 0.0;
     let out = preview_of(zero);
     assert!(
-        out.contains("Latest speed: Unknown") && !out.contains("0.0 tok/s"),
+        out.contains("Latest speed: —") && !out.contains("0.0 tok/s"),
         "{out}"
     );
 
@@ -791,14 +791,11 @@ fn unknown_speed_is_not_zero_and_an_old_model_keeps_its_qualifier() {
     let out = preview_of(old);
     assert!(out.contains("old gpt-4.1"), "model qualifier:\n{out}");
     assert!(out.contains("3m ago"), "age qualifier:\n{out}");
-    assert!(out.contains("84.2 tok/s"), "{out}");
+    assert!(out.contains("84.2"), "{out}");
 
     // The reported rate is shown as measured: TTFT (500 ms of 10 s) is not subtracted.
     let out = preview_of(rich(Harness::Codex, "r", "Fresh"));
-    assert!(
-        out.contains("84.2 tok/s") && !out.contains("105.3"),
-        "{out}"
-    );
+    assert!(out.contains("84.2") && !out.contains("105.3"), "{out}");
 }
 
 #[test]

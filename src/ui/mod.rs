@@ -39,6 +39,11 @@ pub use roster::{
     Column, ColumnBox, MIN_HEIGHT, MIN_WIDTH, PREVIEW_WIDTH, RosterLayout, handle_mouse,
     render_roster,
 };
+/// Compact value facts (`head`, `sub`, `quiet`) shared by the roster, preview
+/// and details views.
+pub mod facts {
+    pub use super::session::{Fact, active_fact, cost_fact, speed_fact, tokens_fact};
+}
 
 /// Draw whichever screen is active, then any panel on top of it.
 pub fn render(frame: &mut ratatui::Frame, app: &App, ctx: &RosterContext) {
