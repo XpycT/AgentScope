@@ -37,6 +37,10 @@ A SQLite authorizer allows only read operations on the allowlisted session table
 
 If a strict zero-sidecar guarantee becomes required, implement a reviewed read-only VFS/private-shm boundary or an explicit snapshot workflow, and record a new ADR. Do not silently tighten the promise without changing the implementation.
 
+## Scope note (2026-11-01)
+
+The same read-only SQLite behavior applies to the Hermes reader added later: `state.db` (including `profiles/<name>/state.db`) is opened through the shared read-only allowlist opener, and SQLite may likewise create or update its transient `-shm`/`-wal` sidecars. `tests/read_only.rs::hermes_profiles_and_decoy_credentials_leave_provider_content_unchanged` snapshots Hermes files before and after a full reader/worker/TUI session and permits only those sidecars, with every other database, record and decoy file byte-identical.
+
 ## Verification (2026-10-30)
 
 What the implementation does matches the decision above. Evidence, all on synthetic fixtures unless stated:

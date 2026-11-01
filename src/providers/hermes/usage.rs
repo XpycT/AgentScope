@@ -556,31 +556,19 @@ fn priced_contribution(
         HermesCostStatus::Estimated => money.estimated_usd,
         HermesCostStatus::Actual | HermesCostStatus::Included | HermesCostStatus::Unknown => None,
     };
-    let mut cost = if money.status == HermesCostStatus::Actual && money.actual_usd.is_some() {
-        // `actual` authorizes the provider-reported amount even when it is zero.
-        let usd = money.actual_usd.unwrap_or(0.0);
-        CostEstimate {
-            usd: Some(usd),
-            class: AggregationClass::Reported,
-            known_subtotal: usd,
-            source: Some(MoneySource::ReportedApi),
-            ..CostEstimate::default()
-        }
-    } else {
-        estimate_facts(
-            PricedFacts {
-                model: model.as_ref(),
-                scope: crate::domain::UsageScope::Session,
-                categories: &categories,
-                accounting: HermesTokens::accounting(),
-                request: None,
-                money: &recorded,
-                harness: crate::domain::Harness::Hermes,
-            },
-            prices,
-            ReferencePolicy::Disabled,
-        )
-    };
+    let mut cost = estimate_facts(
+        PricedFacts {
+            model: model.as_ref(),
+            scope: crate::domain::UsageScope::Session,
+            categories: &categories,
+            accounting: HermesTokens::accounting(),
+            request: None,
+            money: &recorded,
+            harness: crate::domain::Harness::Hermes,
+        },
+        prices,
+        ReferencePolicy::Disabled,
+    );
     if !attribution_proven
         && !matches!(
             cost.source,
@@ -610,7 +598,7 @@ fn priced_contribution(
         model,
         &recorded,
         money.status,
-        money.actual_usd.is_some(),
+        money.actual_usd.is_some_and(|usd| usd > 0.0),
         prices,
     );
     HermesUsageContribution {
@@ -815,7 +803,7 @@ struct CostSum {
     same_source: bool,
     reported: Option<f64>,
     reported_all: bool,
-    all_actual: bool,
+    all_reported: bool,
     saved: Option<f64>,
     saved_all: bool,
     partial_note: Option<String>,
@@ -836,7 +824,7 @@ impl CostSum {
             same_source: true,
             reported: None,
             reported_all: true,
-            all_actual: true,
+            all_reported: true,
             saved: None,
             saved_all: true,
             partial_note: None,
@@ -910,8 +898,8 @@ impl CostSum {
         } else if self.source != cost.source {
             self.same_source = false;
         }
-        if contribution.status != HermesCostStatus::Actual || contribution.reported_usd.is_none() {
-            self.all_actual = false;
+        if cost.class != AggregationClass::Reported {
+            self.all_reported = false;
         }
         match contribution.reported_usd {
             Some(reported) => self.reported = Some(self.reported.unwrap_or(0.0) + reported),
@@ -927,7 +915,10 @@ impl CostSum {
         let class = if !self.any {
             AggregationClass::Unknown
         } else if self.usd.is_some() {
-            if self.all_actual {
+            // Only a sum whose every displayed contribution is a positive
+            // provider-reported amount is `Reported`; an actual-zero contribution
+            // contributes an estimate and must downgrade the mixed total.
+            if self.all_reported {
                 AggregationClass::Reported
             } else {
                 AggregationClass::Estimated
@@ -951,6 +942,7 @@ impl CostSum {
                 reasoning: self.breakdown.reasoning,
             },
             source: if self.same_source { self.source } else { None },
+            reference: false,
         }
     }
 }

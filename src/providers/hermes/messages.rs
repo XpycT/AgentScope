@@ -219,7 +219,6 @@ struct Group {
     first_id: i64,
     representative: Row,
     blocks: usize,
-    suppressed: bool,
     carrier: bool,
     identities: Vec<Identity>,
     last_display: (usize, i64),
@@ -233,6 +232,15 @@ enum Phase {
     Display,
     Fold,
     Ready,
+}
+
+/// Resumable stages of the final fold, so no slice groups, orders or counts the
+/// whole retained projection in one call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FoldPhase {
+    Group,
+    Emit,
+    Suffix,
 }
 
 pub(crate) struct Projection {
@@ -253,6 +261,12 @@ pub(crate) struct Projection {
     groups: Vec<Group>,
     by_id: HashMap<String, usize>,
     suffix: Vec<usize>,
+    fold_phase: FoldPhase,
+    fold_at: usize,
+    fold_groups: HashMap<Identity, Group>,
+    fold_order: std::collections::BTreeMap<(usize, i64, i64), Identity>,
+    fold_suffix: Vec<usize>,
+    fold_suffix_at: usize,
     bytes: usize,
     row_cap: usize,
     byte_cap: usize,
@@ -300,6 +314,12 @@ impl Projection {
             groups: Vec::new(),
             by_id: HashMap::new(),
             suffix: Vec::new(),
+            fold_phase: FoldPhase::Group,
+            fold_at: 0,
+            fold_groups: HashMap::new(),
+            fold_order: std::collections::BTreeMap::new(),
+            fold_suffix: Vec::new(),
+            fold_suffix_at: 0,
             bytes: 0,
             row_cap: ROW_CAP,
             byte_cap: INDEX_BYTES,
@@ -322,10 +342,12 @@ impl Projection {
     }
 
     /// One bounded slice. A tiny slice leaves the phase and cursor untouched, so
-    /// the next call continues instead of restarting.
+    /// the next call continues instead of restarting. Every SQL statement here
+    /// carries the slice deadline, so a scan or lock yields `Pending` rather than
+    /// overrunning the caller's budget.
     pub(crate) fn step(
         &mut self,
-        conn: &Connection,
+        conn: &mut Connection,
         budget: RefreshBudget,
     ) -> Result<ReadProgress<WorkProgress>, ProviderError> {
         if self.over {
@@ -336,6 +358,25 @@ impl Projection {
         }
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(budget.max_millis.max(1));
+        set_busy(conn, busy_for_deadline(deadline, u64::MAX))?;
+        let result = with_deadline_bound(conn, deadline, |conn| {
+            self.step_inner(conn, budget, deadline)
+        });
+        match result {
+            Ok(progress) => Ok(progress),
+            Err(error) if crate::providers::sqlite_guard::interrupted(&error) => {
+                Ok(ReadProgress::Pending(WorkProgress::default()))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn step_inner(
+        &mut self,
+        conn: &Connection,
+        budget: RefreshBudget,
+        deadline: std::time::Instant,
+    ) -> Result<ReadProgress<WorkProgress>, ProviderError> {
         let mut records = budget.max_records.max(1);
         let mut bytes = budget.max_bytes.max(1);
         let mut progress = WorkProgress::default();
@@ -344,9 +385,7 @@ impl Projection {
                 return Ok(ReadProgress::Pending(progress));
             }
             if self.phase == Phase::Fold {
-                self.fold()?;
-                self.phase = Phase::Ready;
-                return Ok(ReadProgress::Ready(progress));
+                return self.fold_step(&mut progress, deadline);
             }
             if self.member >= self.members.len() {
                 self.member = 0;
@@ -359,92 +398,109 @@ impl Projection {
                 continue;
             }
             let limit = records.min(BATCH) as i64;
-            let sql = match self.phase {
-                Phase::Tombstones => tombstone_sql(&self.shape),
-                _ => display_sql(&self.shape),
-            };
-            let session = &self.members[self.member];
+            let session = self.members[self.member].clone();
             let member = self.member;
-            let mut fetched = 0usize;
-            let mut stopped = false;
-            let mut cursor = self.cursor;
-            {
-                let mut statement = conn.prepare_cached(&sql).map_err(map_error)?;
-                let mut query = statement
-                    .query(rusqlite::params![session.native_id, cursor, limit])
-                    .map_err(map_error)?;
-                while let Some(row) = query.next().map_err(map_error)? {
-                    let id: i64 = row.get(0).map_err(map_error)?;
-                    cursor = id;
-                    fetched += 1;
-                    // Per-row accounting: a previous row's bytes must not be
-                    // subtracted again or let a later row skip the cap.
-                    let mut spent = 96usize;
-                    match self.phase {
-                        Phase::Tombstones => {
-                            let identity: Option<Vec<u8>> = row.get(1).map_err(map_error)?;
-                            let uid: Option<String> = row.get(2).map_err(map_error)?;
-                            spent += identity.as_ref().map_or(0, Vec::len);
-                            spent += uid.as_ref().map_or(0, String::len);
-                            let tombstones = self.removed_hashes.len() + self.removed_uids.len();
-                            if tombstones >= self.row_cap
-                                || self.bytes.saturating_add(spent) > self.byte_cap
-                            {
-                                self.over = true;
-                                return Err(over());
-                            }
-                            self.bytes = self.bytes.saturating_add(spent);
-                            if let Some(identity) = identity {
-                                let position =
-                                    self.removed_hashes.entry(identity).or_insert((member, id));
-                                if (member, id) > *position {
-                                    *position = (member, id);
-                                }
-                            }
-                            if let Some(uid) = uid.filter(|uid| !uid.is_empty()) {
-                                let position = self.removed_uids.entry(uid).or_insert((member, id));
-                                if (member, id) > *position {
-                                    *position = (member, id);
-                                }
-                            }
-                        }
-                        _ => {
-                            let parsed = scan_row(row)?;
-                            spent += parsed.message.byte_len();
-                            self.last_read = None;
-                            let blocks = blocks_of(&parsed.message);
-                            if self.rows.len() >= self.row_cap
-                                || self.bytes.saturating_add(spent) > self.byte_cap
-                            {
-                                self.over = true;
-                                return Err(over());
-                            }
-                            self.bytes = self.bytes.saturating_add(spent);
-                            self.rows.push(Row {
-                                id,
-                                member,
-                                key: parsed.order.unwrap_or(id),
-                                active: parsed.active,
-                                summary: parsed.summary,
-                                identity: parsed.identity,
-                                uid: parsed.uid.filter(|uid| !uid.is_empty()),
-                                blocks,
-                            });
-                        }
+            // Page candidate row ids without the visibility/tombstone predicate,
+            // so a gap of filtered-out rows still advances the resumable cursor
+            // even if SQLite interrupts the scan at the slice deadline.
+            // Page physical ids without the session predicate. A gap of other
+            // sessions must still advance the cursor; the per-id fetch keeps the
+            // session filter below.
+            let ids_sql = "SELECT id FROM messages WHERE id > ?1 ORDER BY id LIMIT ?2";
+            let mut statement = match conn.prepare_cached(ids_sql) {
+                Ok(statement) => statement,
+                Err(error) => {
+                    let error = map_error(error);
+                    if crate::providers::sqlite_guard::interrupted(&error) {
+                        return Ok(ReadProgress::Pending(progress));
                     }
-                    records = records.saturating_sub(1);
-                    bytes = bytes.saturating_sub(spent);
-                    progress.records += 1;
-                    progress.expanded_bytes += spent;
-                    if records == 0 || bytes == 0 {
-                        // A budget stop is not query exhaustion: keep the member
-                        // and cursor so later rows are never silently omitted.
-                        stopped = true;
-                        break;
+                    return Err(error);
+                }
+            };
+            let mut query = match statement.query(rusqlite::params![self.cursor, limit]) {
+                Ok(query) => query,
+                Err(error) => {
+                    let error = map_error(error);
+                    if crate::providers::sqlite_guard::interrupted(&error) {
+                        return Ok(ReadProgress::Pending(progress));
+                    }
+                    return Err(error);
+                }
+            };
+            let mut ids = Vec::with_capacity(limit as usize);
+            loop {
+                match query.next() {
+                    Ok(Some(row)) => ids.push(row.get::<_, i64>(0).map_err(map_error)?),
+                    Ok(None) => break,
+                    Err(error) => {
+                        let error = map_error(error);
+                        if crate::providers::sqlite_guard::interrupted(&error) {
+                            return Ok(ReadProgress::Pending(progress));
+                        }
+                        return Err(error);
                     }
                 }
             }
-            self.cursor = cursor;
+            drop(query);
+            let fetched = ids.len();
+            let mut stopped = false;
+            let row_sql = match self.phase {
+                Phase::Tombstones => tombstone_sql(&self.shape),
+                _ => display_sql(&self.shape),
+            }
+            // Fetch the one candidate by primary key; the range predicate above
+            // would rescan every later row when a candidate is filtered out.
+            .replacen(
+                "WHERE session_id = ?1 AND id > ?2",
+                "WHERE session_id = ?1 AND id = ?2",
+                1,
+            )
+            .replace(" LIMIT ?3", " LIMIT 1");
+            let mut row_statement = match conn.prepare_cached(&row_sql) {
+                Ok(statement) => statement,
+                Err(error) => {
+                    let error = map_error(error);
+                    if crate::providers::sqlite_guard::interrupted(&error) {
+                        return Ok(ReadProgress::Pending(progress));
+                    }
+                    return Err(error);
+                }
+            };
+            for id in ids {
+                if records == 0 || bytes == 0 {
+                    stopped = true;
+                    break;
+                }
+                match row_statement.query(rusqlite::params![session.native_id, id]) {
+                    Ok(mut single) => match single.next() {
+                        Ok(Some(row)) => {
+                            let spent = self.ingest_row(row, member, id)?;
+                            if spent > 0 {
+                                bytes = bytes.saturating_sub(spent);
+                                progress.expanded_bytes += spent;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let error = map_error(error);
+                            if crate::providers::sqlite_guard::interrupted(&error) {
+                                return Ok(ReadProgress::Pending(progress));
+                            }
+                            return Err(error);
+                        }
+                    },
+                    Err(error) => {
+                        let error = map_error(error);
+                        if crate::providers::sqlite_guard::interrupted(&error) {
+                            return Ok(ReadProgress::Pending(progress));
+                        }
+                        return Err(error);
+                    }
+                }
+                records = records.saturating_sub(1);
+                progress.records += 1;
+                self.cursor = id;
+            }
             if fetched < limit as usize && !stopped {
                 self.member += 1;
                 self.cursor = -1;
@@ -452,122 +508,219 @@ impl Projection {
         }
     }
 
-    /// Folds copies by proven identity, applies tombstones, orders by native
-    /// display position and computes the suffix event counts.
-    fn fold(&mut self) -> Result<(), ProviderError> {
-        let mut groups: HashMap<Identity, Group> = HashMap::new();
-        let mut order: Vec<(usize, i64, i64, Identity)> = Vec::new();
-        let rows = std::mem::take(&mut self.rows);
-        for row in rows {
-            let hash = row.identity.clone().map(Identity::Hash);
-            let uid = row.uid.clone().map(Identity::Uid);
-            // A summary carrier folds onto the first copy with its message_uid;
-            // every other row keys by its stored identity.
-            let key = if row.summary {
-                row.uid
-                    .as_ref()
-                    .and_then(|uid| self.uid_group.get(uid).cloned())
-                    .or(hash.clone())
-                    .or(uid.clone())
-                    .unwrap_or(Identity::Row(row.member, row.id))
-            } else {
-                hash.clone()
-                    .or(uid.clone())
-                    .unwrap_or(Identity::Row(row.member, row.id))
-            };
-            if let Some(uid) = &row.uid {
-                self.uid_group.entry(uid.clone()).or_insert(key.clone());
+    /// Applies one filtered row to the tombstone set or the display index and
+    /// returns the bytes it retained (0 when the phase predicate excluded it).
+    fn ingest_row(
+        &mut self,
+        row: &rusqlite::Row<'_>,
+        member: usize,
+        id: i64,
+    ) -> Result<usize, ProviderError> {
+        let mut spent = 96usize;
+        match self.phase {
+            Phase::Tombstones => {
+                let identity: Option<Vec<u8>> = row.get(1).map_err(map_error)?;
+                let uid: Option<String> = row.get(2).map_err(map_error)?;
+                spent += identity.as_ref().map_or(0, Vec::len);
+                spent += uid.as_ref().map_or(0, String::len);
+                if self.removed_hashes.len() + self.removed_uids.len() >= self.row_cap
+                    || self.bytes.saturating_add(spent) > self.byte_cap
+                {
+                    self.over = true;
+                    return Err(over());
+                }
+                self.bytes = self.bytes.saturating_add(spent);
+                if let Some(identity) = identity {
+                    let position = self.removed_hashes.entry(identity).or_insert((member, id));
+                    if (member, id) > *position {
+                        *position = (member, id);
+                    }
+                }
+                if let Some(uid) = uid.filter(|uid| !uid.is_empty()) {
+                    let position = self.removed_uids.entry(uid).or_insert((member, id));
+                    if (member, id) > *position {
+                        *position = (member, id);
+                    }
+                }
             }
-            let mut identities = Vec::new();
-            if let Some(identity) = &row.identity {
-                identities.push(Identity::Hash(identity.clone()));
+            _ => {
+                let parsed = scan_row(row)?;
+                spent += parsed.message.byte_len();
+                self.last_read = None;
+                let blocks = blocks_of(&parsed.message);
+                if self.rows.len() >= self.row_cap
+                    || self.bytes.saturating_add(spent) > self.byte_cap
+                {
+                    self.over = true;
+                    return Err(over());
+                }
+                self.bytes = self.bytes.saturating_add(spent);
+                self.rows.push(Row {
+                    id,
+                    member,
+                    key: parsed.order.unwrap_or(id),
+                    active: parsed.active,
+                    summary: parsed.summary,
+                    identity: parsed.identity,
+                    uid: parsed.uid.filter(|uid| !uid.is_empty()),
+                    blocks,
+                });
             }
-            if let Some(uid) = &row.uid {
-                identities.push(Identity::Uid(uid.clone()));
+        }
+        Ok(spent)
+    }
+
+    /// Folds copies by proven identity in resumable stages: group, emit in
+    /// native order (applying tombstones and logical ids), then build suffix
+    /// counts. A large retained projection returns `Pending` instead of holding
+    /// the worker for the whole fold.
+    fn fold_step(
+        &mut self,
+        progress: &mut WorkProgress,
+        deadline: std::time::Instant,
+    ) -> Result<ReadProgress<WorkProgress>, ProviderError> {
+        const FOLD_ITEMS: usize = 2_048;
+        let mut worked = 0usize;
+        loop {
+            if worked >= FOLD_ITEMS || std::time::Instant::now() >= deadline {
+                return Ok(ReadProgress::Pending(*progress));
             }
-            let position = (row.member, row.id);
-            let (row_member, row_key, row_id) = (row.member, row.key, row.id);
-            match groups.get_mut(&key) {
-                Some(group) => {
-                    group.carrier |= row.summary;
-                    group.last_display = group.last_display.max(position);
-                    for identity in identities {
-                        if !group.identities.contains(&identity) {
-                            group.identities.push(identity);
+            match self.fold_phase {
+                FoldPhase::Group => {
+                    if self.fold_at >= self.rows.len() {
+                        self.rows.clear();
+                        self.fold_at = 0;
+                        self.groups.clear();
+                        self.by_id.clear();
+                        self.fold_phase = FoldPhase::Emit;
+                        continue;
+                    }
+                    let row = self.rows[self.fold_at].clone();
+                    self.fold_at += 1;
+                    self.group_row(row);
+                    worked += 1;
+                    progress.records += 1;
+                }
+                FoldPhase::Emit => {
+                    let Some((_, identity)) = self.fold_order.pop_first() else {
+                        self.fold_suffix = vec![0usize; self.groups.len() + 1];
+                        self.fold_suffix_at = self.groups.len();
+                        self.fold_phase = FoldPhase::Suffix;
+                        continue;
+                    };
+                    if let Some(group) = self.fold_groups.remove(&identity) {
+                        let suppressed = group.identities.iter().any(|identity| {
+                            let removed = match identity {
+                                Identity::Hash(hash) => self.removed_hashes.get(hash),
+                                Identity::Uid(uid) => self.removed_uids.get(uid),
+                                Identity::Row(..) => None,
+                            };
+                            removed.is_some_and(|removed| *removed > group.last_display)
+                        });
+                        if !suppressed {
+                            let mut group = group;
+                            group.logical_id = match &group.identity {
+                                Identity::Hash(hash) => format!("h{}", hex(hash)),
+                                Identity::Uid(uid) => format!("u{}", hex(uid.as_bytes())),
+                                Identity::Row(_, id) => format!("r{id}"),
+                            };
+                            let at = self.groups.len();
+                            self.by_id.insert(group.logical_id.clone(), at);
+                            self.groups.push(group);
                         }
                     }
-                    if (row.active, row.id) > (group.representative.active, group.representative.id)
-                    {
-                        group.representative = row;
-                        group.blocks = group.blocks.max(group.representative.blocks);
-                    }
-                    if (row_member, row_key, row_id) < (group.member, group.key, group.first_id) {
-                        group.member = row_member;
-                        group.key = row_key;
-                        group.first_id = row_id;
-                    }
+                    worked += 1;
+                    progress.records += 1;
                 }
-                None => {
-                    order.push((row_member, row_key, row_id, key.clone()));
-                    groups.insert(
-                        key.clone(),
-                        Group {
-                            identity: key.clone(),
-                            member: row.member,
-                            key: row.key,
-                            first_id: row.id,
-                            representative: row.clone(),
-                            blocks: row.blocks,
-                            suppressed: false,
-                            carrier: row.summary,
-                            identities,
-                            last_display: position,
-                            logical_id: String::new(),
-                        },
-                    );
+                FoldPhase::Suffix => {
+                    if self.fold_suffix_at == 0 {
+                        let suffix = std::mem::take(&mut self.fold_suffix);
+                        self.suffix = suffix;
+                        self.phase = Phase::Ready;
+                        return Ok(ReadProgress::Ready(*progress));
+                    }
+                    let at = self.fold_suffix_at - 1;
+                    self.fold_suffix[at] =
+                        self.fold_suffix[at + 1].saturating_add(self.groups[at].blocks);
+                    self.fold_suffix_at = at;
+                    worked += 1;
+                    progress.records += 1;
                 }
             }
         }
-        for group in groups.values_mut() {
-            group.suppressed = group.identities.iter().any(|identity| {
-                let removed = match identity {
-                    Identity::Hash(hash) => self.removed_hashes.get(hash),
-                    Identity::Uid(uid) => self.removed_uids.get(uid),
-                    Identity::Row(..) => None,
-                };
-                removed.is_some_and(|removed| *removed > group.last_display)
-            });
+    }
+
+    /// One row into the fold maps; order-independent for grouping, but rows are
+    /// consumed in source order so a summary carrier resolves the same group as
+    /// it did before the fold was sliced.
+    fn group_row(&mut self, row: Row) {
+        let hash = row.identity.clone().map(Identity::Hash);
+        let uid = row.uid.clone().map(Identity::Uid);
+        let key = if row.summary {
+            row.uid
+                .as_ref()
+                .and_then(|uid| self.uid_group.get(uid).cloned())
+                .or(hash.clone())
+                .or(uid.clone())
+                .unwrap_or(Identity::Row(row.member, row.id))
+        } else {
+            hash.clone()
+                .or(uid.clone())
+                .unwrap_or(Identity::Row(row.member, row.id))
+        };
+        if let Some(uid) = &row.uid {
+            self.uid_group.entry(uid.clone()).or_insert(key.clone());
         }
-        order.sort_by_key(|(member, key, id, _)| (*member, *key, *id));
-        let mut visible = Vec::with_capacity(order.len());
-        for (_, _, _, identity) in order {
-            if let Some(group) = groups.remove(&identity)
-                && !group.suppressed
-            {
-                visible.push(group);
+        let mut identities = Vec::new();
+        if let Some(identity) = &row.identity {
+            identities.push(Identity::Hash(identity.clone()));
+        }
+        if let Some(uid) = &row.uid {
+            identities.push(Identity::Uid(uid.clone()));
+        }
+        let position = (row.member, row.id);
+        let (row_member, row_key, row_id) = (row.member, row.key, row.id);
+        match self.fold_groups.get_mut(&key) {
+            Some(group) => {
+                group.carrier |= row.summary;
+                group.last_display = group.last_display.max(position);
+                for identity in identities {
+                    if !group.identities.contains(&identity) {
+                        group.identities.push(identity);
+                    }
+                }
+                if (row.active, row.id) > (group.representative.active, group.representative.id) {
+                    group.representative = row;
+                    group.blocks = group.blocks.max(group.representative.blocks);
+                }
+                if (row_member, row_key, row_id) < (group.member, group.key, group.first_id) {
+                    group.member = row_member;
+                    group.key = row_key;
+                    group.first_id = row_id;
+                }
+            }
+            None => {
+                self.fold_order
+                    .insert((row_member, row_key, row_id), key.clone());
+                let blocks = row.blocks;
+                let summary = row.summary;
+                self.fold_groups.insert(
+                    key.clone(),
+                    Group {
+                        identity: key,
+                        member: row.member,
+                        key: row.key,
+                        first_id: row.id,
+                        representative: row,
+                        blocks,
+                        carrier: summary,
+                        identities,
+                        last_display: position,
+                        logical_id: String::new(),
+                    },
+                );
             }
         }
-        self.by_id.clear();
-        // The event id is the logical message's proven identity, not the physical
-        // row that happens to be its representative: a compaction may remove that
-        // copy while a new active copy keeps the same identity and anchor.
-        for group in &mut visible {
-            group.logical_id = match &group.identity {
-                Identity::Hash(hash) => format!("h{}", hex(hash)),
-                Identity::Uid(uid) => format!("u{}", hex(uid.as_bytes())),
-                Identity::Row(_, id) => format!("r{id}"),
-            };
-        }
-        for (at, group) in visible.iter().enumerate() {
-            self.by_id.insert(group.logical_id.clone(), at);
-        }
-        let mut suffix = vec![0usize; visible.len() + 1];
-        for at in (0..visible.len()).rev() {
-            suffix[at] = suffix[at + 1].saturating_add(visible[at].blocks);
-        }
-        self.groups = visible;
-        self.suffix = suffix;
-        Ok(())
     }
 
     /// Events after `anchor` in native display order (unbounded count).
@@ -1263,7 +1416,7 @@ fn parse_tool_calls(parsed: &ParsedMessage) -> Vec<Call> {
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 fn project_hermes_messages(
-    conn: &Connection,
+    conn: &mut Connection,
     members: &[SessionKey],
     anchor: Option<&PageAnchor>,
     direction: PageDirection,
@@ -2100,11 +2253,109 @@ mod tests {
         .unwrap();
     }
 
+    /// A tombstone scan that has to cross a large unindexed table must respect
+    /// the slice deadline instead of finishing the whole scan in one call.
+    #[test]
+    fn a_projection_scan_respects_the_slice_deadline() {
+        let (mut conn, key) = projection_fixture();
+        conn.execute_batch(
+            "WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 20000)
+             INSERT INTO messages(session_id, role, content, timestamp, active, compacted)
+             SELECT 's', 'user', 'x', 1.0, 0, 0 FROM c;",
+        )
+        .unwrap();
+        let shape = crate::providers::hermes::schema::detect_shape(&conn).unwrap();
+        let mut projection = Projection::new(&[key], std::path::Path::new("mem"), 1, shape, None);
+        let started = std::time::Instant::now();
+        let budget = RefreshBudget {
+            max_records: 100_000,
+            max_bytes: usize::MAX,
+            max_millis: 1,
+        };
+        let mut pending = 0usize;
+        while let ReadProgress::Pending(_) = projection.step(&mut conn, budget).unwrap() {
+            pending += 1;
+            assert!(pending < 5_000, "filtered gaps never advanced the cursor");
+        }
+        assert!(projection.ready());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the scan overran its slices: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Other sessions in the physical-id gap must not starve the cursor: the
+    /// candidate page is physical-only and the session filter is applied per id.
+    #[test]
+    fn a_projection_advances_across_other_session_gaps() {
+        let (mut conn, key) = projection_fixture();
+        conn.execute_batch(
+            "WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 20000)
+             INSERT INTO messages(session_id, role, content, timestamp, active, compacted)
+             SELECT 'other', 'user', 'x', 1.0, 1, 0 FROM c;",
+        )
+        .unwrap();
+        insert_fixture(&conn, "assistant", "only row", 1, 0, Some("only"), 30_000);
+        let shape = crate::providers::hermes::schema::detect_shape(&conn).unwrap();
+        let mut projection = Projection::new(&[key], std::path::Path::new("mem"), 1, shape, None);
+        let budget = RefreshBudget {
+            max_records: 100_000,
+            max_bytes: usize::MAX,
+            max_millis: 5,
+        };
+        let mut pending = 0usize;
+        while let ReadProgress::Pending(_) = projection.step(&mut conn, budget).unwrap() {
+            pending += 1;
+            assert!(pending < 5_000, "other-session gaps never advanced");
+        }
+        assert!(projection.ready());
+        assert_eq!(projection.groups.len(), 1);
+    }
+
+    /// A projection larger than one fold slice must return `Pending`, keep its
+    /// staging state, and complete only across later calls.
+    #[test]
+    fn a_large_projection_folds_in_bounded_slices() {
+        let (mut conn, key) = projection_fixture();
+        conn.execute_batch("BEGIN").unwrap();
+        for at in 0..2_200 {
+            insert_fixture(
+                &conn,
+                if at % 2 == 0 { "user" } else { "assistant" },
+                &format!("row {at}"),
+                1,
+                0,
+                Some(&format!("uid-{at}")),
+                at,
+            );
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        let shape = crate::providers::hermes::schema::detect_shape(&conn).unwrap();
+        let mut projection = Projection::new(&[key], std::path::Path::new("mem"), 1, shape, None);
+        let budget = RefreshBudget {
+            max_records: 100_000,
+            max_bytes: usize::MAX,
+            max_millis: 60_000,
+        };
+        let mut pending = 0usize;
+        while let ReadProgress::Pending(_) = projection.step(&mut conn, budget).unwrap() {
+            pending += 1;
+            assert!(pending < 100, "fold never completed");
+        }
+        assert!(
+            pending >= 2,
+            "the fold must span slices, not run atomically ({pending})"
+        );
+        assert!(projection.ready());
+        assert_eq!(projection.groups.len(), 2_200);
+    }
+
     /// A byte budget that fits one row must not be mistaken for end-of-member:
     /// every later display row and tombstone is still read.
     #[test]
     fn a_byte_interrupted_batch_keeps_the_cursor_and_tombstones() {
-        let (conn, key) = projection_fixture();
+        let (mut conn, key) = projection_fixture();
         // The first live row is older than the removed copy of its identity: a
         // skipped tombstone would resurrect it in the folded projection.
         insert_fixture(&conn, "user", "live one", 1, 0, Some("dead-1"), 10);
@@ -2130,7 +2381,7 @@ mod tests {
             max_millis: 60_000,
         };
         let mut steps = 0usize;
-        while let ReadProgress::Pending(_) = projection.step(&conn, budget).unwrap() {
+        while let ReadProgress::Pending(_) = projection.step(&mut conn, budget).unwrap() {
             steps += 1;
             assert!(steps < 64, "the cursor never advanced");
         }
@@ -2142,7 +2393,7 @@ mod tests {
     /// identities; they cannot grow past the row ceiling.
     #[test]
     fn uid_only_tombstones_are_bounded() {
-        let (conn, key) = projection_fixture();
+        let (mut conn, key) = projection_fixture();
         for at in 0..8 {
             insert_fixture(&conn, "user", "dead", 0, 0, Some(&format!("uid-{at}")), at);
         }
@@ -2154,7 +2405,7 @@ mod tests {
             .with_caps(4, usize::MAX);
         let error = projection
             .step(
-                &conn,
+                &mut conn,
                 RefreshBudget {
                     max_records: 100,
                     max_bytes: 1_000_000,

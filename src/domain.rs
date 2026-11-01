@@ -290,6 +290,10 @@ pub struct CostEstimate {
     pub known_subtotal: f64,
     pub breakdown: CostBreakdown,
     pub source: Option<MoneySource>,
+    /// Priced from the native-vendor API reference because no billing route was
+    /// recorded. The recorded provider is never invented; UI labels this a
+    /// reference estimate.
+    pub reference: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -595,6 +595,9 @@ pub(crate) struct Selection {
     /// Bit per leg in `LEG_NAMES` that the service tier leaves unpriced.
     unpublished: u8,
     as_of: Option<String>,
+    /// The route was supplied by the native-vendor reference policy, not by a
+    /// recorded provider.
+    reference: bool,
 }
 
 impl Selection {
@@ -820,11 +823,11 @@ fn select(
     let Some(model) = facts.model else {
         return Err("no model recorded");
     };
-    let provider = match (model.provider.as_deref(), policy) {
-        (Some(p), _) => p,
+    let (provider, reference) = match (model.provider.as_deref(), policy) {
+        (Some(p), _) => (p, false),
         (None, ReferencePolicy::NativeApi(h)) if h == facts.harness => match h {
-            Harness::Claude => "anthropic",
-            Harness::Codex => "openai",
+            Harness::Claude => ("anthropic", true),
+            Harness::Codex => ("openai", true),
             _ => return Err("no billing route recorded"),
         },
         (None, _) => return Err("no billing route recorded"),
@@ -908,6 +911,7 @@ fn select(
         multiplier,
         unpublished,
         as_of,
+        reference,
     })
 }
 
@@ -985,6 +989,7 @@ fn price(
         known_subtotal: sum.known,
         breakdown,
         source: Some(source),
+        reference: selection.reference,
     };
     (cost, Some(selection))
 }

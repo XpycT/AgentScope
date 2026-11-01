@@ -928,3 +928,15 @@ fn loading_rows_show_an_ellipsis_never_zero() {
     assert!(out.contains('…'), "{out}");
     assert!(!out.contains("0 tok/s") && !out.contains("$0.00"), "{out}");
 }
+
+#[test]
+fn mtime_derived_activity_is_marked_approximate() {
+    let mut derived = rich(Harness::Codex, "d", "Approximate archive");
+    derived.meta.activity.at = Some(NOW - 180_000);
+    derived.meta.activity.class = AggregationClass::Derived;
+    derived.last_event_at = None;
+    derived.last_completion = None;
+    let app = rich_app(vec![derived]);
+    let out = text(&draw(&app, &ctx(false), 120, 40));
+    assert!(out.contains("~3m"), "approximate marker missing:\n{out}");
+}

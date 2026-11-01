@@ -209,9 +209,14 @@ pub(super) fn cost_fact(usage: Option<&UsageSummary>, hydrated: bool) -> Fact {
     };
     let cost = &usage.cost;
     match (cost.usd, cost.class) {
-        (Some(usd), AggregationClass::Estimated) => {
-            Fact::new(format!("~{}", money_text(usd)), "estimated")
-        }
+        (Some(usd), AggregationClass::Estimated) => Fact::new(
+            format!("~{}", money_text(usd)),
+            if cost.reference {
+                "reference estimate"
+            } else {
+                "estimated"
+            },
+        ),
         (Some(usd), class) if class != AggregationClass::Unknown => {
             Fact::new(money_text(usd), class_name(class))
         }
@@ -493,11 +498,25 @@ fn usage_lines(usage: &UsageSummary) -> Vec<String> {
     if let Some(note) = &usage.cost.note {
         out.push(format!("Cost note: {}", display_safe(note)));
     }
+    if usage.cost.reference {
+        out.push(
+            "Reference API estimate: no billing route was recorded; the provider was not invented."
+                .into(),
+        );
+    }
     if usage.cost.class == AggregationClass::Estimated {
         out.push("Cost is an estimate from the local price table, not a billed amount.".into());
         let basis = match usage.cost.source {
             Some(MoneySource::UserOverride) => Some("your price override"),
             Some(MoneySource::SavedCatalogEstimate) => Some("an estimate saved by the source"),
+            Some(MoneySource::BundledReference) if usage.cost.reference => Some(
+                "the bundled official price catalog, applied as a reference API estimate \
+                 because no billing route was recorded",
+            ),
+            Some(MoneySource::BundledReference) if usage.cost.reference => Some(
+                "the bundled official price catalog, applied as a reference API estimate \
+                 because no billing route was recorded",
+            ),
             Some(MoneySource::BundledReference) => Some("the bundled official price catalog"),
             _ => None,
         };

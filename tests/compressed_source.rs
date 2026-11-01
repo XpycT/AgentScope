@@ -1815,3 +1815,48 @@ fn codex_archive_page_retention_stays_bounded_with_many_hidden_records() {
             .is_some_and(|t| t.preview.contains("older visible"))
     }));
 }
+
+#[test]
+fn archived_activity_prefers_recorded_time_and_marks_mtime_as_approximate() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let archived = dir.path().join("archived_sessions");
+    let rollouts = sessions.join("2026").join("10").join("29");
+    fs::create_dir_all(&rollouts).unwrap();
+    fs::create_dir_all(&archived).unwrap();
+
+    // No recorded timestamp: discovery falls back to the archive's mtime and
+    // labels it derived/approximate rather than inventing a reported time.
+    let no_time = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"archive-no-time\"}}\n";
+    let zst = rollouts.join("rollout-no-time.jsonl.zst");
+    write_archive(&zst, no_time);
+    support::set_modified(&zst, 1_700_000_000);
+    let config = support::config_for_store(&sessions, &archived);
+    let mut scanner = CodexScanner::new(&config).unwrap();
+    let found = support::world::discover_pass(&mut scanner, NOW, BIG).sessions;
+    let meta = latest(&found)
+        .into_iter()
+        .find(|m| m.key.native_id == "archive-no-time")
+        .expect("archive listed");
+    assert_eq!(meta.activity.at, Some(1_700_000_000_000));
+    assert_eq!(
+        meta.activity.class,
+        agentscope::domain::AggregationClass::Derived
+    );
+
+    // A recorded timestamp is reported and determines the exact order.
+    let timed = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"archive-timed\"},\
+                  \"timestamp\":\"2026-10-29T10:00:00Z\"}\n";
+    let zst = rollouts.join("rollout-timed.jsonl.zst");
+    write_archive(&zst, timed);
+    let found = support::world::discover_pass(&mut scanner, NOW, BIG).sessions;
+    let meta = latest(&found)
+        .into_iter()
+        .find(|m| m.key.native_id == "archive-timed")
+        .expect("timed archive listed");
+    assert_eq!(meta.activity.at, Some(1_793_268_000_000));
+    assert_eq!(
+        meta.activity.class,
+        agentscope::domain::AggregationClass::Reported
+    );
+}

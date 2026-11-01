@@ -175,6 +175,55 @@ fn cache_ttl_costs_reconcile() {
 }
 
 #[test]
+fn a_single_recorded_cache_write_retention_is_not_dropped() {
+    // Pi records only the one-hour subset; the residual has no recorded TTL and
+    // must stay at the generic cache-write rate instead of losing the known leg.
+    let prices = price_schedule(
+        r#"[{"billing_provider":"acme","model":"m","rates":{"input":2.0,"output":10.0,"cache_read":0.1,"cache_write":3.0,"cache_write_5m":2.5,"cache_write_1h":4.0}}]"#,
+    );
+    let cats = TokenCategories {
+        input: Some(0),
+        output: Some(0),
+        cache_read: Some(0),
+        cache_write: Some(600),
+        cache_write_1h: Some(400),
+        ..TokenCategories::default()
+    };
+    let u = usage("r1", Some("acme"), "m", cats.clone(), ADDITIVE);
+    let e = estimate(&u, &prices);
+    assert!((e.usd.unwrap() - 0.0022).abs() < 1e-12, "{e:?}");
+    assert!((e.breakdown.cache_write_1h.unwrap() - 0.0016).abs() < 1e-12);
+    assert!((e.breakdown.cache_write_other.unwrap() - 0.0006).abs() < 1e-12);
+    assert_eq!(e.breakdown.cache_write_5m, Some(0.0));
+
+    // A five-minute-only split keeps its own leg and sends the rest generic.
+    let cats = TokenCategories {
+        cache_write_5m: Some(200),
+        cache_write_1h: None,
+        ..cats
+    };
+    let u = usage("r2", Some("acme"), "m", cats.clone(), ADDITIVE);
+    let e = estimate(&u, &prices);
+    assert!((e.breakdown.cache_write_5m.unwrap() - 0.0005).abs() < 1e-12);
+    assert!((e.breakdown.cache_write_other.unwrap() - 0.0012).abs() < 1e-12);
+    assert_eq!(e.breakdown.cache_write_1h, Some(0.0));
+
+    // A split larger than the recorded total is invalid, never clamped.
+    let cats = TokenCategories {
+        cache_write: Some(100),
+        cache_write_5m: Some(200),
+        cache_write_1h: None,
+        ..cats
+    };
+    let u = usage("r3", Some("acme"), "m", cats, ADDITIVE);
+    assert!(
+        estimate_cost(&u, &prices, ReferencePolicy::Disabled)
+            .usd
+            .is_none()
+    );
+}
+
+#[test]
 fn inclusive_cached_input_and_reasoning_are_not_rebilled() {
     let cats = TokenCategories {
         input: Some(1_000),
@@ -639,7 +688,12 @@ fn billing_routes_are_exact_and_native_reference_is_policy_gated() {
     ]);
     let cats = additive(1_000_000, 0, 0, 0, 0);
     let routed = usage("r", Some("acme"), "claude-x", cats.clone(), ADDITIVE);
-    assert!(estimate(&routed, &prices).usd.is_some());
+    let routed_cost = estimate(&routed, &prices);
+    assert!(routed_cost.usd.is_some());
+    assert!(
+        !routed_cost.reference,
+        "a recorded route is not a reference"
+    );
     // Provider names are exact: no case folding or harness aliases.
     for alias in ["Anthropic", "ACME", "claude", "opencode"] {
         let u = usage("r", Some(alias), "claude-x", cats.clone(), ADDITIVE);
@@ -652,7 +706,13 @@ fn billing_routes_are_exact_and_native_reference_is_policy_gated() {
     // No recorded route: only an enabled native policy prices it, as a reference.
     let bare = usage("r", None, "claude-x", cats, ADDITIVE);
     assert_eq!(estimate(&bare, &prices).usd, None);
-    assert_eq!(estimate_cost(&bare, &prices, native).usd, Some(2.0));
+    let reference = estimate_cost(&bare, &prices, native);
+    assert_eq!(reference.usd, Some(2.0));
+    assert!(
+        reference.reference,
+        "the native fallback must be labeled a reference"
+    );
+    assert_eq!(reference.source, Some(MoneySource::BundledReference));
     let codex = ReferencePolicy::NativeApi(Harness::Codex);
     assert_eq!(estimate_cost(&bare, &prices, codex).usd, None);
 }

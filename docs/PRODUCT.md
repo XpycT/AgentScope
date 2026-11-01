@@ -1,35 +1,42 @@
 # AgentScope — Product Requirements & Design
 
-**Version:** 0.2 (proposal)<br>
-**Date:** 27 October 2026<br>
-**Status:** Requirements document; v1 implemented and verified on synthetic fixtures, partially validated on real data (see [Implementation status](#implementation-status))<br>
+**Version:** 0.3<br>
+**Date:** 1 November 2026<br>
+**Status:** Requirements document; v1 implemented and verified on synthetic fixtures across six harnesses, partially validated on real data (see [Implementation status](#implementation-status))<br>
 **Product category:** Local-first developer observability tool<br>
 **Initial interface:** Terminal User Interface (TUI)
 
 ## Implementation status
 
-*Updated 2026-10-30. The sections below remain the product requirements; this section records what was actually verified.*
+*Updated 2026-11-01. The sections below remain the product requirements; this section records what was actually verified.*
 
 | Area | Status |
 |---|---|
-| Codex, Claude Code, OpenCode adapters, roster, transcript explorer, usage, status, process candidates, TUI | Implemented. AC-01..AC-10 pass on synthetic fixtures through the real adapters, worker thread, and keyboard path (`tests/acceptance.rs`). |
-| Read-only (§10, AC-08) | Verified on fixtures: session files, the main OpenCode database, mtimes, and permissions (Unix mode bits; on Windows only the read-only attribute, not ACLs) unchanged; credential tables denied by the SQLite authorizer; `auth.json`/credential files never discovered (`tests/read_only.rs`). **Exception:** SQLite may create/update OpenCode `-shm`/`-wal` sidecars ([ADR-0002](decisions/0002-opencode-readonly-wal-sidecars.md)); the claim is "no writes to session content, databases, configuration, permissions, or credentials", not "byte-identical directory". |
+| Six harness readers, roster, transcript explorer, usage, status, process candidates, TUI | Implemented for Codex, Claude Code, OpenCode, OMP (oh-my-pi), Hermes, and native Pi. AC-01..AC-10 pass on synthetic fixtures through the real adapters, worker thread, and keyboard path (`tests/acceptance.rs`). |
+| Native subagents | Implemented for five harnesses: Codex, Claude Code, OpenCode, OMP, and Hermes. Pi records no native child session, so none is listed. Child/grandchild, fork, continuation, orphan and cycle cases are covered by `native_children`, the adapter suites, and the integrated world. |
+| Local desktop and archives | Claude Desktop Code/Cowork manifests and Codex `archived_sessions`/`.jsonl.zst` are read locally; released sessions are hidden by default. Chat history, credentials, renderer caches, VM bundles, and cloud-only or WSL-contained stores are not read. |
+| Money | Offline catalog revision `2026-10-30.2` (schema version 1, checked 2026-10-30) plus exact user overrides. Every amount is an API-equivalent estimate; a reported amount must be `ReportedApi`, a saved estimate must have a verified source, and unknown routes/tiers/tariffs/TTL/reasoning rates stay `Unknown`. |
+| Measured facts | Per-harness coverage is explicit: turn timing and context for Codex/Claude Code; recorded model time, request speed, active-branch context for OMP/Pi; compaction markers for Codex/Claude/OMP/Pi plus Hermes event/aggregate compaction. Hermes active time, speed, and context stay Unknown. See [Architecture §5](ARCHITECTURE.md#5-state-and-measurement-semantics). |
+| Bounded reads and paging | One worker slice stops at 256 records, 8 MiB, or 100 ms; metadata probes are 4 KiB head plus 32 KiB tail; root/child pages are 50; record/page/loaded-window/ledger caps are configurable and visible. Cancellation is job-scoped. |
+| Read-only (§10, AC-08) | Verified on fixtures: session files, the main databases, mtimes, and permissions (Unix mode bits; on Windows only the read-only attribute, not ACLs) unchanged; OpenCode and Hermes SQLite run behind fixed table/column allowlists; credential tables denied; `auth.json`/credential files never discovered (`tests/read_only.rs`). **Exception:** SQLite may create/update `-shm`/`-wal` sidecars ([ADR-0002](decisions/0002-opencode-readonly-wal-sidecars.md)); the claim is "no writes to session content, databases, configuration, permissions, or credentials", not "byte-identical directory". |
 | Privacy (§10, AC-09) | Verified on fixtures: sentinel secrets absent from Debug output, warnings, errors, and rendered screens; control sequences neutralized; credential-shaped text masked by default (`tests/privacy.rs`). Masking is best effort. |
-| Real data | Read-only adapter smoke on one Windows developer machine (codex-cli 0.159.2, Claude Code 2.1.311, opencode 2.0.29): discovery of all three providers and transcript page reading only; a before/after content-hash inventory found no silent content change (concurrent provider changes are reported as inconclusive, not attributed). Outstanding on real data: live append (AC-04), an interactive TUI run, macOS/Linux, and Windows ACL-level permission checks. |
+| Real data | Read-only adapter smoke on one Windows developer machine (codex-cli 0.159.2, Claude Code 2.1.311, opencode 2.0.29): discovery of all three providers and transcript page reading only; a before/after content-hash inventory found no silent content change (concurrent provider changes are reported as inconclusive, not attributed). The six synthetic harnesses were exercised through the real binary for roster, paging, session summaries, limits and locked-source isolation, with child expansion and transcript navigation exercised through the real readers/worker/App/renderer under a test backend rather than a live terminal. Outstanding on real data: OMP/Hermes/Pi installations, live append (AC-04), an interactive TUI run, macOS/Linux, and Windows ACL-level permission checks. |
 | Performance (§11) | Deterministic work budgets enforced; timings measured on Windows only ([benchmarks](superpowers/notes/2026-10-30-benchmarks.md)). |
 
 **Known deviations from the requirements above:**
 
-- The roster scan is not the header/tail metadata-only pass the design called for; adapters stream each file once (bounded per call). Deferred.
+- The roster scan is not the header/tail metadata-only pass the design called for; Codex and Claude Code stream each file once (bounded per call). OMP and Pi use bounded prefix/tail probes. Deferred.
 - Process-to-session matching needs the session ID on a command line, so most sessions show `Unmatched` or same-provider *candidates*; Windows does not expose other processes' working directories.
-- Cost estimates require a user-supplied exact provider+model price; otherwise cost is `Unknown`.
+- Cost is priced only from the bundled catalog or an exact user override; anything else is `Unknown`. A session-wide token counter cannot be split into individual requests, so per-request tiers and time-of-day tariffs stay `Unknown` at session level.
+- Search, filters, and counts cover loaded roots and loaded children only; 50 roots load at a time. This is a deliberate bound, not an absence claim.
+- Native Pi has no subagents, no recorded session end/active interval, and speed only when an assistant record carries `durationMs`. Hermes keeps per-event compaction before/after/duration and request speed `Unknown`.
 - macOS and Linux are unvalidated; OpenCode and macOS are not benchmarked.
 
 ## 1. Executive summary
 
 AgentScope is a **read-only, local-first observability application for AI coding agents**. It gives developers one place to discover agent sessions, inspect full conversations and tool activity, understand token consumption and estimated costs, and identify sessions that may need attention. It does not launch, control, or modify the underlying agents.
 
-The initial product focuses on sessions produced by **OpenAI Codex CLI, Claude Code, OpenCode, OMP (oh-my-pi), and Hermes**, including agents launched directly or through orchestrators such as Hermes. AgentScope should feel like an independent, cross-provider counterpart to the OMP Agent Hub: a session roster with a drill-down inspector and transcript timeline. A future architecture will support collectors on multiple machines and a unified hub, but **the MVP is strictly local and TUI-only**.
+The initial product focuses on sessions produced by **OpenAI Codex CLI, Claude Code, OpenCode, OMP (oh-my-pi), Hermes, and native Pi**, including agents launched directly or through orchestrators such as Hermes. AgentScope should feel like an independent, cross-provider counterpart to the OMP Agent Hub: a session roster with a drill-down inspector and transcript timeline. A future architecture will support collectors on multiple machines and a unified hub, but **the MVP is strictly local and TUI-only**.
 
 **Product promise:** *Understand what every local coding agent is doing without changing how it runs.*
 
@@ -56,7 +63,7 @@ A developer or small technical team operating several local coding agents concur
 - **When I delegate implementation or review**, I want to open a roster and see the newest activity for each session, so I know whether work is progressing.
 - **When an agent becomes quiet**, I want an evidence-based explanation of what is known and unknown, so I can decide whether to investigate manually.
 - **When a task is expensive**, I want token totals and cost provenance, so I can distinguish measured use from estimates.
-- **When a worker fails**, I want to read its transcript and tool outputs in chronological order without switching among three providers' tools.
+- **When a worker fails**, I want to read its transcript and tool outputs in chronological order without switching among six harnesses' tools.
 - **When I move between machines** (future), I want the same inspection experience without exposing local secrets or sending raw transcripts to a third party.
 
 ## 3. Goals, non-goals, and principles
@@ -100,7 +107,7 @@ The **MVP release** includes:
 | Area | MVP capability |
 |---|---|
 | Platforms | One local machine per running application; Windows and macOS validation, Linux best effort |
-| Providers | Codex CLI, Claude Code, OpenCode (current detected local storage variants) |
+| Providers | Codex CLI, Claude Code, OpenCode, OMP, Hermes, and native Pi (current detected local storage variants; cloud-only and WSL-contained stores excluded) |
 | UI | Keyboard-first Ratatui TUI: session roster, session inspector, transcript reader |
 | Discovery | Provider-native local session stores; recent sessions, project and model metadata when present |
 | Transcript | Chronological user/assistant messages and expandable tool inputs/outputs |
@@ -235,10 +242,12 @@ A normalized `UsageObservation` records provider, model, timestamp, token breakd
 
 - **Reported usage:** emitted by a provider or client in a persisted record.
 - **Derived usage:** computed from trusted reported records after provider-specific de-duplication/delta logic.
-- **Estimated cost:** usage multiplied by a configured, versioned price schedule.
+- **Estimated cost:** usage multiplied by the bundled, versioned price schedule or an exact user override.
 - **Unknown:** no reliable observation; never silently coerce missing values to zero.
 
-Provider adapters must handle cumulative snapshots versus per-request counts differently. For Codex, do not sum every `token_count` snapshot; compare the appropriate cumulative/delta semantics per observed record. For Claude Code, deduplicate repeated or streaming messages by stable identifiers and avoid counting parent rollups and child sessions twice. For OpenCode, validate whether usage is per-message/part and whether the stored amount is already a computed charge before aggregation.
+Implemented money provenance distinguishes four sources: `ReportedApi` (a provider-reported API amount; a reported zero stays reported and does not override the estimate), `SavedCatalogEstimate` (a provider-saved estimate whose source is verified), `UserOverride`, and `BundledReference`. The bundled catalog is `src/pricing/catalog.json` (schema version 1, revision `2026-10-30.2`, checked 2026-10-30 from eight official source pages). Every amount is an API-equivalent estimate, never billed spend; an unverified saved amount, a subscription allocation, a parent's quoted child cost, and an aggregate compaction row are never added to per-request money. A model, billing route, request-length tier, time-of-day tariff, unmapped cache-retention rate, or reasoning counter without an explicit rate stays `Unknown`; a partial subtotal is labeled and never promoted to a total.
+
+Provider adapters must handle cumulative snapshots versus per-request counts differently. For Codex, do not sum every `token_count` snapshot; compare the appropriate cumulative/delta semantics per observed record. For Claude Code, deduplicate repeated or streaming messages by stable identifiers and avoid counting parent rollups and child sessions twice. For OpenCode, validate whether usage is per-message/part and whether the stored amount is already a computed charge before aggregation. OMP and Pi count only uniquely owned requests across recorded branches: copied fork/continuation history and unprovable ownership are not charged, and an authoritative revision replaces a stored contribution instead of adding one. Hermes counts recorded per-row/session aggregates and never converts them into request deltas or measured throughput; a compression ledger row is one aggregate amount, never split per event.
 
 **Context utilization** is not equivalent to total lifetime session tokens; display a context percentage only when current-window consumption and window size are defensible. **Provider subscription spend cannot be inferred from token totals.** Estimated API-equivalent costs must be labeled accordingly.
 
@@ -247,17 +256,17 @@ Provider adapters must handle cumulative snapshots versus per-request counts dif
 ### 9.1 Local architecture
 
 ```text
-Codex JSONL  ───> Codex adapter  ──┐
-Claude JSONL ───> Claude adapter ───┼──> Normalized snapshots/events
-OpenCode DB  ───> OpenCode adapter ─┘                │
-OS processes ───> Process observer ──────────────────┤
-                                                    ↓
-                                    In-memory session index
-                                                    ↓
-                                             Ratatui TUI
+Codex / Claude / OMP / Pi JSONL ───> native readers ──┐
+OpenCode / Hermes SQLite        ───> DB readers ──────┼──> Normalized snapshots/events
+Claude Desktop Code/Cowork      ───> Desktop reader ──┤
+OS processes                    ───> Process observer┘              │
+                                                                    ↓
+                                                      In-memory session index
+                                                                    ↓
+                                                               Ratatui TUI
 ```
 
-The MVP can rebuild a bounded in-memory index for recent data, then maintain incremental cursors. Persistent storage is optional; if introduced, it must be a separate AgentScope-owned cache, never an agent's database.
+The MVP can rebuild a bounded in-memory index for recent data, then maintain incremental cursors. Persistent storage is optional; if introduced, it must be a separate AgentScope-owned cache, never an agent's database. Roots resolve from CLI, provider environment, config, then the platform default; OMP and Pi refuse to share an ambiguously configured path rather than mislabel it.
 
 ### 9.2 Possible Rust modules (illustrative, not prescribed)
 
@@ -359,7 +368,7 @@ These are engineering targets, not claims of measured performance. Define a benc
 
 **AC-07 — Missing data:** Unavailable cost, missing completion event, or ambiguous process matching display Unknown/Unmatched instead of misleading zeros or hard failures.
 
-**AC-08 — Read-only regression:** Running all acceptance tests never changes provider session files, the main provider database, configuration, permissions, credentials, or running processes. The only permitted filesystem change is SQLite's transient OpenCode `-shm`/`-wal` sidecars (ADR-0002).
+**AC-08 — Read-only regression:** Running all acceptance tests never changes provider session files, the main provider databases, configuration, permissions, credentials, or running processes. The only permitted filesystem change is SQLite's transient `-shm`/`-wal` sidecars for read-only SQLite readers (OpenCode and Hermes, ADR-0002).
 
 **AC-09 — Privacy:** Raw terminal control sequences are neutralized and known test secrets are masked in the default transcript display.
 
@@ -372,6 +381,8 @@ These are engineering targets, not claims of measured performance. Define a benc
 **OMP (synthetic, 2026-11-01):** OMP sessions and artifact-tree subagents are implemented. The OMP family, fork and a secret-bearing session are part of the native world (`World::native`; `World::with_omp` adds them to the three-provider world). `omp_family_opens_through_the_real_worker_app_and_renderer` (acceptance), the `omp_*` cases in `read_only`, `privacy`, `perf_budget` and `live_refresh`, and `tests/omp_discovery.rs`, `omp_hydration.rs`, `omp_transcript.rs` cover children/grandchildren, direct tokens (a parent's quoted child cost is not added), category counters, compaction summaries with Unknown cost, newest and older transcript pages, live append, replacement, cancellation and a damaged or unsupported sibling. Compaction cost and active time are `Unknown` (OMP persists neither).
 
 **Native Pi (synthetic, 2026-11-01):** the standard Pi JSONL tree format is read as a complete `ProviderReader` (discovery, hydration, transcript/details/count/source, job-scoped cancellation). The Pi family, a verbatim fork and a secret-bearing session are part of the native world (`World::native`; `World::with_pi` adds them to the three-provider world). `pi_family_opens_through_the_real_worker_app_and_renderer` (acceptance), the `pi_*` cases in `read_only`, `privacy` and `perf_budget`, the native-world cases in `native_children`, `desktop_sessions` and `tui_flow` (whose population now includes Pi), plus `tests/pi_sessions.rs`, `pi_tree.rs` and `pi_transcript.rs`, cover: newest-entry open and exact backward identities, source inspection, unsupported/malformed records that keep valid neighbours, torn appends (no phantom until the terminator, then one request), truncation/replacement invalidation, cancellation, combined details budgets, extension state excluded, and no invented extension children. Request speed is Unknown unless an assistant record carries `durationMs`; session end and active intervals are Unknown because standard Pi records persist neither.
+
+**Six-harness release (synthetic, 2026-11-01):** `World::with_all_harnesses()` builds one 125-root store across all six harnesses with five native child families (Codex, Claude Code, OpenCode, OMP, Hermes delegate), a nested grandchild, a Pi root with no children, a Hermes continuation member, a native zstd archive, Claude Desktop Code/Cowork/released sessions, partial/damaged/locked sources and injected secrets. `six_harness_roster_preserves_direct_usage_and_generation` and `six_harness_refresh_keeps_selection_and_truthful_unknowns` in `tests/acceptance.rs` assert exact 50/100/125 root identities with no duplicate or child root slot, every member's owned tokens/cost, each family's final transcript event, a selected identity surviving a roster-generation change with a late obsolete preview answer discarded, loaded-only search (an unloaded match is not found; a child match keeps its parent), manual historical reading not being jumped, and Hermes aggregate rows/Pi missing timing remaining `Unknown` rather than becoming request speed. The full gate run after integration passed 857 tests (0 failed, 3 ignored) with clean `fmt`/`check`/`clippy -D warnings`; the real binary reproduced the six-harness roster, paging, per-harness summaries, locked/limit isolation and a 133-file source inventory (130 byte-identical; three SQLite `-shm` sidecars only). The approved release's 18 design scenarios are walked row-by-row, with the owning tests and smoke observations, in the R2 completion report; no row is satisfied by a staged subset.
 
 ## 13. Risks, dependencies, and mitigations
 
@@ -388,21 +399,23 @@ These are engineering targets, not claims of measured performance. Define a benc
 
 ## 14. Open decisions and validation spikes
 
-These items must be verified against **real sessions on the target devices** before implementation is considered stable:
+These items remain to be verified against **real sessions on the target devices** before the release is called stable (implementation on synthetic fixtures is complete):
 
-1. Exact Codex, Claude Code, and OpenCode schema versions and configurable data roots.
-2. Which providers persist per-request versus cumulative token snapshots and how to deduplicate.
+1. Exact Codex, Claude Code, OpenCode, OMP, Hermes, and Pi schema versions and configurable data roots on real installations; only the first three were partly exercised.
+2. Real per-request versus cumulative token behavior for OMP, Hermes, and Pi producers, including whether copied branch history and compaction usage are persisted the same way the fixtures model.
 3. Availability of usable session IDs in OS processes, and realistic limits of process-to-session correlation.
-4. Whether source records include explicit terminal outcomes; if not, display Unknown.
-5. How OpenCode schema and WAL behavior respond to a concurrent read-only query.
-6. Whether Hermes process registry can eventually be inspected safely without importing, mutating, or invoking Hermes internals.
-7. How much of parent/child lineage is explicitly persisted for each provider.
+4. Whether source records include explicit terminal outcomes; where they do not, the display stays Unknown.
+5. How OpenCode and Hermes schema/WAL behavior responds to a concurrent read-only query on real live databases.
+6. Whether the Hermes process registry can eventually be inspected safely without importing, mutating, or invoking Hermes internals.
+7. How much parent/child lineage is explicitly persisted across provider versions for each of the five subagent-capable harnesses.
+8. Claude Desktop Code/Cowork manifest layouts and released-session semantics across application versions.
+9. Whether OMP/Pi keep recording whole-request durations in the same fields, and whether Pi ever gains a native child-session format.
 
 Capture **redacted, consented, version-labeled test fixtures**; never commit real agent transcripts or credentials.
 
 ## 15. Success criteria
 
-MVP is successful when the user can run Hermes and other coding tools unchanged, launch a single terminal application, see sessions from all three providers, select one, read its recorded work and tool outputs, inspect usable token totals, and distinguish *observed facts* from uncertain lifecycle and cost estimates.
+MVP is successful when the user can run Hermes and other coding tools unchanged, launch a single terminal application, see sessions from all six supported harnesses, select one, read its recorded work and tool outputs, inspect usable token totals, and distinguish *observed facts* from uncertain lifecycle and cost estimates.
 
 Longer-term product success: the same experience across multiple local devices without compromising source privacy or depending on any single orchestrator.
 
@@ -420,4 +433,4 @@ These are implementation research leads, **not stable provider data format contr
 
 ---
 
-**Current scope:** Local, read-only, three-provider TUI MVP. Process control, orchestrator integration, web UI, and remote collection are outside the first release.
+**Current scope:** Local, read-only, six-harness TUI MVP. Process control, orchestrator integration, web UI, and remote collection are outside the first release.

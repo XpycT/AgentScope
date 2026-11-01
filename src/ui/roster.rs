@@ -536,7 +536,20 @@ fn row_lines(
         .into_iter()
         .flatten()
         .max();
-    let last = activity.map_or_else(|| "—".to_string(), |t| relative_label(t, now));
+    // A mtime-derived activity is approximate and must not read as an exact
+    // recorded event time.
+    let approximate = activity == s.meta.activity.at
+        && s.meta.activity.class == crate::domain::AggregationClass::Derived;
+    let last = activity.map_or_else(
+        || "—".to_string(),
+        |t| {
+            format!(
+                "{}{}",
+                if approximate { "~" } else { "" },
+                relative_label(t, now)
+            )
+        },
+    );
     let project = s
         .meta
         .project

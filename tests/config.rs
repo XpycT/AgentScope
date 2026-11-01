@@ -784,3 +784,15 @@ fn codex_explicit_archived_root_wins_over_the_derived_home_store() {
     );
     assert!(!cfg.harnesses.codex.archived_explicit);
 }
+
+#[test]
+fn readme_config_example_parses() {
+    let readme = include_str!("../README.md");
+    let start = readme.find("```toml").expect("README TOML example") + "```toml".len();
+    let end = start + readme[start..].find("```").expect("closing fence");
+    let cfg = load_from(&readme[start..end]).expect("the README example is valid TOML");
+    assert_eq!(cfg.max_cached_sessions, 2000);
+    assert!(cfg.native_api_reference_estimates);
+    assert!(cfg.harnesses.codex.root.is_some());
+    assert!(cfg.harnesses.hermes.root.is_some());
+}

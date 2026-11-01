@@ -470,9 +470,9 @@ impl HermesScanner {
         let result = {
             let db = self
                 .dbs
-                .get(&path)
+                .get_mut(&path)
                 .ok_or_else(|| ProviderError::Internal("hermes connection missing".into()))?;
-            transcript.projection.step(&db.connection, budget)
+            transcript.projection.step(&mut db.connection, budget)
         };
         self.transcripts.insert(logical.clone(), transcript);
         match result {

@@ -54,10 +54,10 @@ Options:
   --version                 Print version
   --help                    Print this help
 
-Keys: j/k move, g/G first/last, Enter open (or load more), Space expand, Tab swap list/preview,
-      Left/Right scroll columns, J/K scroll preview, / search, n/N next/previous match,
-      f filter, s sort (S reverse), r refresh, p process candidates, D diagnostics, v source,
-      x redaction, ? help, q or Ctrl+c quit.
+Keys: j/k move, g/G first/last, Enter open (or load more), m next 50 roots, Space expand,
+      Tab swap list/preview, Left/Right scroll columns, J/K scroll preview, / search loaded,
+      n/N next/previous match, f filter, s sort (S reverse), r refresh, p process candidates,
+      D diagnostics, v source, x redaction, ? help, q or Ctrl+c quit.
 Mouse: click selects, the marker expands, Load more rows load, the wheel scrolls; hold Shift to
        select text with the terminal. Mouse input never changes agent sessions.";
 

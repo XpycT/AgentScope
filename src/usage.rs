@@ -140,21 +140,32 @@ pub(crate) fn legs(c: &TokenCategories, a: TokenAccounting) -> Result<Legs, Usag
         (a, b) => a.or(b),
     };
     let (write_5m, write_1h, write_other) = match (c.cache_write_5m, c.cache_write_1h) {
-        (Some(a), Some(b)) => {
-            let split = a.checked_add(b).ok_or(UsageError::Overflow)?;
-            let other = match c.cache_write {
-                Some(total) => {
-                    Leg::Tokens(total.checked_sub(split).ok_or(UsageError::InvalidSubset)?)
-                }
-                None => Leg::NotApplicable,
-            };
-            (Leg::Tokens(a), Leg::Tokens(b), other)
-        }
-        _ => (
+        (None, None) => (
             Leg::NotApplicable,
             Leg::NotApplicable,
             Leg::of(c.cache_write),
         ),
+        (five, one) => {
+            // A producer may record only one retention split (Pi records the
+            // one-hour subset; Claude may omit an absent split). The known leg is
+            // priced at its own rate and the residual at the generic write rate;
+            // a missing total leaves the residual unknown rather than zero.
+            let known = five
+                .unwrap_or(0)
+                .checked_add(one.unwrap_or(0))
+                .ok_or(UsageError::Overflow)?;
+            let other = match c.cache_write {
+                Some(total) => {
+                    Leg::Tokens(total.checked_sub(known).ok_or(UsageError::InvalidSubset)?)
+                }
+                None => Leg::Unknown,
+            };
+            (
+                Leg::Tokens(five.unwrap_or(0)),
+                Leg::Tokens(one.unwrap_or(0)),
+                other,
+            )
+        }
     };
     let mut out = Legs {
         input: Leg::Unknown,
@@ -339,6 +350,7 @@ struct Contribution {
     source: Option<MoneySource>,
     reported: Option<f64>,
     saved: Option<f64>,
+    reference: bool,
 }
 
 #[derive(Clone, Default)]
@@ -346,6 +358,7 @@ struct Agg {
     requests: usize,
     priced: usize,
     reported_class: usize,
+    reference: usize,
     sources: [usize; 4],
     tokens: [Tally; TOKEN_LEGS],
     usd: f64,
@@ -394,6 +407,9 @@ impl Agg {
         self.subtotal += if add { c.subtotal } else { -c.subtotal };
         if c.reported_class {
             bump(&mut self.reported_class);
+        }
+        if c.reference {
+            bump(&mut self.reference);
         }
         if let Some(s) = c.source {
             bump(&mut self.sources[source_slot(s)]);
@@ -467,6 +483,7 @@ impl Agg {
                 reasoning: leg(6),
             },
             source,
+            reference: self.reference > 0,
         }
     }
 
@@ -710,6 +727,7 @@ impl UsageLedger {
             source: cost.source,
             reported: usable_money(&facts.money.reported_api),
             saved: usable_money(&facts.money.saved_estimate),
+            reference: cost.reference,
         };
         let meta = PriceMeta {
             as_of: cost.as_of,

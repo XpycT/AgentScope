@@ -529,6 +529,85 @@ fn cost_status_actual_estimated_included_and_unknown_stay_distinct() {
             .is_some_and(|note| note.contains("reported no charge"))
     );
 
+    // `actual` zero is a subscription/free-route report, not a free API call:
+    // the headline stays the API-equivalent estimate while the zero is retained.
+    let mut actual_zero = HermesUsageReconciler::new(meta.clone(), &prices);
+    actual_zero.observe_segment(
+        &session(
+            db,
+            "s",
+            "test-model",
+            "test-provider",
+            Some(1),
+            tokens(1_000, 500, 0, 0, 0),
+            money(HermesCostStatus::Actual, Some(0.0), Some(0.0)),
+        ),
+        &[main_row(
+            db,
+            "s",
+            "test-model",
+            "test-provider",
+            HermesCostStatus::Actual,
+            Some(0.0),
+            Some(0.0),
+        )],
+    );
+    let actual_zero = actual_zero.finish();
+    assert!(actual_zero.cost.usd.is_some_and(|usd| usd > 0.0));
+    assert_eq!(actual_zero.cost.class, AggregationClass::Estimated);
+    assert_eq!(actual_zero.reported_cost_usd, Some(0.0));
+    assert!(
+        actual_zero
+            .cost
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("reported no charge"))
+    );
+
+    // Mixed contributions: a positive actual amount plus an actual-zero row that
+    // is itself an estimate. The combined amount is not wholly reported.
+    let mut mixed = HermesUsageReconciler::new(meta.clone(), &prices);
+    let mut positive = main_row(
+        db,
+        "s",
+        "test-model",
+        "test-provider",
+        HermesCostStatus::Actual,
+        Some(0.0),
+        Some(0.30),
+    );
+    positive.row = HermesRowId(11);
+    let mut zero = main_row(
+        db,
+        "s",
+        "test-model",
+        "test-provider",
+        HermesCostStatus::Actual,
+        Some(0.0),
+        Some(0.0),
+    );
+    zero.row = HermesRowId(12);
+    mixed.observe_segment(
+        &session(
+            db,
+            "s",
+            "test-model",
+            "test-provider",
+            Some(2),
+            tokens(2_000, 1_000, 0, 0, 0),
+            money(HermesCostStatus::Actual, Some(0.0), Some(0.30)),
+        ),
+        &[positive, zero],
+    );
+    let mixed = mixed.finish();
+    assert!(
+        mixed.cost.usd.is_some_and(|usd| usd > 0.30),
+        "{:?}",
+        mixed.cost
+    );
+    assert_eq!(mixed.cost.class, AggregationClass::Estimated);
+    assert_eq!(mixed.reported_cost_usd, Some(0.30));
+
     // Unknown/missing status with the default 0 must be re-estimated, not free.
     let mut unknown = HermesUsageReconciler::new(meta.clone(), &prices);
     unknown.observe_segment(
@@ -584,6 +663,47 @@ fn cost_status_actual_estimated_included_and_unknown_stay_distinct() {
     assert_eq!(unpriced.cost.usd, None);
     assert_ne!(unpriced.cost.class, AggregationClass::Reported);
     assert_ne!(unpriced.cost.class, AggregationClass::Estimated);
+}
+
+#[test]
+fn actual_zero_is_still_request_dependent() {
+    let db = Path::new("state.db");
+    let prices = tiered_prices();
+    let meta = metadata(db, "s", "test-model", "test-provider");
+    let mut actual_zero = HermesUsageReconciler::new(meta, &prices);
+    actual_zero.observe_segment(
+        &session(
+            db,
+            "s",
+            "test-model",
+            "test-provider",
+            Some(1),
+            tokens(1_000, 500, 0, 0, 0),
+            money(HermesCostStatus::Actual, Some(0.0), Some(0.0)),
+        ),
+        &[main_row(
+            db,
+            "s",
+            "test-model",
+            "test-provider",
+            HermesCostStatus::Actual,
+            Some(0.0),
+            Some(0.0),
+        )],
+    );
+    let actual_zero = actual_zero.finish();
+    assert!(actual_zero.cost.usd.is_none());
+    assert_eq!(actual_zero.cost.class, AggregationClass::Partial);
+    assert_eq!(actual_zero.reported_cost_usd, Some(0.0));
+    assert!(
+        actual_zero
+            .cost
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("service-tier")),
+        "{:?}",
+        actual_zero.cost.note
+    );
 }
 
 #[test]
