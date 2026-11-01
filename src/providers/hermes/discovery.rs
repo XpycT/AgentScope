@@ -683,14 +683,19 @@ fn digest(meta: &SessionMetadata) -> u64 {
 
 /// Busy timeout that fits the remaining slice, optionally bounded by config.
 fn busy_for(step: &Step, busy_ms: u64) -> u64 {
-    step.deadline
+    busy_for_deadline(step.deadline, busy_ms)
+}
+
+/// Busy timeout shared with hydration: never wait past the slice deadline.
+pub(crate) fn busy_for_deadline(deadline: Instant, busy_ms: u64) -> u64 {
+    deadline
         .saturating_duration_since(Instant::now())
         .as_millis()
         .min(u128::from(busy_ms.max(1)))
         .max(1) as u64
 }
 
-fn set_busy(conn: &Connection, busy_ms: u64) -> Result<(), ProviderError> {
+pub(crate) fn set_busy(conn: &Connection, busy_ms: u64) -> Result<(), ProviderError> {
     conn.busy_timeout(Duration::from_millis(busy_ms.max(1)))
         .map_err(map_error)
 }
@@ -887,9 +892,19 @@ fn with_deadline<T>(
     deadline: Instant,
     run: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
 ) -> Result<T, ProviderError> {
+    with_deadline_bound(conn, deadline, |conn| run(conn).map_err(map_error))
+}
+
+/// Generic deadline-bound SQLite work for tests/hydration whose row parsing
+/// reports [`ProviderError`] rather than a raw SQLite error.
+pub(crate) fn with_deadline_bound<T>(
+    conn: &mut Connection,
+    deadline: Instant,
+    run: impl FnOnce(&Connection) -> Result<T, ProviderError>,
+) -> Result<T, ProviderError> {
     conn.progress_handler(1000, Some(move || Instant::now() >= deadline))
         .map_err(map_error)?;
-    let result = run(conn).map_err(map_error);
+    let result = run(conn);
     let _ = conn.progress_handler(0, None::<fn() -> bool>);
     result
 }

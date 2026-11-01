@@ -8,6 +8,7 @@
 //! repairs, or loads an extension.
 
 use std::path::Path;
+use std::time::Instant;
 
 use rusqlite::Connection;
 
@@ -32,6 +33,7 @@ static HERMES_ALLOWLIST: Allowlist = Allowlist {
         (
             "sessions",
             &[
+                "rowid",
                 "id",
                 "parent_session_id",
                 "source",
@@ -84,6 +86,7 @@ static HERMES_ALLOWLIST: Allowlist = Allowlist {
         (
             "session_model_usage",
             &[
+                "rowid",
                 "session_id",
                 "model",
                 "billing_provider",
@@ -130,6 +133,20 @@ pub fn open_read_only(path: &Path) -> Result<Connection, ProviderError> {
 
 pub(crate) fn open_with(path: &Path, busy_ms: u64) -> Result<Connection, ProviderError> {
     open_read_only_with(path, &HERMES_ALLOWLIST, busy_ms)
+}
+
+/// Opens with a deadline already installed for the opener's first schema work.
+pub(crate) fn open_with_deadline(
+    path: &Path,
+    busy_ms: u64,
+    deadline: Instant,
+) -> Result<Connection, ProviderError> {
+    super::super::sqlite_guard::open_read_only_with_deadline(
+        path,
+        &HERMES_ALLOWLIST,
+        busy_ms,
+        Some(deadline),
+    )
 }
 
 /// Optional columns/tables probed once per connection. Discovery keeps every

@@ -377,6 +377,149 @@ pub fn set_ended(conn: &Connection, id: &str, seconds: f64, reason: &str) {
     update(conn, id, "end_reason", Value::Text(reason.to_string()));
 }
 
+pub fn set_source(conn: &Connection, id: &str, source: &str) {
+    update(conn, id, "source", Value::Text(source.to_string()));
+}
+
+/// Rewrites the session aggregate counters and money exactly as the producer
+/// stores them. `token_legs` is `(input, output, cache_read, cache_write, reasoning)`.
+pub fn set_session_usage(
+    conn: &Connection,
+    id: &str,
+    token_legs: [u64; 5],
+    api_call_count: u64,
+    estimated: f64,
+    actual: f64,
+    cost_status: Option<&str>,
+) {
+    update(
+        conn,
+        id,
+        "input_tokens",
+        Value::Integer(token_legs[0] as i64),
+    );
+    update(
+        conn,
+        id,
+        "output_tokens",
+        Value::Integer(token_legs[1] as i64),
+    );
+    update(
+        conn,
+        id,
+        "cache_read_tokens",
+        Value::Integer(token_legs[2] as i64),
+    );
+    update(
+        conn,
+        id,
+        "cache_write_tokens",
+        Value::Integer(token_legs[3] as i64),
+    );
+    update(
+        conn,
+        id,
+        "reasoning_tokens",
+        Value::Integer(token_legs[4] as i64),
+    );
+    update(
+        conn,
+        id,
+        "api_call_count",
+        Value::Integer(api_call_count as i64),
+    );
+    update(conn, id, "estimated_cost_usd", Value::Real(estimated));
+    update(conn, id, "actual_cost_usd", Value::Real(actual));
+    update(conn, id, "cost_status", text(cost_status));
+}
+
+/// Inserts one `session_model_usage` row with explicit routing columns, so two
+/// rows can share every visible (model/provider/task) field while differing in
+/// `billing_base_url`/`billing_mode`.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_usage_routed(
+    conn: &Connection,
+    session: &str,
+    model: &str,
+    provider: &str,
+    base_url: &str,
+    billing_mode: &str,
+    task: &str,
+    token_legs: [u64; 5],
+    estimated: f64,
+    cost_status: &str,
+) {
+    insert_row(
+        conn,
+        "session_model_usage",
+        vec![
+            ("session_id", Value::Text(session.to_string())),
+            ("model", Value::Text(model.to_string())),
+            ("billing_provider", Value::Text(provider.to_string())),
+            ("billing_base_url", Value::Text(base_url.to_string())),
+            ("billing_mode", Value::Text(billing_mode.to_string())),
+            ("task", Value::Text(task.to_string())),
+            ("api_call_count", Value::Integer(1)),
+            ("input_tokens", Value::Integer(token_legs[0] as i64)),
+            ("output_tokens", Value::Integer(token_legs[1] as i64)),
+            ("cache_read_tokens", Value::Integer(token_legs[2] as i64)),
+            ("cache_write_tokens", Value::Integer(token_legs[3] as i64)),
+            ("reasoning_tokens", Value::Integer(token_legs[4] as i64)),
+            ("estimated_cost_usd", Value::Real(estimated)),
+            ("actual_cost_usd", Value::Real(0.0)),
+            ("cost_status", text(Some(cost_status))),
+            ("cost_source", text(Some("fixture"))),
+            ("first_seen", Value::Real(1_793_318_400.0)),
+            ("last_seen", Value::Real(1_793_318_500.0)),
+        ],
+    );
+}
+
+/// Updates one `session_model_usage` row's call count and monetary evidence.
+#[allow(clippy::too_many_arguments)]
+pub fn set_usage_usage(
+    conn: &Connection,
+    session: &str,
+    model: &str,
+    task: &str,
+    api_call_count: u64,
+    estimated: f64,
+    actual: f64,
+    cost_status: Option<&str>,
+) {
+    conn.execute(
+        "UPDATE session_model_usage SET api_call_count = ?1, estimated_cost_usd = ?2, \
+         actual_cost_usd = ?3, cost_status = ?4 \
+         WHERE session_id = ?5 AND model = ?6 AND task = ?7",
+        rusqlite::params![
+            api_call_count as i64,
+            estimated,
+            actual,
+            text(cost_status),
+            session,
+            model,
+            task
+        ],
+    )
+    .expect("update fixture usage");
+}
+
+pub fn set_message_tool_calls(conn: &Connection, message: i64, tool_calls: &str) {
+    conn.execute(
+        "UPDATE messages SET tool_calls = ?1 WHERE id = ?2",
+        rusqlite::params![tool_calls, message],
+    )
+    .expect("update message tool calls");
+}
+
+pub fn set_message_finish_reason(conn: &Connection, message: i64, reason: Option<&str>) {
+    conn.execute(
+        "UPDATE messages SET finish_reason = ?1 WHERE id = ?2",
+        rusqlite::params![text(reason), message],
+    )
+    .expect("update message finish reason");
+}
+
 pub fn set_message_state(conn: &Connection, message: i64, active: i64, compacted: i64) {
     conn.execute(
         "UPDATE messages SET active = ?1, compacted = ?2 WHERE id = ?3",

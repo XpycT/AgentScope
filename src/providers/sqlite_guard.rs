@@ -8,7 +8,7 @@
 //! they genuinely share.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -96,18 +96,39 @@ pub(crate) fn open_read_only_with(
     allow: &'static Allowlist,
     busy_ms: u64,
 ) -> Result<Connection, ProviderError> {
+    open_read_only_with_deadline(path, allow, busy_ms, None)
+}
+
+/// Like [`open_read_only_with`], but installs the slice progress handler before
+/// the opener's first SQL/PRAGMA work. A caller with a deadline therefore cannot
+/// overrun in open/authorizer/schema handshake before its later handler exists.
+pub(crate) fn open_read_only_with_deadline(
+    path: &Path,
+    allow: &'static Allowlist,
+    busy_ms: u64,
+    deadline: Option<Instant>,
+) -> Result<Connection, ProviderError> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let mut conn = Connection::open_with_flags(path, flags).map_err(map_error)?;
     conn.busy_timeout(Duration::from_millis(busy_ms.max(1)))
         .map_err(map_error)?;
-    conn.pragma_update(None, "query_only", true)
+    if let Some(deadline) = deadline {
+        conn.progress_handler(1000, Some(move || Instant::now() >= deadline))
+            .map_err(map_error)?;
+    }
+    let result = (|| -> Result<(), ProviderError> {
+        conn.pragma_update(None, "query_only", true)
+            .map_err(map_error)?;
+        conn.authorizer(Some(move |ctx: AuthContext<'_>| authorize(allow, ctx)))
+            .map_err(map_error)?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })
         .map_err(map_error)?;
-    conn.authorizer(Some(move |ctx: AuthContext<'_>| authorize(allow, ctx)))
-        .map_err(map_error)?;
-    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
-        r.get::<_, i64>(0)
-    })
-    .map_err(map_error)?;
+        Ok(())
+    })();
+    let _ = conn.progress_handler(0, None::<fn() -> bool>);
+    result?;
     Ok(conn)
 }
 
