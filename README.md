@@ -8,6 +8,19 @@ AgentScope puts every session on one machine into a single keyboard-driven TUI. 
 
 **Works with:** Codex CLI · Claude Code (CLI and Desktop) · OpenCode · OMP (oh-my-pi) · Hermes · Pi
 
+![AgentScope session roster: sessions from Claude Code, Codex and OMP grouped by project, with status, speed, tokens and cost, and a preview of the selected session](docs/images/roster.png)
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/transcript.png" alt="Session transcript with agent messages, tool calls and their timings"></td>
+    <td width="50%"><img src="docs/images/session-details.png" alt="Session details: token breakdown, cost estimate, context, family and process"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>Transcript: messages, tool calls and timings</em></td>
+    <td align="center"><em>Details: tokens, cost estimate, context and family</em></td>
+  </tr>
+</table>
+
 ## Why AgentScope
 
 - **See everything in one place.** One roster across all harnesses, with search, filter and sort. Subagents, forks and continuations are nested under their parent session.
