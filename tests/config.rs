@@ -786,11 +786,18 @@ fn codex_explicit_archived_root_wins_over_the_derived_home_store() {
 }
 
 #[test]
-fn readme_config_example_parses() {
-    let readme = include_str!("../README.md");
-    let start = readme.find("```toml").expect("README TOML example") + "```toml".len();
-    let end = start + readme[start..].find("```").expect("closing fence");
-    let cfg = load_from(&readme[start..end]).expect("the README example is valid TOML");
+fn usage_config_examples_parse() {
+    // The config and pricing examples are two blocks; together they form one config file.
+    let usage = include_str!("../docs/USAGE.md");
+    let mut example = String::new();
+    for block in usage.split("```toml").skip(1) {
+        example.push_str(&block[..block.find("```").expect("closing fence")]);
+    }
+    assert!(
+        example.contains("[[pricing]]"),
+        "docs/USAGE.md TOML examples"
+    );
+    let cfg = load_from(&example).expect("the docs/USAGE.md examples are valid TOML");
     assert_eq!(cfg.max_cached_sessions, 2000);
     assert!(cfg.native_api_reference_estimates);
     assert!(cfg.harnesses.codex.root.is_some());
