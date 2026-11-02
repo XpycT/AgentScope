@@ -94,8 +94,15 @@ pub(super) fn put(
     status: &str,
     footer: &str,
 ) {
+    let back = "‹ Esc  ";
     frame.render_widget(
-        Paragraph::new(Line::styled(fit(title, f.width), f.palette.title())),
+        Paragraph::new(Line::from(vec![
+            Span::styled(back, f.palette.quiet()),
+            Span::styled(
+                fit(title, f.width.saturating_sub(back.width())),
+                f.palette.title(),
+            ),
+        ])),
         f.title,
     );
     let mut spans = Vec::new();
@@ -141,21 +148,6 @@ pub(super) fn wrap_into(rows: &mut Vec<String>, text: &str, width: usize) -> boo
         }
     }
     false
-}
-
-/// Draw the visible slice of `rows` and report the scroll extent to `app`.
-pub(super) fn draw_rows(frame: &mut Frame, app: &App, rows: &[String], scroll: usize, body: Rect) {
-    let height = body.height as usize;
-    let max_scroll = rows.len().saturating_sub(height);
-    app.set_overlay_extent(max_scroll);
-    let start = scroll.min(max_scroll);
-    let shown: Vec<Line<'static>> = rows
-        .iter()
-        .skip(start)
-        .take(height)
-        .map(|r| Line::raw(r.clone()))
-        .collect();
-    frame.render_widget(Paragraph::new(shown), body);
 }
 
 /// `HH:MM:SS` in the host zone, or `—` when the event has no time.
@@ -818,29 +810,50 @@ pub fn render_source(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         frame.render_widget(Paragraph::new("No source record is open."), f.body);
         return;
     };
-    let mut rows = vec![locator_text(&view.locator), String::new()];
+    let palette = f.palette;
+    let mut rows: Vec<Row> = Vec::new();
+    push_section(&mut rows, "LOCATOR", palette);
+    push_wrapped(
+        &mut rows,
+        &locator_text(&view.locator),
+        f.width,
+        Style::default(),
+    );
+    push_section(&mut rows, "STATE", palette);
     let mut note = if view.revealed {
         REVEALED_NOTICE.to_string()
     } else {
         REDACTED_NOTICE.to_string()
     };
     match &view.state {
-        SourceState::Loading => rows.push("Loading source record…".into()),
-        SourceState::Failed => rows.push("The source record could not be loaded.".into()),
+        SourceState::Loading => rows.push(("Loading source record…".into(), palette.quiet())),
+        SourceState::Failed => rows.push((
+            "The source record could not be loaded.".into(),
+            palette.warning(),
+        )),
         SourceState::Unavailable(reason) => {
-            rows.push(format!("Source record unavailable: {reason}"));
+            let reason = display_safe(reason);
+            let text = if reason.trim().is_empty() {
+                "Source record unavailable: —".to_string()
+            } else {
+                format!("Source record unavailable: {reason}")
+            };
+            push_wrapped(&mut rows, &text, f.width, palette.warning());
         }
         SourceState::Ready { text, truncated } => {
-            if wrap_into(&mut rows, text, f.width) || *truncated {
+            push_section(&mut rows, "CONTENT", palette);
+            let mut wrapped = Vec::new();
+            if wrap_into(&mut wrapped, text, f.width) || *truncated {
                 note = format!("{note}  [record truncated for display]");
             }
+            rows.extend(wrapped.into_iter().map(|line| (line, Style::default())));
         }
     }
-    draw_rows(frame, app, &rows, view.scroll, f.body);
+    draw_styled(frame, app, &rows, view.scroll, f.body, 0);
     put(
         frame,
         &f,
-        "< Source record",
+        "SOURCE RECORD",
         app.notice(),
         &note,
         "j/k scroll  x redaction  Esc back  q quit",
@@ -893,33 +906,57 @@ pub fn render_diagnostics(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         return;
     };
     let entries = transcript.diagnostics();
-    let mut head: Vec<String> = Vec::new();
-    if let Some(row) = app.session(transcript.key()) {
-        head.push(format!(
-            "Hidden records: {}   Source available: {}   Entries listed: {}",
-            row.session.hidden_records,
-            if row.session.meta.source_available {
-                "yes"
-            } else {
-                "no"
-            },
-            entries.len()
-        ));
-        for w in row.session.warnings.iter().take(MAX_WARNINGS) {
-            head.push(format!(
-                "Warning ×{}: {}",
-                w.count,
-                display_safe(&w.message)
-            ));
+    let row = app.session(transcript.key());
+    let mut head: Vec<Row> = Vec::new();
+    push_section(&mut head, "OVERVIEW", f.palette);
+    head.push((
+        format!(
+            "Hidden records: {}",
+            row.as_ref().map_or_else(
+                || "—".to_string(),
+                |row| row.session.hidden_records.to_string()
+            )
+        ),
+        Style::default(),
+    ));
+    head.push((
+        format!(
+            "Source available: {}",
+            row.as_ref().map_or_else(
+                || "—".to_string(),
+                |row| if row.session.meta.source_available {
+                    "yes".to_string()
+                } else {
+                    "no".to_string()
+                }
+            )
+        ),
+        Style::default(),
+    ));
+    head.push((
+        format!("Entries listed: {}", entries.len()),
+        Style::default(),
+    ));
+    push_section(&mut head, "WARNINGS", f.palette);
+    match row.as_ref() {
+        Some(row) if !row.session.warnings.is_empty() => {
+            for w in row.session.warnings.iter().take(MAX_WARNINGS) {
+                head.push((
+                    format!("Warning ×{}: {}", w.count, display_safe(&w.message)),
+                    f.palette.warning(),
+                ));
+            }
         }
+        Some(_) => head.push(("— none".into(), f.palette.quiet())),
+        None => head.push(("—".into(), f.palette.quiet())),
     }
-    head.push(String::new());
+    push_section(&mut head, "RECORDS", f.palette);
 
     let height = f.body.height as usize;
     let mut lines: Vec<Line<'static>> = head
         .iter()
         .take(height)
-        .map(|h| Line::raw(fit(h, f.width)))
+        .map(|(text, style)| margin_line(text, *style, f.width, 0))
         .collect();
     let room = height.saturating_sub(lines.len());
     if entries.is_empty() {
@@ -946,7 +983,7 @@ pub fn render_diagnostics(frame: &mut Frame, app: &App, ctx: &RosterContext) {
     put(
         frame,
         &f,
-        "< Diagnostics: hidden, unknown, and source-only records",
+        "DIAGNOSTICS",
         app.notice(),
         if entries
             .get(app.diagnostics_selected())

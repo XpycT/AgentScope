@@ -542,6 +542,83 @@ fn help_is_contextual_and_closes_without_quitting() {
     assert!(screen.contains("Help"), "{screen}");
 }
 
+const LEGEND_LINES: [&str; 9] = [
+    "Values: — not recorded   … loading",
+    "+ partial / lower bound   ~ estimated",
+    "Status: ● active   ○ recent   ! quiet",
+    "▲ stalled?   ✓ complete",
+    "✗ failed   × cancelled",
+    "- unavailable   ? unknown",
+    "Tools: ✓ completed   ✗ error",
+    "… pending   ? unknown",
+    "group totals cover loaded sessions",
+];
+
+fn legend_line_visible(screen: &str, want: &str) -> bool {
+    screen.lines().any(|line| {
+        line.trim()
+            .trim_matches(|c: char| matches!(c, '│' | '─' | '┌' | '┐' | '└' | '┘'))
+            .trim()
+            == want
+    })
+}
+
+#[test]
+fn help_shows_value_legend() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    assert_eq!(ch(&mut app, '?'), KeyAction::None);
+    assert_eq!(app.panel(), Panel::Help);
+    // The shared legend follows the screen-specific keys and capability notes.
+    let _ = draw(&app, 100, 30);
+    app.panel_move(isize::MAX);
+    let screen = draw(&app, 100, 30);
+    for want in LEGEND_LINES {
+        assert!(
+            legend_line_visible(&screen, want),
+            "missing legend line {want:?} in:\n{screen}"
+        );
+    }
+}
+
+#[test]
+fn help_legend_fits_the_smallest_terminal() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    assert_eq!(ch(&mut app, '?'), KeyAction::None);
+    let mut seen = String::new();
+    loop {
+        seen.push_str(&draw(&app, 60, 20));
+        seen.push('\n');
+        let before = app.panel_scroll();
+        app.panel_move(7);
+        if app.panel_scroll() == before {
+            break;
+        }
+    }
+    for want in LEGEND_LINES {
+        assert!(
+            legend_line_visible(&seen, want),
+            "missing complete legend line {want:?} while scrolling 60x20"
+        );
+    }
+}
+
+#[test]
+fn filter_overlay_lists_provider_counts() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    assert_eq!(ch(&mut app, 'f'), KeyAction::None);
+    assert_eq!(app.panel(), Panel::Filter);
+    let screen = draw(&app, 100, 30);
+    for want in ["Provider", "Codex 1", "Claude 1", "OpenCode 1"] {
+        assert!(screen.contains(want), "missing {want:?} in:\n{screen}");
+    }
+}
+
 #[test]
 fn tab_cycles_panes_and_ctrl_c_always_quits() {
     let mut app = new_app();

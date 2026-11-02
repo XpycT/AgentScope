@@ -183,11 +183,31 @@ fn help_lines(screen: Screen) -> Vec<String> {
         }
     }
     out.push(String::new());
+    push_legend(&mut out);
+    out.push(String::new());
     out.push("# Anywhere".into());
     out.push(key("?", "This help"));
     out.push(key("q", "Quit (not while typing in a search)"));
     out.push(key("Ctrl+c", "Quit, always"));
     out
+}
+
+/// Shared value, status-chip, and tool-glyph vocabulary for every help screen.
+/// Every line fits the 54-column body of the smallest supported terminal.
+fn push_legend(out: &mut Vec<String>) {
+    out.push("# Legend".into());
+    out.push("Values: — not recorded   … loading".into());
+    out.push("+ partial / lower bound   ~ estimated".into());
+    out.push(String::new());
+    out.push("Status: ● active   ○ recent   ! quiet".into());
+    out.push("▲ stalled?   ✓ complete".into());
+    out.push("✗ failed   × cancelled".into());
+    out.push("- unavailable   ? unknown".into());
+    out.push(String::new());
+    out.push("Tools: ✓ completed   ✗ error".into());
+    out.push("… pending   ? unknown".into());
+    out.push(String::new());
+    out.push("group totals cover loaded sessions".into());
 }
 
 fn process_lines(app: &App) -> Vec<String> {
@@ -266,6 +286,7 @@ fn clock(ts: i64) -> String {
 fn filter_lines(app: &App, width: usize, height: usize, palette: Palette) -> Vec<Line<'static>> {
     let items = app.filter_items();
     let cursor = app.panel_cursor();
+    let counts = app.provider_counts();
     let mut rows: Vec<(Option<usize>, String)> = Vec::new();
     let mut section = "";
     for (i, item) in items.iter().enumerate() {
@@ -281,7 +302,14 @@ fn filter_lines(app: &App, width: usize, height: usize, palette: Palette) -> Vec
             section = heading;
             rows.push((None, format!("# {heading}")));
         }
-        rows.push((Some(i), item_text(item, i == cursor)));
+        let count = match item.target {
+            FilterTarget::Provider(p) => counts
+                .iter()
+                .find(|(harness, _)| *harness == p)
+                .map(|(_, count)| *count),
+            _ => None,
+        };
+        rows.push((Some(i), item_text(item, i == cursor, count)));
     }
     let cursor_row = rows
         .iter()
@@ -302,10 +330,16 @@ fn filter_lines(app: &App, width: usize, height: usize, palette: Palette) -> Vec
         .collect()
 }
 
-fn item_text(item: &FilterItem, at_cursor: bool) -> String {
+fn item_text(item: &FilterItem, at_cursor: bool, count: Option<usize>) -> String {
     let marker = if at_cursor { "> " } else { "  " };
     let (checkbox, label) = match &item.target {
-        FilterTarget::Provider(p) => (true, harness_name(*p).to_string()),
+        FilterTarget::Provider(p) => (
+            true,
+            count.map_or_else(
+                || harness_name(*p).to_string(),
+                |count| format!("{} {count}", harness_name(*p)),
+            ),
+        ),
         FilterTarget::Status(l) => {
             let (icon, text) = status_text(*l);
             (true, format!("{icon} {text}"))

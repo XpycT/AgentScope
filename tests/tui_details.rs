@@ -643,13 +643,41 @@ fn diagnostics_lists_hidden_unknown_and_source_only_records() {
     assert_eq!(app.screen, Screen::Diagnostics);
     let out = draw(&app);
     for want in [
-        "Diagnostics",
+        "DIAGNOSTICS",
         "Hidden records: 4",
         "[hidden] suppressed call record",
         "[listed] unknown record type",
         "[listed] source-only record",
         "sess-1.jsonl @ byte 500",
         "sess-1.jsonl @ byte 700",
+    ] {
+        assert!(out.contains(want), "missing {want:?} in:\n{out}");
+    }
+}
+
+#[test]
+fn diagnostics_groups_fields_under_labels() {
+    let mut app = app();
+    open(
+        &mut app,
+        page(
+            vec![event(0, EventKind::AssistantMessage, "hello")],
+            vec![diagnostic(500, "unknown record type", false)],
+        ),
+    );
+    assert!(app.open_diagnostics());
+    let out = draw(&app);
+    for want in [
+        "‹ Esc  DIAGNOSTICS",
+        "OVERVIEW",
+        "Hidden records: 4",
+        "Source available: yes",
+        "Entries listed: 1",
+        "WARNINGS",
+        "— none",
+        "RECORDS",
+        "[listed] unknown record type",
+        "sess-1.jsonl @ byte 500",
     ] {
         assert!(out.contains(want), "missing {want:?} in:\n{out}");
     }
