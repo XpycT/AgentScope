@@ -17,24 +17,32 @@ use crate::domain::{
     AggregationClass, SessionKey, SessionLink, SessionSummary, Status, Timestamp, TokenCategories,
 };
 use crate::ingest::text::display_safe;
-use crate::time::{format_local, relative_label};
+use crate::time::{format_local_short, relative_label};
 
 use super::RosterContext;
 use super::details::wrap_into;
 use super::session::{Fact, cost_fact, speed_fact, tokens_fact};
 use super::widgets::{
-    ABSENT, LOADING, Palette, READ_FAILED, agent_tag, display_title, fit, one_line, status_chip,
-    tokens_text, tool_glyph,
+    ABSENT, LOADING, Palette, READ_FAILED, agent_tag, display_title, effort_span, fit, one_line,
+    status_chip, tokens_text, tool_glyph,
 };
 
-/// Draw the preview into `area`. Beside the list a left rule separates it.
-pub fn render_preview(frame: &mut Frame, app: &App, ctx: &RosterContext, area: Rect) {
+/// Draw the preview into `area`. `beside` the list, a quiet left rule and one
+/// blank column separate it from the value columns.
+pub fn render_preview(frame: &mut Frame, app: &App, ctx: &RosterContext, area: Rect, beside: bool) {
     let palette = Palette::new(ctx.no_color);
-    let inner = if app.preview_beside_list() {
-        let block = Block::default().borders(Borders::LEFT);
+    let inner = if beside {
+        let block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(palette.quiet());
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        inner
+        Rect::new(
+            inner.x.saturating_add(1),
+            inner.y,
+            inner.width.saturating_sub(1),
+            inner.height,
+        )
     } else {
         area
     };
@@ -142,7 +150,8 @@ fn pinned_lines(
         field(&mut parts, &model.id, palette.quiet(), palette);
     }
     if let Some(effort) = meta.model.as_ref().and_then(|m| m.effort.as_deref()) {
-        field(&mut parts, effort, palette.quiet(), palette);
+        let effort = effort_span(effort, palette);
+        field(&mut parts, &effort.content, effort.style, palette);
     }
     if let Some(provider) = meta.model.as_ref().and_then(|m| m.provider.as_deref()) {
         field(&mut parts, provider, palette.quiet(), palette);
@@ -170,6 +179,7 @@ fn pinned_lines(
         parts.push((ABSENT.into(), palette.quiet()));
     }
     lines.push(styled_row(parts, width));
+    lines.push(Line::default());
 
     // Status chip and its evidence.
     let age = status_age(session, app.now());
@@ -177,11 +187,12 @@ fn pinned_lines(
     lines.push(styled_row(
         vec![
             (chip.content.into_owned(), chip.style),
-            ("  ".into(), Style::default()),
+            (" · ".into(), palette.quiet()),
             (one_line(&status.evidence), palette.quiet()),
         ],
         width,
     ));
+    lines.push(Line::default());
 
     // Tokens with provenance, cost, and speed. A failed hydration is not
     // "still loading": cached values stay, and otherwise the facts say so.
@@ -244,7 +255,7 @@ fn pinned_lines(
         let shares = token_shares(&usage.categories);
         if shares.iter().any(|share| share.value > 0) {
             lines.push(bar_line(&shares, width, palette));
-            lines.push(legend_line(&shares, width, palette));
+            lines.extend(legend_lines(&shares, width, palette));
         }
     }
     lines
@@ -260,71 +271,124 @@ fn scrolling_rows(
     width: usize,
     palette: Palette,
 ) -> Vec<Line<'static>> {
-    let mut rows = Vec::new();
-
-    rows.push(ScrollRow::Section("CONTEXT"));
-    let mut context = Vec::new();
-    wrap_into(
-        &mut context,
+    let mut rows = vec![Line::default()];
+    labeled(
+        &mut rows,
+        "CONTEXT",
         &context_text(session, hydrated, facts_failed),
         width,
+        palette,
     );
-    rows.extend(context.into_iter().map(ScrollRow::Text));
-
-    rows.push(ScrollRow::Section("STARTED"));
     let started = session
         .metrics
         .timing
         .started_at
         .or(session.meta.created_at)
-        .map_or_else(|| ABSENT.to_string(), format_local);
-    let mut started_rows = Vec::new();
-    wrap_into(&mut started_rows, &started, width);
-    rows.extend(started_rows.into_iter().map(ScrollRow::Text));
+        .map_or_else(
+            || ABSENT.to_string(),
+            |at| {
+                format!(
+                    "{} · {} ago",
+                    format_local_short(at),
+                    relative_label(at, app.now())
+                )
+            },
+        );
+    labeled(&mut rows, "STARTED", &started, width, palette);
 
-    rows.push(ScrollRow::Section("LAST ACTIVITY"));
-    activity_rows(&mut rows, app.activity(key), width);
+    rows.push(Line::default());
+    let age = status_age(session, app.now())
+        .map(|age| format!("{age} ago"))
+        .unwrap_or_default();
+    labeled(&mut rows, "LAST ACTIVITY", &age, width, palette);
+    activity_rows(&mut rows, app.activity(key), width, palette);
 
-    rows.push(ScrollRow::Quiet("Enter open".into()));
-    rows.into_iter()
-        .map(|row| match row {
-            ScrollRow::Section(text) => Line::styled(text, palette.section()),
-            ScrollRow::Text(text) => Line::raw(text),
-            ScrollRow::Quiet(text) => Line::styled(text, palette.quiet()),
-        })
-        .collect()
+    rows.push(Line::default());
+    rows.push(Line::styled("Enter open", palette.quiet()));
+    rows
 }
 
-enum ScrollRow {
-    Section(&'static str),
-    Text(String),
-    Quiet(String),
-}
-
-fn activity_rows(rows: &mut Vec<ScrollRow>, state: Option<&ActivityState>, width: usize) {
-    match state {
-        None | Some(ActivityState::Loading) => rows.push(ScrollRow::Quiet(LOADING.into())),
-        Some(ActivityState::Nothing) => {
-            rows.push(ScrollRow::Quiet("no activity recorded".into()));
-        }
-        Some(ActivityState::Failed) => {
-            rows.push(ScrollRow::Quiet("couldn't read latest activity".into()));
-        }
-        Some(ActivityState::Ready(last)) => ready_rows(rows, last, width),
+/// A section label with its value on the same line; a long value wraps under
+/// the label.
+fn labeled(
+    rows: &mut Vec<Line<'static>>,
+    label: &'static str,
+    value: &str,
+    width: usize,
+    palette: Palette,
+) {
+    let label_width = UnicodeWidthStr::width(label) + 2;
+    let mut wrapped = Vec::new();
+    wrap_into(
+        &mut wrapped,
+        value,
+        width.saturating_sub(label_width).max(1),
+    );
+    let mut wrapped = wrapped.into_iter();
+    rows.push(styled_row(
+        vec![
+            (label.into(), palette.section()),
+            ("  ".into(), Style::default()),
+            (wrapped.next().unwrap_or_default(), palette.quiet()),
+        ],
+        width,
+    ));
+    for line in wrapped {
+        rows.push(Line::styled(
+            format!("{}{line}", " ".repeat(label_width)),
+            palette.quiet(),
+        ));
     }
 }
 
-fn ready_rows(rows: &mut Vec<ScrollRow>, last: &LastActivity, width: usize) {
-    if let Some(tool) = &last.tool {
-        let mut text = format!("{} {}", tool_glyph(tool.status), one_line(&tool.name));
-        let summary = one_line(&tool.summary);
-        if !summary.is_empty() {
-            text.push(' ');
-            text.push_str(&summary);
+fn activity_rows(
+    rows: &mut Vec<Line<'static>>,
+    state: Option<&ActivityState>,
+    width: usize,
+    palette: Palette,
+) {
+    match state {
+        None | Some(ActivityState::Loading) => rows.push(Line::styled(LOADING, palette.quiet())),
+        Some(ActivityState::Nothing) => {
+            rows.push(Line::styled("no activity recorded", palette.quiet()));
         }
+        Some(ActivityState::Failed) => {
+            rows.push(Line::styled(
+                "couldn't read latest activity",
+                palette.quiet(),
+            ));
+        }
+        Some(ActivityState::Ready(last)) => ready_rows(rows, last, width, palette),
+    }
+}
+
+fn ready_rows(rows: &mut Vec<Line<'static>>, last: &LastActivity, width: usize, palette: Palette) {
+    if let Some(tool) = &last.tool {
+        let name = one_line(&tool.name);
+        let lead = UnicodeWidthStr::width(name.as_str()) + 3;
         let mut wrapped = Vec::new();
-        wrap_into(&mut wrapped, &text, width);
-        rows.extend(wrapped.into_iter().map(ScrollRow::Text));
+        wrap_into(
+            &mut wrapped,
+            &one_line(&tool.summary),
+            width.saturating_sub(lead).max(1),
+        );
+        let mut wrapped = wrapped.into_iter();
+        rows.push(styled_row(
+            vec![
+                (
+                    tool_glyph(tool.status).into(),
+                    palette.tool_status(tool.status),
+                ),
+                (" ".into(), Style::default()),
+                (name.clone(), palette.tool_name(&name)),
+                (" ".into(), Style::default()),
+                (wrapped.next().unwrap_or_default(), Style::default()),
+            ],
+            width,
+        ));
+        for line in wrapped.take(1) {
+            rows.push(Line::raw(format!("{}{line}", " ".repeat(lead))));
+        }
     }
     match &last.reply {
         Some(reply) => {
@@ -332,10 +396,13 @@ fn ready_rows(rows: &mut Vec<ScrollRow>, last: &LastActivity, width: usize) {
             let mut wrapped = Vec::new();
             wrap_into(&mut wrapped, &text, width.saturating_sub(2).max(1));
             for line in wrapped.into_iter().take(3) {
-                rows.push(ScrollRow::Text(format!("▌ {line}")));
+                rows.push(Line::from(vec![
+                    Span::styled(Palette::SELECTION_MARKER, palette.reply_bar()),
+                    Span::raw(format!(" {line}")),
+                ]));
             }
         }
-        None => rows.push(ScrollRow::Quiet("no reply in recent events".into())),
+        None => rows.push(Line::styled("no reply in recent events", palette.quiet())),
     }
 }
 
@@ -357,7 +424,7 @@ fn context_text(session: &SessionSummary, hydrated: bool, facts_failed: bool) ->
             tokens_text(Some(used)),
             tokens_text(Some(window)),
         ),
-        (Some(used), _) => format!("{} recorded · window not recorded", tokens_text(Some(used))),
+        (Some(used), _) => format!("{} in use · window not recorded", tokens_text(Some(used))),
         _ => ABSENT.into(),
     }
 }
@@ -551,23 +618,40 @@ pub(super) fn token_bar(
     bar_line(&token_shares(categories), width, palette)
 }
 
-fn legend_line(shares: &[Share; 4], width: usize, palette: Palette) -> Line<'static> {
+/// Legend for the largest categories, wrapped onto a second line rather than
+/// cut off.
+fn legend_lines(shares: &[Share; 4], width: usize, palette: Palette) -> Vec<Line<'static>> {
     let mut order: Vec<usize> = (0..4).filter(|&i| shares[i].value > 0).collect();
     order.sort_by(|&a, &b| shares[b].value.cmp(&shares[a].value).then(a.cmp(&b)));
+    let mut lines = Vec::new();
     let mut parts: Vec<(String, Style)> = Vec::new();
-    for (rank, &i) in order.iter().take(3).enumerate() {
-        if rank > 0 {
-            parts.push(("  ".into(), Style::default()));
-        }
+    let mut used = 0;
+    for &i in order.iter().take(3) {
         let share = &shares[i];
         let (glyph, style) = if palette.is_no_color() {
             (share.plain, Style::default())
         } else {
-            ('█', Style::default().fg(share.color))
+            ('■', Style::default().fg(share.color))
         };
+        let label = format!(" {} ", share.label);
+        let value = tokens_text(Some(share.value));
+        let item_width =
+            1 + UnicodeWidthStr::width(label.as_str()) + UnicodeWidthStr::width(value.as_str());
+        if used > 0 && used + 2 + item_width > width && lines.is_empty() {
+            lines.push(styled_row(std::mem::take(&mut parts), width));
+            used = 0;
+        }
+        if used > 0 {
+            parts.push(("  ".into(), Style::default()));
+            used += 2;
+        }
         parts.push((glyph.to_string(), style));
-        parts.push((format!(" {} ", share.label), palette.quiet()));
-        parts.push((tokens_text(Some(share.value)), palette.value()));
+        parts.push((label, palette.quiet()));
+        parts.push((value, palette.value()));
+        used += item_width;
     }
-    styled_row(parts, width)
+    if !parts.is_empty() {
+        lines.push(styled_row(parts, width));
+    }
+    lines
 }

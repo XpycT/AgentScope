@@ -4,7 +4,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -12,15 +12,15 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::{App, SourceState, tool_summary};
 use crate::domain::{
     BoundedText, DiagnosticEntry, Event, EventKind, LocatorKind, SessionLink, SourceLocator,
-    Timestamp, ToolInteraction, ToolStatus, UsageScope,
+    StatusLabel, Timestamp, ToolInteraction, ToolStatus, UsageScope,
 };
 use crate::ingest::text::display_safe;
 use crate::time::{format_local, relative_label};
 
 use super::RosterContext;
-use super::inspector::{REASONING_LABEL, grouped, money_text};
+use super::inspector::{REASONING_LABEL, money_text};
 use super::roster::{MIN_HEIGHT, MIN_WIDTH};
-use super::widgets::{Palette, fit, tokens_text};
+use super::widgets::{Palette, SHELL_TOOLS, fit, tokens_text};
 
 /// Most wrapped rows built for one overlay body.
 const MAX_ROWS: usize = 4_000;
@@ -217,7 +217,10 @@ fn header_line(
     };
     let mut parts = vec![
         ("‹ Esc  ".to_string(), palette.quiet()),
-        (badge, badge_style),
+        (
+            format!(" {badge} "),
+            badge_style.add_modifier(Modifier::REVERSED),
+        ),
         ("  ".to_string(), Style::default()),
         (clock(event.timestamp), palette.value()),
         (" · ".to_string(), palette.quiet()),
@@ -229,14 +232,14 @@ fn header_line(
     ];
     if let Some(code) = event.tool.as_ref().and_then(|tool| tool.exit_code) {
         parts.push((" · ".to_string(), palette.quiet()));
-        parts.push((
-            format!("Exit: {code}"),
-            if code == 0 {
-                palette.quiet()
-            } else {
-                palette.warning()
-            },
-        ));
+        parts.push(if code == 0 {
+            ("✓ exit 0".to_string(), palette.quiet())
+        } else {
+            (
+                format!("✗ exit {code}"),
+                palette.status(StatusLabel::Failed),
+            )
+        });
     }
     parts.push(("   [ prev  ] next".to_string(), palette.quiet()));
     styled_row(parts, width)
@@ -407,12 +410,37 @@ fn tool_rows(
 ) -> bool {
     let mut capped = false;
     rows.push((tool_meta(tool), palette.quiet()));
-    push_section(rows, "input (recorded preview)", palette);
+    let shell = SHELL_TOOLS
+        .iter()
+        .any(|name| tool.name.eq_ignore_ascii_case(name));
+    push_section(
+        rows,
+        if shell {
+            "command"
+        } else {
+            "input (recorded preview)"
+        },
+        palette,
+    );
     let summary = tool_summary(tool);
     if !summary.is_empty() {
-        capped |= push_wrapped(rows, &summary, width, Style::default());
+        capped |= push_wrapped(rows, &summary, width, palette.value());
     }
-    capped |= push_bounded(rows, tool.input.as_ref(), width, palette);
+    let raw = tool
+        .input
+        .as_ref()
+        .map(|input| display_safe(&input.preview));
+    if summary.is_empty()
+        || raw
+            .as_deref()
+            .is_some_and(|raw| raw.trim() != summary.trim())
+    {
+        if !summary.is_empty() {
+            rows.push((String::new(), Style::default()));
+            rows.push(("recorded arguments".into(), palette.quiet()));
+        }
+        capped |= push_bounded(rows, tool.input.as_ref(), width, palette);
+    }
 
     push_section(rows, "output (recorded preview)", palette);
     match (&tool.output, tool.status) {
@@ -458,17 +486,7 @@ fn text_rows(rows: &mut Vec<Row>, event: &Event, width: usize, palette: Palette)
         EventKind::Lifecycle | EventKind::Tool => "event (recorded preview)",
     };
     push_section(rows, label, palette);
-    let mut capped = push_bounded(rows, event.text.as_ref(), width, palette);
-    if event.kind == EventKind::Reasoning && !capped {
-        rows.push((String::new(), Style::default()));
-        capped = push_wrapped(
-            rows,
-            &format!("{REASONING_LABEL}; not hidden chain-of-thought"),
-            width,
-            palette.quiet(),
-        );
-    }
-    capped
+    push_bounded(rows, event.text.as_ref(), width, palette)
 }
 
 fn content_rows(
@@ -539,8 +557,14 @@ fn usage_rows(rows: &mut Vec<Row>, event: &Event, width: usize, palette: Palette
     };
     rows.push((
         usage.categories.total.map_or_else(
-            || "Total not recorded".to_string(),
-            |total| format!("Total {}", grouped(total)),
+            || "total not recorded".to_string(),
+            |total| {
+                format!(
+                    "{:<CATEGORY_LABEL_WIDTH$} {:>6}",
+                    "total",
+                    tokens_text(Some(total))
+                )
+            },
         ),
         if usage.categories.total.is_some() {
             palette.value()
@@ -641,12 +665,8 @@ fn source_rows(rows: &mut Vec<Row>, event: &Event, app: &App, width: usize, pale
         palette.quiet(),
     );
     if event.kind == EventKind::Reasoning {
-        push_wrapped(
-            rows,
-            &format!("{REASONING_LABEL}; not hidden chain-of-thought"),
-            width,
-            palette.quiet(),
-        );
+        push_wrapped(rows, REASONING_LABEL, width, palette.quiet());
+        push_wrapped(rows, "not hidden chain-of-thought", width, palette.quiet());
     }
     push_wrapped(
         rows,
@@ -756,15 +776,23 @@ pub fn render_details(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         .and_then(|tool| app.resolved_tool_child(&event.session, tool));
     let wide = f.width >= WIDE_MIN;
     let content_width = if wide {
-        CONTENT_MAX.min(f.width - SIDE_WIDTH - CONTENT_MARGIN)
+        CONTENT_MAX.min(f.width - SIDE_WIDTH - 2 - CONTENT_MARGIN * 2)
     } else {
         CONTENT_MAX.min(f.width - CONTENT_MARGIN)
     };
     let content = content_rows(event, child.as_ref(), content_width, palette);
     if wide {
-        let [left, right] =
-            Layout::horizontal([Constraint::Min(1), Constraint::Length(SIDE_WIDTH as u16)])
-                .areas(f.body);
+        let [left, rule, _, right] = Layout::horizontal([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(SIDE_WIDTH as u16),
+        ])
+        .areas(f.body);
+        let bar: Vec<Line<'static>> = (0..rule.height)
+            .map(|_| Line::styled("│", palette.quiet()))
+            .collect();
+        frame.render_widget(Paragraph::new(bar), rule);
         let side = side_rows(event, app, SIDE_WIDTH, palette);
         let content_max = content.len().saturating_sub(left.height as usize);
         let side_max = side.len().saturating_sub(f.body.height as usize);

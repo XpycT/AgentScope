@@ -1127,15 +1127,14 @@ fn live_wal_family_provider_effort_and_confirmed_link_smoke() {
     );
     for needle in [
         "[OC]",
-        "Billing provider: openai",
-        "model gpt-5",
-        "thinking high",
-        "Agent: build",
+        "billed via  openai",
+        "gpt-5 · high · openai",
+        "agent       build",
     ] {
         assert!(info.contains(needle), "missing {needle:?}:\n{info}");
     }
-    let header_at = info.find("model gpt-5").unwrap();
-    let billing_at = info.find("Billing provider: openai").unwrap();
+    let header_at = info.find("gpt-5 · high").unwrap();
+    let billing_at = info.find("billed via  openai").unwrap();
     assert!(header_at < billing_at, "{info}");
 
     // Details shows the confirmed link; `o` opens the child session rather than

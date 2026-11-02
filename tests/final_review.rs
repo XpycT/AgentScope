@@ -346,8 +346,8 @@ fn real_codex_adapter_lineage_reaches_the_session_info_screen() {
             .join("\n")
     };
     for (child, expected) in [
-        ("child-id", "Parent: resolved — Codex parent-id"),
-        ("orphan-id", "Parent: unresolved — id missing-parent"),
+        ("child-id", "parent      resolved — Codex parent-id"),
+        ("orphan-id", "parent      unresolved — id missing-parent"),
     ] {
         let target = app
             .visible_rows()
@@ -442,11 +442,11 @@ fn real_claude_usage_with_server_tools_shows_categories_pricing_date_and_fee_not
         .collect::<Vec<_>>()
         .join("\n");
     for needle in [
-        "Input: 10",
-        "Cache read: 2",
-        "Output: 4",
-        "Pricing as of: 2026-09-15",
-        "Cost note: server-tool fees excluded",
+        "input              10",
+        "cache read          2",
+        "output              4",
+        "prices as of 2026-09-15",
+        "note: server-tool fees excluded",
         "web_search 2",
     ] {
         assert!(screen.contains(needle), "missing {needle:?}:\n{screen}");

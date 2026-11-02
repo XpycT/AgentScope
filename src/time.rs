@@ -39,3 +39,14 @@ pub fn format_local(ts: Timestamp) -> String {
         None => "invalid time".to_string(),
     }
 }
+
+/// Short local date for compact views, e.g. `Oct 31, 09:12`.
+pub fn format_local_short(ts: Timestamp) -> String {
+    match DateTime::<Utc>::from_timestamp_millis(ts) {
+        Some(utc) => utc
+            .with_timezone(&Local)
+            .format("%b %-d, %H:%M")
+            .to_string(),
+        None => "invalid time".to_string(),
+    }
+}

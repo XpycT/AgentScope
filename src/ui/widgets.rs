@@ -19,7 +19,8 @@ pub const READ_FAILED: &str = "couldn't read";
 const PROMPT_TAIL: usize = 40;
 
 /// Tool-name groups used only to color a name by what the call does.
-const SHELL_TOOLS: &[&str] = &["bash", "shell", "exec", "command", "terminal", "run", "cmd"];
+pub(super) const SHELL_TOOLS: &[&str] =
+    &["bash", "shell", "exec", "command", "terminal", "run", "cmd"];
 const FILE_TOOLS: &[&str] = &[
     "read",
     "write",
@@ -416,6 +417,12 @@ impl Palette {
 
     /// Marker on every line of the selected item.
     pub const SELECTION_MARKER: &str = "▌";
+
+    /// Accent for the selection marker, so the selected item stands out even
+    /// where the subtle background is invisible.
+    pub fn selection_marker(&self) -> Style {
+        self.colored(Color::Cyan).add_modifier(Modifier::BOLD)
+    }
 
     pub fn selected(&self) -> Style {
         Style::default().add_modifier(Modifier::REVERSED)

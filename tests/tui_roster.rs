@@ -571,7 +571,8 @@ fn the_preview_takes_45_columns_from_150_and_never_below() {
     let wide = RosterLayout::for_area(Rect::new(0, 0, 150, 30));
     let preview = wide.preview.expect("preview column at 150");
     assert_eq!((preview.width, preview.x), (45, 105));
-    assert_eq!(wide.rows.width, 105);
+    // One blank column separates the value columns from the preview rule.
+    assert_eq!(wide.rows.width, 104);
     assert!(
         RosterLayout::for_area(Rect::new(0, 0, 149, 30))
             .preview
@@ -1123,7 +1124,7 @@ fn preview_buffer(app: &App, no_color: bool) -> Buffer {
 fn preview_buffer_at(app: &App, no_color: bool, width: u16, height: u16) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
-        .draw(|f| render_preview(f, app, &ctx(no_color), f.area()))
+        .draw(|f| render_preview(f, app, &ctx(no_color), f.area(), false))
         .unwrap();
     terminal.backend().buffer().clone()
 }
@@ -1280,9 +1281,9 @@ fn preview_pins_header_numbers_and_bar() {
     );
 
     // Scrolling moves only the sections below the pinned block.
-    let _ = preview_buffer_at(&app, true, 60, 10); // records the scroll extent
+    let _ = preview_buffer_at(&app, true, 60, 13); // records the scroll extent
     app.scroll_preview(100);
-    let scrolled = text(&preview_buffer_at(&app, true, 60, 10));
+    let scrolled = text(&preview_buffer_at(&app, true, 60, 13));
     assert!(
         scrolled
             .lines()
@@ -1418,8 +1419,8 @@ fn preview_reply_keeps_line_breaks_and_stops_at_three_rows() {
 }
 
 #[test]
-fn preview_effort_stays_quiet_in_color_mode() {
-    for effort in ["high", "max"] {
+fn preview_effort_keeps_its_level_color() {
+    for (effort, color) in [("high", Color::Yellow), ("max", Color::Red)] {
         let mut s = rich(Harness::Codex, "e", "Effort");
         s.meta.model = Some(model("gpt-5.5", Some("openai"), Some(effort)));
         let mut app = app();
@@ -1429,8 +1430,8 @@ fn preview_effort_stays_quiet_in_color_mode() {
         let width = buf.area.width as usize;
         assert_eq!(
             buf.content()[y as usize * width + x as usize].fg,
-            Color::DarkGray,
-            "{effort} is part of the quiet metadata line"
+            color,
+            "{effort} uses the shared thinking-level color"
         );
     }
 }
@@ -1632,7 +1633,7 @@ fn context_percentage_needs_a_known_window() {
     unknown.metrics.context.used = Some(215_000);
     unknown.metrics.context.capacity = None;
     let out = preview_of(unknown);
-    assert!(out.contains("215k recorded"), "{out}");
+    assert!(out.contains("215k in use"), "{out}");
     assert!(!out.contains('%'), "no percentage without a window:\n{out}");
 
     let mut known = rich(Harness::Codex, "k", "Known window");

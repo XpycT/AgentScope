@@ -238,8 +238,8 @@ fn shows_tool_arguments_output_and_oversized_markers() {
         "call-9",
         "Error",
         "2.5s",
-        "Exit: 1",
-        "input (recorded preview)",
+        "✗ exit 1",
+        "command",
         "cargo test --all",
         "output (recorded preview)",
         "2 failed assertions",
@@ -259,7 +259,7 @@ fn details_rendering_is_bounded_for_huge_previews() {
     open(&mut app, page(vec![e], vec![]));
     assert!(app.open_details());
     let out = draw(&app);
-    assert!(out.contains("input (recorded preview)"));
+    assert!(out.contains("command"));
     assert!(out.contains("cargo test --all"));
     app.overlay_scroll(isize::MAX);
     assert!(draw(&app).contains("[display limited"), "marker at the end");
@@ -295,7 +295,7 @@ fn details_side_column_at_wide_width() {
     let out = screen_at(&app, 130, 30);
     for want in [
         "USAGE (message)",
-        "1,600",
+        "1.6k",
         "input",
         "output",
         "reasoning",
@@ -312,13 +312,19 @@ fn details_side_column_at_wide_width() {
         .lines()
         .find(|line| line.contains("USAGE (message)"))
         .expect("a side column");
+    // Columns, not bytes: the rule before the side column is multi-byte.
+    let content: String = side.split("USAGE (message)").next().unwrap_or("").into();
     assert_eq!(
-        side.find("USAGE (message)"),
-        Some(100),
+        content.chars().count(),
+        100,
         "the side column starts after 100 content columns:\n{side}"
     );
     assert!(
-        side[..100].contains("reply (recorded preview)"),
+        content.ends_with("│ "),
+        "a rule separates the side column:\n{side}"
+    );
+    assert!(
+        content.contains("reply (recorded preview)"),
         "content and facts share the row:\n{side}"
     );
     assert!(out.contains("hello world"), "{out}");
@@ -414,13 +420,13 @@ fn tool_details_label_recorded_input_and_output_previews() {
     let out = screen_at(&app, 100, 40);
     for want in [
         "SHELL",
-        "input (recorded preview)",
+        "command",
         "cargo test --all",
         "output (recorded preview)",
         "2 failed assertions",
         "second line",
         "[truncated: showing 31 of 90000 bytes]",
-        "Exit: 1",
+        "✗ exit 1",
     ] {
         assert!(out.contains(want), "missing {want:?} in:\n{out}");
     }
@@ -1305,17 +1311,24 @@ fn not_recorded_line_lists_absent_facts() {
     assert!(app.open_session_info());
     app.take_requests();
     let screen = session_screen_at(&app, 160, 60);
-    let line = screen
-        .lines()
-        .find(|line| line.contains("Not recorded:"))
+    // The list wraps; read it up to the priced-models line.
+    let start = screen
+        .find("Not recorded:")
         .unwrap_or_else(|| panic!("missing Not recorded line:\n{screen}"));
+    let end = screen[start..]
+        .find("Priced models")
+        .map_or(screen.len(), |at| start + at);
+    let line = screen[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     for field in [
         "end time",
         "origin",
         "model variant",
         "server tools",
         "compaction cost",
-        "reasoning tokens",
+        "token usage",
         "context window",
         "process start",
     ] {
@@ -1330,10 +1343,9 @@ fn cost_panel_explains_unpriced_requests() {
     assert!(app.open_session_info());
     app.take_requests();
     let screen = session_screen_at(&app, 120, 70);
-    assert!(screen.contains("2 of 4 priced · incomplete"), "{screen}");
     assert!(
-        screen.contains("█████░░░░░"),
-        "priced-request bar:\n{screen}"
+        screen.contains("priced      ██████████░░░░░░░░░░  2/4"),
+        "{screen}"
     );
     assert!(
         screen.contains("Unpriced because two requests had no recorded price."),
@@ -1468,7 +1480,7 @@ fn time_panel_shows_old_model_speed_note() {
     assert!(app.open_session_info());
     app.take_requests();
     let screen = session_screen_at(&app, 120, 60);
-    assert!(screen.contains("Latest speed: 84.2 tok/s"), "{screen}");
+    assert!(screen.contains("speed now   84.2 tok/s"), "{screen}");
     assert!(screen.contains("old old-model · 2m ago"), "{screen}");
 }
 
@@ -1635,14 +1647,16 @@ fn partial_category_costs_keep_their_subtotal_and_coverage_in_session_details() 
     assert!(app.open_session_info());
     let screen = session_screen(&app);
     assert!(
-        screen.contains("Known subtotal: $0.05 (incomplete, not a total)"),
+        screen.contains("$0.05+  known so far, not a total"),
         "{screen}"
     );
-    assert!(screen.contains("Unpriced coverage: output"), "{screen}");
-    assert!(screen.contains("1 of 2 priced"), "{screen}");
-    assert!(screen.contains("Cost: $0.05+ · partial 1/2"), "{screen}");
     assert!(
-        !screen.contains("Cost: $0.05 "),
+        screen.contains("Unpriced because no price was recorded for: output."),
+        "{screen}"
+    );
+    assert!(screen.contains("1/2"), "{screen}");
+    assert!(
+        !screen.contains("│ $0.05  "),
         "no complete total is claimed:\n{screen}"
     );
 }

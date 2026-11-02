@@ -183,8 +183,10 @@ impl RosterLayout {
         } else {
             area.width
         };
-        let header = Rect::new(area.x, table_head.y, list_w, 1);
-        let rows = Rect::new(area.x, body.y, list_w, body.height);
+        // Keep one blank column between the value columns and the preview rule.
+        let rows_w = if side { list_w - 1 } else { list_w };
+        let header = Rect::new(area.x, table_head.y, rows_w, 1);
+        let rows = Rect::new(area.x, body.y, rows_w, body.height);
         let preview = side.then(|| {
             Rect::new(
                 area.x + list_w,
@@ -453,7 +455,7 @@ pub fn render_roster(frame: &mut Frame, app: &App, ctx: &RosterContext) {
             body,
         );
     } else if swapped {
-        render_preview(frame, app, ctx, body);
+        render_preview(frame, app, ctx, body, false);
     } else {
         if !has_rows {
             frame.render_widget(
@@ -469,7 +471,7 @@ pub fn render_roster(frame: &mut Frame, app: &App, ctx: &RosterContext) {
             render_rows(frame, app, &layout, palette, selection);
         }
         if let Some(preview) = layout.preview {
-            render_preview(frame, app, ctx, preview);
+            render_preview(frame, app, ctx, preview, true);
         }
     }
 }
@@ -631,15 +633,20 @@ fn status_cell(row: &RosterSession<'_>, now: Timestamp) -> String {
     }
 }
 
-/// Visible fold text: expanded, collapsed with known children, or a blank cell.
-fn fold_text(row: &RosterSession<'_>) -> String {
+/// Visible fold glyph: expanded, collapsed with known children, or a blank cell.
+fn fold_text(row: &RosterSession<'_>) -> &'static str {
     if row.expanded {
-        "▾".to_string()
+        "▾"
     } else if row.child_count > 0 {
-        format!("▸ +{}", row.child_count)
+        "▸"
     } else {
-        " ".to_string()
+        " "
     }
+}
+
+/// Quiet hidden-children count drawn after a folded parent's title.
+fn folded_count(row: &RosterSession<'_>) -> Option<String> {
+    (!row.expanded && row.child_count > 0).then(|| format!(" +{}", row.child_count))
 }
 
 /// First screen column of a session's fold cell: after the marker strip, the
@@ -655,7 +662,7 @@ fn fold_control(layout: &RosterLayout, row: &RosterSession<'_>) -> Option<(u16, 
         return None;
     }
     let start = fold_start(layout, row.depth);
-    let width = UnicodeWidthStr::width(fold_text(row).as_str()) as u16;
+    let width = UnicodeWidthStr::width(fold_text(row)) as u16;
     Some((start, start + width))
 }
 
@@ -671,10 +678,10 @@ fn row_lines(
 ) -> [Line<'static>; 2] {
     let s = row.session;
     let (icon, _) = status_text(row.status.label);
-    let marker = if highlighted {
-        Palette::SELECTION_MARKER
+    let (marker, marker_style) = if highlighted {
+        (Palette::SELECTION_MARKER, palette.selection_marker())
     } else {
-        " "
+        (" ", Style::default())
     };
     let (tree_first, tree_second) = if row.depth == 0 {
         ("", "")
@@ -683,6 +690,8 @@ fn row_lines(
     } else {
         ("  ├ ", "  │ ")
     };
+    // Line 2 starts under the title: status glyph, space, fold cell, space.
+    let title_indent = "    ";
     let fold = fold_text(row);
     let speed = speed_fact(s, row.hydrated, now);
     let column_start = layout
@@ -694,7 +703,7 @@ fn row_lines(
     // Line 1: marker, tree, status glyph, fold marker, bold title, columns.
     let mut first = Vec::new();
     let mut used = 0;
-    push(&mut first, &mut used, marker, Style::default());
+    push(&mut first, &mut used, marker, marker_style);
     push(&mut first, &mut used, " ", Style::default());
     push(&mut first, &mut used, tree_first, palette.quiet());
     push(
@@ -706,13 +715,18 @@ fn row_lines(
     push(&mut first, &mut used, " ", Style::default());
     push(&mut first, &mut used, fold, palette.quiet());
     push(&mut first, &mut used, " ", Style::default());
-    let title_width = column_start.saturating_sub(used + 1);
+    let count = folded_count(row).unwrap_or_default();
+    let count_width = UnicodeWidthStr::width(count.as_str());
+    let title_width = column_start.saturating_sub(used + 1 + count_width);
     push(
         &mut first,
         &mut used,
-        fit(&display_title(&s.meta), title_width),
+        fit(&display_title(&s.meta), title_width)
+            .trim_end()
+            .to_string(),
         palette.value(),
     );
+    push(&mut first, &mut used, count, palette.quiet());
     for placed in &layout.columns {
         if (placed.x as usize) > used {
             let padding = " ".repeat(placed.x as usize - used);
@@ -746,12 +760,13 @@ fn row_lines(
     }
     pad_to(&mut first, &mut used, width);
 
-    // Line 2: marker, tree continuation, agent tag, model, effort, provider.
+    // Line 2, under the title: agent tag, model · effort · provider.
     let mut second = Vec::new();
     let mut used = 0;
-    push(&mut second, &mut used, marker, Style::default());
+    push(&mut second, &mut used, marker, marker_style);
     push(&mut second, &mut used, " ", Style::default());
     push(&mut second, &mut used, tree_second, palette.quiet());
+    push(&mut second, &mut used, title_indent, Style::default());
     push_span(
         &mut second,
         &mut used,
@@ -762,10 +777,10 @@ fn row_lines(
     let model_id = model.map_or_else(|| ABSENT.to_string(), |m| one_line(&m.id));
     push(&mut second, &mut used, model_id, palette.quiet());
     if let Some(effort) = model.and_then(|m| m.effort.as_deref()) {
-        push(&mut second, &mut used, " ", Style::default());
+        push(&mut second, &mut used, " · ", palette.quiet());
         push_span(&mut second, &mut used, effort_span(effort, palette));
     }
-    push(&mut second, &mut used, " ", Style::default());
+    push(&mut second, &mut used, " · ", palette.quiet());
     let provider = model
         .and_then(|m| m.provider.as_deref())
         .map_or_else(|| ABSENT.to_string(), one_line);
@@ -773,7 +788,7 @@ fn row_lines(
     // A rate measured on another model keeps its explanation beside the quiet
     // number; the color cue alone is absent under no_color.
     if speed.quiet && !speed.sub.is_empty() {
-        push(&mut second, &mut used, " · ", Style::default());
+        push(&mut second, &mut used, " · ", palette.quiet());
         push(
             &mut second,
             &mut used,
@@ -781,6 +796,8 @@ fn row_lines(
             palette.quiet(),
         );
     }
+    let mut second = clip_spans(second, width);
+    let mut used = used.min(width);
     pad_to(&mut second, &mut used, width);
 
     let lines = [Line::from(first), Line::from(second)];
@@ -808,6 +825,26 @@ fn row_lines(
     lines.map(select)
 }
 
+/// Cut spans to `width` columns, ending a clipped span with the shared marker.
+fn clip_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::with_capacity(spans.len());
+    let mut used = 0;
+    for span in spans {
+        let w = UnicodeWidthStr::width(span.content.as_ref());
+        if used + w <= width {
+            used += w;
+            out.push(span);
+            continue;
+        }
+        let rest = width - used;
+        if rest > 0 {
+            out.push(Span::styled(fit(&span.content, rest), span.style));
+        }
+        break;
+    }
+    out
+}
+
 /// Group heading: bold project name, then quiet loaded-member totals.
 fn group_header_line(
     header: crate::app::GroupHeader<'_>,
@@ -832,10 +869,16 @@ fn group_header_line(
         ),
         None => ABSENT.to_string(),
     };
-    let summary = format!("{} sessions · {tokens} · {cost}", total.sessions);
+    let noun = if total.sessions == 1 {
+        "session"
+    } else {
+        "sessions"
+    };
+    let summary = format!("{} {noun} · {tokens} · {cost}", total.sessions);
     let width = layout.rows.width as usize;
+    // The totals follow the name; a long name gives way first.
     let summary_width = UnicodeWidthStr::width(summary.as_str());
-    let name_width = width.saturating_sub(summary_width + 2);
+    let name_width = width.saturating_sub(summary_width + 2).max(width.min(12));
     let name = header
         .project
         .map_or_else(|| "No project".to_string(), display_safe);
@@ -844,11 +887,13 @@ fn group_header_line(
     push(
         &mut spans,
         &mut used,
-        fit(&name, name_width),
+        fit(&name, name_width).trim_end().to_string(),
         palette.title(),
     );
     push(&mut spans, &mut used, "  ", Style::default());
     push(&mut spans, &mut used, summary, palette.quiet());
+    let mut spans = clip_spans(spans, width);
+    let mut used = used.min(width);
     pad_to(&mut spans, &mut used, width);
     Line::from(spans)
 }
@@ -863,8 +908,6 @@ fn table_header(layout: &RosterLayout, palette: Palette) -> Line<'static> {
         out.push_str(&" ".repeat(label_x - used));
         used = label_x;
     }
-    out.push_str(&fit("SESSION / PROJECT", layout.session_width as usize));
-    used += layout.session_width as usize;
     for placed in &layout.columns {
         let x = placed.x as usize;
         if x > used {

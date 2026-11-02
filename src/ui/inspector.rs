@@ -19,20 +19,18 @@ use crate::domain::{
     SessionSummary, StatusLabel, Timestamp, ToolInteraction, ToolStatus, UsageScope,
 };
 use crate::ingest::text::display_safe;
-use crate::time::format_local;
+use crate::time::{format_local, format_local_short, relative_label};
 
 use super::RosterContext;
 use super::preview::status_age;
 use super::roster::{MIN_HEIGHT, MIN_WIDTH};
 use super::session::{cost_fact, speed_fact, tokens_fact};
 use super::widgets::{
-    ABSENT, ELLIPSIS, Palette, agent_tag, display_title, effort_span, fit, search_prompt,
+    ABSENT, ELLIPSIS, LOADING, Palette, agent_tag, display_title, effort_span, fit, search_prompt,
     status_chip, tokens_text, tool_glyph,
 };
 
 const MARKER_W: usize = 2;
-const TIME_W: usize = 5;
-const ACTOR_W: usize = 5;
 /// Most wrapped text lines shown for a collapsed prompt or reply.
 const COLLAPSED_TEXT_LINES: usize = 3;
 /// Most lines one expanded row shows before deferring to Details.
@@ -40,6 +38,10 @@ const MAX_DETAIL_LINES: usize = 12;
 const HEADER_LINES: u16 = 3;
 const ROW_INDENT: usize = 2;
 const DETAIL_INDENT: usize = 4;
+/// Reading width for transcript text and the right edge of tool outcomes.
+const TEXT_MAX_W: usize = 110;
+/// Tool names are padded to this width so their summaries line up.
+const TOOL_NAME_W: usize = 6;
 
 pub const REASONING_LABEL: &str = "Provider reasoning (persisted)";
 
@@ -135,64 +137,59 @@ pub(super) fn header_lines(
         Span::raw("  "),
         Span::styled(evidence, palette.quiet()),
     ]);
-    let line2 = Line::from(line2_spans(s, transcript, palette));
+    let line2 = Line::from(line2_spans(app, s, transcript, palette));
     let line3 = Line::from(line3_spans(app, transcript, s, hydrated, palette));
     vec![line1, line2, line3]
 }
 
-/// Project · model · thinking level · provider · started · loaded events.
+/// Project · model · thinking level · provider · started · loaded events, as
+/// quiet values without labels; absent fields are left out.
 fn line2_spans(
+    app: &App,
     s: &SessionSummary,
     transcript: &Transcript,
     palette: Palette,
 ) -> Vec<Span<'static>> {
-    let quiet = |text: String| Span::styled(text, palette.quiet());
-    let project = s
-        .meta
-        .project
-        .as_deref()
-        .map_or_else(|| ABSENT.to_string(), flatten);
-    let model = s
-        .meta
-        .model
-        .as_ref()
-        .map_or_else(|| ABSENT.to_string(), |m| flatten(&m.id));
-    let provider = s
-        .meta
-        .model
-        .as_ref()
-        .and_then(|m| m.provider.as_deref())
-        .map_or_else(|| ABSENT.to_string(), flatten);
-    let started = s
-        .metrics
-        .timing
-        .started_at
-        .or(s.meta.created_at)
-        .map_or_else(|| ABSENT.to_string(), stamp);
-    let effort = s
-        .meta
-        .model
-        .as_ref()
-        .and_then(|m| m.effort.as_deref().or(m.configured_effort.as_deref()));
-    let mut spans = vec![
-        quiet(format!("project {project}")),
-        quiet(" · ".into()),
-        quiet(format!("model {model}")),
-        quiet(" · ".into()),
-        quiet("thinking ".into()),
-    ];
-    match effort {
-        Some(effort) => spans.push(effort_span(effort, palette)),
-        None => spans.push(quiet(ABSENT.into())),
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut push = |span: Span<'static>| {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", palette.quiet()));
+        }
+        spans.push(span);
+    };
+    let model = s.meta.model.as_ref();
+    if let Some(project) = s.meta.project.as_deref() {
+        push(Span::styled(flatten(project), palette.quiet()));
     }
-    spans.push(quiet(format!(
-        " · provider {provider} · started {started} · {} loaded",
-        transcript.events().len()
-    )));
+    if let Some(model) = model {
+        push(Span::styled(flatten(&model.id), palette.quiet()));
+    }
+    if let Some(effort) = model.and_then(|m| m.effort.as_deref().or(m.configured_effort.as_deref()))
+    {
+        push(effort_span(effort, palette));
+    }
+    if let Some(provider) = model.and_then(|m| m.provider.as_deref()) {
+        push(Span::styled(flatten(provider), palette.quiet()));
+    }
+    if let Some(started) = s.metrics.timing.started_at.or(s.meta.created_at) {
+        push(Span::styled(
+            format!(
+                "started {} ({} ago)",
+                stamp(started),
+                relative_label(started, app.now())
+            ),
+            palette.quiet(),
+        ));
+    }
+    push(Span::styled(
+        format!("{} loaded", transcript.events().len()),
+        palette.quiet(),
+    ));
     spans
 }
 
-/// Tokens · cost · context · speed · tool calls · children.
+/// Tokens · cost · context · speed · tool calls · children: bold values
+/// followed by quiet labels. Tokens and cost always show, `—` when absent.
 fn line3_spans(
     app: &App,
     transcript: &Transcript,
@@ -203,15 +200,12 @@ fn line3_spans(
     let tokens = tokens_fact(s.usage.as_ref(), hydrated);
     let cost = cost_fact(s.usage.as_ref(), hydrated);
     let speed = speed_fact(s, hydrated, app.now());
-    let mut parts = vec![
-        format!("tokens {}", tokens.head),
-        format!("cost {}", cost.head),
-    ];
+    let mut parts: Vec<(String, &'static str)> = vec![(tokens.head, "tokens"), (cost.head, "cost")];
     if let Some(context) = context_text(&s.metrics.context) {
-        parts.push(format!("context {context}"));
+        parts.push(context);
     }
     if numeric(&speed.head) {
-        parts.push(format!("speed {} tok/s", speed.head));
+        parts.push((speed.head, "tok/s"));
     }
     let tools = transcript
         .events()
@@ -219,30 +213,42 @@ fn line3_spans(
         .filter(|e| e.tool.is_some())
         .count();
     if tools > 0 {
-        parts.push(format!(
-            "{tools}{} tool{}",
-            if transcript.has_older() { "+" } else { "" },
-            if tools == 1 { "" } else { "s" }
+        parts.push((
+            format!("{tools}{}", if transcript.has_older() { "+" } else { "" }),
+            if tools == 1 {
+                "tool call"
+            } else {
+                "tool calls"
+            },
         ));
     }
     if let Some(children) = app.children_of(transcript.key()) {
         let count = children.metadata.len();
         if count > 0 {
-            parts.push(format!(
-                "{count}{} child{}",
-                if children.next.is_some() { "+" } else { "" },
-                if count == 1 { "" } else { "ren" }
+            parts.push((
+                format!("{count}{}", if children.next.is_some() { "+" } else { "" }),
+                if count == 1 { "child" } else { "children" },
             ));
         }
     }
-    vec![Span::styled(parts.join(" · "), palette.quiet())]
+    let mut spans = Vec::new();
+    for (value, label) in parts {
+        if !spans.is_empty() {
+            spans.push(Span::raw("   "));
+        }
+        let style = if matches!(value.as_str(), ABSENT | LOADING) {
+            palette.quiet()
+        } else {
+            palette.value()
+        };
+        spans.push(Span::styled(value, style));
+        spans.push(Span::styled(format!(" {label}"), palette.quiet()));
+    }
+    spans
 }
 
 fn stamp(ts: Timestamp) -> String {
-    let local = format_local(ts);
-    local
-        .get(..16)
-        .map_or_else(|| local.clone(), str::to_string)
+    format_local_short(ts)
 }
 
 fn flatten(text: &str) -> String {
@@ -271,15 +277,15 @@ fn clip(text: &str, width: usize) -> String {
     out
 }
 
-fn context_text(c: &ContextUsage) -> Option<String> {
+/// Context value and its label for the header numbers line.
+fn context_text(c: &ContextUsage) -> Option<(String, &'static str)> {
     match (c.used, c.capacity) {
-        (Some(used), Some(window)) => Some(format!(
-            "{} of {}",
-            tokens_text(Some(used)),
-            tokens_text(Some(window))
+        (Some(used), Some(window)) => Some((
+            format!("{}/{}", tokens_text(Some(used)), tokens_text(Some(window))),
+            "context",
         )),
-        (Some(used), None) => Some(tokens_text(Some(used))),
-        (None, Some(window)) => Some(format!("{} window", tokens_text(Some(window)))),
+        (Some(used), None) => Some((tokens_text(Some(used)), "context")),
+        (None, Some(window)) => Some((tokens_text(Some(window)), "context window")),
         (None, None) => None,
     }
 }
@@ -431,9 +437,14 @@ fn render_timeline(
             if lines.len() >= height {
                 break;
             }
-            lines.extend(row_lines(
-                row, events, selected, transcript, app, width, palette,
-            ));
+            let mut row_lines = row_lines(row, events, selected, transcript, app, width, palette);
+            // Rows that open with air never stack two blank lines.
+            if lines.last().is_none_or(|line| line.width() == 0)
+                && row_lines.first().is_some_and(|line| line.width() == 0)
+            {
+                row_lines.remove(0);
+            }
+            lines.extend(row_lines);
             if index == selected_row {
                 selected_end = Some(lines.len());
             }
@@ -534,8 +545,9 @@ fn detail_line(text: &str, ctx: RowCtx) -> Line<'static> {
     ])
 }
 
-/// A prompt or reply: bar, actor, time, wrapped recorded preview. A reply's
-/// token count is shown only when the usage belongs to that message or turn.
+/// A prompt or reply: a `▌ You  08:19` header line, then the wrapped recorded
+/// preview under the same bar. A reply's token count is shown only when the
+/// usage belongs to that message or turn.
 fn turn_text_lines(event: &Event, expanded: bool, prompt: bool, ctx: RowCtx) -> Vec<Line<'static>> {
     let actor = if prompt { "You" } else { "Agent" };
     let bar_style = if prompt {
@@ -544,68 +556,58 @@ fn turn_text_lines(event: &Event, expanded: bool, prompt: bool, ctx: RowCtx) -> 
         ctx.palette.reply_bar()
     };
     let width = ctx.width;
-    let prefix = MARKER_W + 2 + ACTOR_W + 2 + TIME_W + 1;
+    let prefix = MARKER_W + 2;
     let token = if prompt {
         None
     } else {
         reply_tokens(event, ctx.palette)
     };
-    let token_w = token.as_ref().map_or(0, |t| t.content.width());
     let text = event.text.as_ref().map_or_else(String::new, |t| {
         display_safe(&t.preview).trim_end_matches('\n').to_string()
     });
-    let first_width = width
-        .saturating_sub(prefix + token_w + usize::from(token_w > 0))
-        .max(1);
-    let rest_width = width.saturating_sub(prefix).max(1);
-    let wrapped = wrap_text_widths(&text, first_width, rest_width);
-    let (mut body, cut) = if expanded {
+    let text_width = width.min(TEXT_MAX_W).saturating_sub(prefix).max(1);
+    let wrapped = wrap_text_widths(&text, text_width, text_width);
+    let (body, cut) = if expanded {
         capped(wrapped, MAX_DETAIL_LINES)
     } else {
         capped(wrapped, COLLAPSED_TEXT_LINES)
     };
 
-    let head_text = body.first().cloned().unwrap_or_default();
-    let head_w = head_text.width();
-    if !body.is_empty() {
-        body.remove(0);
-    }
+    let bar = || Span::styled("▌", bar_style);
     let head = {
+        let time = clock(event.timestamp);
         let mut spans = vec![
             marker_span(ctx.selected, ctx.matched, ctx.palette),
-            Span::styled("▌", bar_style),
+            bar(),
             Span::raw(" "),
-            Span::styled(
-                format!("{actor:<width$}", width = ACTOR_W),
-                ctx.palette.title(),
-            ),
+            Span::styled(actor, ctx.palette.title()),
             Span::raw("  "),
-            Span::styled(clock(event.timestamp), ctx.palette.dim()),
-            Span::raw(" "),
-            Span::raw(head_text),
+            Span::styled(time.clone(), ctx.palette.quiet()),
         ];
         if let Some(token) = token {
-            let used = prefix + head_w;
-            let spaces = width.saturating_sub(used + token_w);
+            let used = prefix + actor.width() + 2 + time.width();
+            let right = width.min(TEXT_MAX_W);
+            let spaces = right.saturating_sub(used + token.content.width()).max(2);
             spans.push(Span::raw(" ".repeat(spaces)));
             spans.push(token);
         }
         Line::from(spans)
     };
     let mut lines = vec![head];
-    let continuation = " ".repeat(prefix - MARKER_W);
     for line in body {
         lines.push(Line::from(vec![
             marker_span(ctx.selected, false, ctx.palette),
-            Span::raw(continuation.clone()),
+            bar(),
+            Span::raw(" "),
             Span::raw(line),
         ]));
     }
     if cut {
         lines.push(Line::from(vec![
             marker_span(ctx.selected, false, ctx.palette),
-            Span::raw(continuation),
-            Span::raw(ELLIPSIS.to_string()),
+            bar(),
+            Span::raw(" "),
+            Span::styled(ELLIPSIS.to_string(), ctx.palette.quiet()),
         ]));
     }
     if expanded {
@@ -613,6 +615,11 @@ fn turn_text_lines(event: &Event, expanded: bool, prompt: bool, ctx: RowCtx) -> 
             lines.push(detail_line("more in details (d)", ctx));
         }
         lines.push(detail_line("recorded preview · v opens the source", ctx));
+    }
+    // Prompts and replies are set apart from the agent work between them.
+    lines.insert(0, Line::default());
+    if prompt {
+        lines.push(Line::default());
     }
     lines
 }
@@ -636,15 +643,10 @@ fn tool_lines(
     let name = flatten(&tool.name);
     let summary = tool_argument_summary(tool);
     let mut right: Vec<Span<'static>> = Vec::new();
-    if let Some(code) = tool.exit_code {
-        let text = format!("exit {code}");
+    if let Some(code) = tool.exit_code.filter(|code| *code != 0) {
         right.push(Span::styled(
-            text,
-            if code == 0 {
-                ctx.palette.quiet()
-            } else {
-                ctx.palette.status(StatusLabel::Failed)
-            },
+            format!("exit {code}"),
+            ctx.palette.status(StatusLabel::Failed),
         ));
     } else if let (Some(start), Some(end)) = (tool.started_at, tool.completed_at)
         && end >= start
@@ -662,11 +664,17 @@ fn tool_lines(
     }
     let right_w: usize = right.iter().map(|s| s.content.width()).sum();
     let prefix = MARKER_W + ROW_INDENT * usize::from(row.depth) + 2;
-    let avail = ctx
-        .width
+    // Durations sit at the reading width, not at the far edge of a wide screen.
+    let row_width = ctx.width.min(TEXT_MAX_W);
+    let avail = row_width
         .saturating_sub(prefix + right_w + usize::from(right_w > 0))
         .max(1);
     let name_text = clip(&name, avail);
+    let name_text = if name_text.width() < TOOL_NAME_W {
+        format!("{name_text:<TOOL_NAME_W$}")
+    } else {
+        name_text
+    };
     let name_w = name_text.width();
     let summary_avail = avail.saturating_sub(name_w + 1);
     let summary_text = clip(&summary, summary_avail);
@@ -686,7 +694,9 @@ fn tool_lines(
         used += 1 + summary_text.width();
         spans.push(Span::raw(summary_text));
     }
-    let spaces = ctx.width.saturating_sub(used + right_w);
+    let spaces = row_width
+        .saturating_sub(used + right_w)
+        .max(usize::from(right_w > 0) * 2);
     spans.push(Span::raw(" ".repeat(spaces)));
     spans.extend(right);
     let mut lines = vec![Line::from(spans)];

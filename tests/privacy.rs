@@ -546,7 +546,11 @@ fn new_metadata_is_display_safe() {
     assert!(app.open_inspector());
     let inspector = screen_text(&app, &ctx);
     assert_clean("inspector", &inspector);
-    assert!(inspector.contains("model "), "the model line is rendered");
+    // Title, project, model, effort and provider all carry the masked field.
+    assert!(
+        inspector.matches("password=").count() >= 3,
+        "the model line is rendered"
+    );
     assert!(app.open_session_info());
     assert_clean("session info", &screen_text(&app, &ctx));
 
@@ -1042,7 +1046,7 @@ fn opencode_metadata_beside_allowlisted_fields_never_surfaces() {
     assert!(app.open_session_info());
     let session = screen_text(&app, &ctx);
     assert_clean("OpenCode session info", &session);
-    for needle in ["Billing provider: openai", "Model: gpt-5", "Effort: high"] {
+    for needle in ["billed via  openai", "gpt-5 · high"] {
         assert!(session.contains(needle), "missing {needle:?}:\n{session}");
     }
 }

@@ -254,12 +254,11 @@ fn renders_header_usage_evidence_and_timeline() {
         "[CDX] Inventory API",
         "quiet",
         evidence.as_str(),
-        "project RipperGame",
-        "model gpt-5.1-codex",
+        "RipperGame · gpt-5.1-codex",
         "2 loaded",
-        "tokens 73k",
-        "cost ~$0.23",
-        "context 475k window",
+        "73k tokens",
+        "~$0.23 cost",
+        "475k context window",
         "You",
         "Implement inventory checks",
         "Agent",
@@ -277,15 +276,15 @@ fn renders_reported_context_window_and_server_tool_counts_and_unknown_otherwise(
     let mut app = app_with(summary(1));
     open(&mut app, page(vec![msg(0)], None, false));
     let out = draw(&app, 110, 30);
-    assert!(out.contains("context 475k window"), "{out}");
+    assert!(out.contains("475k context window"), "{out}");
     assert!(
-        !out.contains("Server tools"),
+        !out.contains("server tools"),
         "moved to session info:\n{out}"
     );
     assert!(app.open_session_info());
     let info = draw(&app, 140, 40);
     assert!(
-        info.contains("Server tools: web_search 3 · web_fetch 1"),
+        info.contains("server tools: web_search 3 · web_fetch 1"),
         "{info}"
     );
     assert!(app.close_overlay());
@@ -296,7 +295,7 @@ fn renders_reported_context_window_and_server_tool_counts_and_unknown_otherwise(
     let mut app = app_with(bare);
     open(&mut app, page(vec![msg(0)], None, false));
     let out = draw(&app, 110, 30);
-    assert!(!out.contains("context "), "{out}");
+    assert!(!out.contains(" context"), "{out}");
     assert!(app.open_session_info());
     let info = draw(&app, 140, 40);
     assert!(
@@ -332,7 +331,7 @@ fn expands_a_tool_row_and_shows_status_duration_exit_and_truncation() {
     // The latest row opens expanded; collapsing it hides the details without
     // recording a manual expansion.
     let expanded = draw(&app, 110, 30);
-    assert!(expanded.contains("✗ shell cargo test --all"), "{expanded}");
+    assert!(expanded.contains("✗ shell  cargo test --all"), "{expanded}");
     assert!(expanded.contains("exit 1"), "{expanded}");
     assert!(
         expanded.contains("recorded preview · v opens the source"),
@@ -348,7 +347,7 @@ fn expands_a_tool_row_and_shows_status_duration_exit_and_truncation() {
     app.inspector_toggle();
     let out = draw(&app, 110, 30);
     for want in [
-        "✗ shell cargo test --all",
+        "✗ shell  cargo test --all",
         "exit 1",
         "input: cargo test --all",
         "[truncated: showing 16 of 9000 bytes]",
@@ -471,10 +470,12 @@ fn missing_timestamps_and_usage_show_unknown() {
     e.timestamp = None;
     open(&mut app, page(vec![e], None, false));
     let out = draw(&app, 110, 30);
-    assert!(out.contains("tokens —"), "{out}");
-    assert!(out.contains("cost —"), "{out}");
-    let row = out.lines().find(|l| l.contains("message 0")).unwrap();
-    assert!(row.contains('—'), "{row}");
+    assert!(out.contains("— tokens"), "{out}");
+    assert!(out.contains("— cost"), "{out}");
+    // The reply's time sits on its header line, just above the text.
+    let lines: Vec<&str> = out.lines().collect();
+    let at = lines.iter().position(|l| l.contains("message 0")).unwrap();
+    assert!(lines[at - 1].contains('—'), "{}", lines[at - 1]);
 }
 
 #[test]
@@ -1380,17 +1381,17 @@ fn session_info_shows_categories_dated_pricing_and_fee_exclusion_note() {
     assert_eq!(app.screen, agentscope::app::Screen::Session);
     let screen = draw(&app, 140, 60);
     for needle in [
-        "Input: 1,200",
-        "Cached input: —",
-        "Cache write: 300",
-        "Cache write 5m: 200",
-        "Cache write 1h: 100",
-        "Cache read: 40,000",
-        "Output: 5,555",
-        "Reasoning: 77",
-        "Total: 47,055",
-        "Pricing as of: 2026-10-01",
-        "Cost note: server-tool fees excluded",
+        "input            1.2k",
+        "cache write       300",
+        "5m              200",
+        "1h              100",
+        "cache read        40k",
+        "output           5.6k",
+        "reasoning          77",
+        "47k total",
+        "cached input",
+        "prices as of 2026-10-01",
+        "note: server-tool fees excluded",
         "Priced models: claude-sonnet-test",
         "web_search 3",
     ] {
@@ -1428,20 +1429,15 @@ fn session_info_renders_resolved_ambiguous_and_unresolved_lineage() {
             Some(SessionLink::Resolved(parent)),
             None,
             true,
-            [
-                "Parent: resolved — Codex parent-7",
-                "Fork: none",
-                "Sidechain: yes",
-            ],
+            vec!["parent      resolved — Codex parent-7", "sidechain   yes"],
         ),
         (
             Some(SessionLink::Ambiguous),
             Some(SessionLink::Unresolved("fork-9".into())),
             false,
-            [
-                "Parent: ambiguous",
-                "Fork: unresolved — id fork-9",
-                "Sidechain: no",
+            vec![
+                "parent      ambiguous",
+                "fork        unresolved — id fork-9",
             ],
         ),
     ];
@@ -1460,6 +1456,13 @@ fn session_info_renders_resolved_ambiguous_and_unresolved_lineage() {
         for needle in expected {
             assert!(screen.contains(needle), "missing {needle:?}:\n{screen}");
         }
+        // Absent lineage fields are not listed as rows.
+        assert_eq!(
+            screen.contains("fork  "),
+            screen.contains("fork-9"),
+            "{screen}"
+        );
+        assert_eq!(screen.contains("sidechain"), sidechain, "{screen}");
     }
 }
 
@@ -1559,21 +1562,19 @@ fn session_info_renders_measured_speed_context_timing_and_compaction_facts() {
     let screen = draw(&app, 160, 60);
     for needle in [
         "TIME & SPEED",
-        "Elapsed: Unknown",
-        "Active: 1s (incomplete coverage)",
-        "Model time: 1m 10s",
-        "Latest speed: 84.2 tok/s",
+        "elapsed time",
+        "active      1s (incomplete coverage)",
+        "model time  1m 10s",
+        "speed now   84.2 tok/s · TTFT 400 ms",
         "old gpt-5.0-codex · 1s ago",
-        "1,600 output in 19s · TTFT 400 ms",
-        "Weighted speed: 78.6 tok/s",
-        "across 5 of 8 requests",
-        "Context: 215,000 of 1.0M window",
+        "1,600 output in 19s",
+        "average     78.6 tok/s · 5 of 8 requests",
+        "215k of 1.0M · 21% of window",
         "epoch c2",
         "Compactions: 2 observed · cost Unknown · 1 unpriced",
-        "Latest compaction: ",
+        "latest ",
         "trigger auto",
         "removed 138,000",
-        "Cost by category: input Unknown",
     ] {
         assert!(screen.contains(needle), "missing {needle:?} in:\n{screen}");
     }
@@ -1588,12 +1589,9 @@ fn session_info_shows_unmeasured_facts_as_unknown_not_zero() {
     assert!(app.open_session_info());
     let screen = draw(&app, 160, 60);
     for needle in [
-        "Started: Unknown",
-        "Active: Unknown (incomplete coverage)",
-        "Latest speed: Unknown",
-        "Weighted speed: Unknown — no measured requests",
-        "Context: Unknown of Unknown window",
-        "Compactions: 0 observed (history incomplete) · cost Unknown · 0 unpriced",
+        "Not recorded: end time, elapsed time, active time, model time, speed, average speed",
+        "compacted   none seen · history incomplete",
+        "context window",
     ] {
         assert!(screen.contains(needle), "missing {needle:?} in:\n{screen}");
     }
@@ -1619,7 +1617,7 @@ fn session_info_never_shows_a_tiny_positive_cost_as_free() {
     assert!(app.open_session_info());
     let screen = draw(&app, 160, 60);
     for needle in [
-        "Cost by category: input <$0.0001",
+        "by category: input <$0.0001",
         "Compactions: 1 observed · cost <$0.0001 · 0 unpriced",
     ] {
         assert!(screen.contains(needle), "missing {needle:?} in:\n{screen}");
@@ -2094,14 +2092,14 @@ fn header_has_three_lines_with_dash_for_missing_cost() {
     assert!(lines[0].contains("[CDX] Inventory API"), "{:?}", lines[0]);
     assert!(lines[0].contains("quiet"), "{:?}", lines[0]);
     assert!(
-        lines[1].contains("project RipperGame")
-            && lines[1].contains("model gpt-5.1-codex")
+        lines[1].contains("RipperGame")
+            && lines[1].contains("gpt-5.1-codex")
             && lines[1].contains("2 loaded"),
         "{:?}",
         lines[1]
     );
     assert!(
-        lines[2].contains("tokens —") && lines[2].contains("cost —"),
+        lines[2].contains("— tokens") && lines[2].contains("— cost"),
         "{:?}",
         lines[2]
     );
@@ -2148,14 +2146,15 @@ fn renders_conversation_turns() {
     let prompt = position("Plan the refactor");
     let noise = position("· 2 auxiliary model calls (job-widget)");
     let reasoning = position("reasoning: reading the parser");
-    let tool = position("✓ shell cargo test");
+    let tool = position("✓ shell  cargo test");
     let reply = position("The refactor is done.");
     assert!(
         prompt < noise && noise < reasoning && reasoning < tool && tool < reply,
         "rows follow the conversation:\n{out}"
     );
 
-    let prompt_row = out.lines().nth(prompt).unwrap();
+    // A prompt's header line sits right above its text, under the same bar.
+    let prompt_row = out.lines().nth(prompt - 1).unwrap();
     assert!(prompt_row.starts_with("  ▌ You"), "{prompt_row:?}");
     let reasoning_row = out.lines().nth(reasoning).unwrap();
     assert!(
@@ -2164,7 +2163,7 @@ fn renders_conversation_turns() {
     );
     let tool_row = out.lines().nth(tool).unwrap();
     assert!(tool_row.starts_with("    ✓ shell"), "{tool_row:?}");
-    let reply_row = out.lines().nth(reply).unwrap();
+    let reply_row = out.lines().nth(reply - 1).unwrap();
     assert!(reply_row.starts_with("▌ ▌ Agent"), "{reply_row:?}");
     assert!(
         out.contains("recorded preview · v opens the source"),
@@ -2215,10 +2214,10 @@ fn tool_row_shows_summary_glyph_and_exit() {
 
     let failed_row = out
         .lines()
-        .find(|line| line.contains("shell cargo test --all"))
+        .find(|line| line.contains("shell  cargo test --all"))
         .unwrap();
     assert!(
-        failed_row.contains("✗ shell cargo test --all"),
+        failed_row.contains("✗ shell  cargo test --all"),
         "{failed_row:?}"
     );
     assert!(failed_row.contains("exit 1"), "{failed_row:?}");
@@ -2232,7 +2231,9 @@ fn tool_row_shows_summary_glyph_and_exit() {
         .find(|line| line.contains("read_file src/main.rs"))
         .unwrap();
     assert!(ok_row.contains("✓ read_file src/main.rs"), "{ok_row:?}");
-    assert!(ok_row.contains("exit 0"), "{ok_row:?}");
+    // A clean exit is not news: the duration is shown instead.
+    assert!(!ok_row.contains("exit 0"), "{ok_row:?}");
+    assert!(ok_row.contains("40ms"), "{ok_row:?}");
 }
 
 #[test]
@@ -2251,15 +2252,15 @@ fn reply_token_count_only_for_message_scope() {
     let mut app = app_with(summary(2));
     open(&mut app, page(vec![message, session], None, false));
     let out = draw(&app, 110, 30);
-    let message_row = out
-        .lines()
-        .find(|line| line.contains("message scoped"))
-        .unwrap();
+    // The token count sits on the reply's header line, above its text.
+    let lines: Vec<&str> = out.lines().collect();
+    let header_of = |needle: &str| {
+        let at = lines.iter().position(|line| line.contains(needle)).unwrap();
+        lines[at - 1]
+    };
+    let message_row = header_of("message scoped");
     assert!(message_row.contains("1.2k"), "{message_row:?}");
-    let session_row = out
-        .lines()
-        .find(|line| line.contains("session scoped"))
-        .unwrap();
+    let session_row = header_of("session scoped");
     assert!(
         !session_row.contains("5k"),
         "session scope belongs in totals only: {session_row:?}"
@@ -2691,12 +2692,19 @@ fn long_unbroken_reply_keeps_token_in_bounds() {
     let mut app = app_with(summary(1));
     open(&mut app, page(vec![reply], None, false));
     let out = draw(&app, 60, 20);
-    let line = out
-        .lines()
-        .find(|line| line.contains("aaaaaaaa"))
+    let lines: Vec<&str> = out.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains("aaaaaaaa"))
         .unwrap_or_else(|| panic!("the reply is drawn:\n{out}"));
     assert!(
-        line.contains("1.2k"),
-        "the first line keeps the token reservation: {line:?}"
+        lines[at - 1].contains("1.2k"),
+        "the header line keeps the token: {:?}",
+        lines[at - 1]
+    );
+    assert!(
+        lines[at].contains(&word),
+        "the word stays whole: {:?}",
+        lines[at]
     );
 }

@@ -5,17 +5,16 @@
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Padding, Paragraph, Widget, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, DetailsState};
 use crate::domain::{
-    AggregationClass, CompactionObservation, CompactionScope, CompactionSummary, ContextUsage,
-    CostBreakdown, CostEstimate, ModelDetail, MoneySource, OriginSurface, ProcessAssociation,
-    SessionLink, SessionMetadata, SessionSummary, TimedRate, Timestamp, TokenCategories,
-    UsageSummary,
+    AggregationClass, CompactionObservation, CompactionScope, CompactionSummary, CostBreakdown,
+    CostEstimate, ModelDetail, MoneySource, OriginSurface, ProcessAssociation, SessionLink,
+    SessionMetadata, SessionSummary, TimedRate, Timestamp, TokenCategories, UsageSummary,
 };
 use crate::ingest::text::display_safe;
 use crate::time::relative_label;
@@ -39,6 +38,8 @@ const MAX_DASHBOARD_ROWS: usize = 4_000;
 const PANEL_COUNT: usize = 6;
 /// Rows kept available for the quiet closing lines.
 const BOTTOM_RESERVE: usize = 16;
+/// Width of the quiet label column inside a panel.
+const LABEL_W: usize = 12;
 /// Header height, matching the inspector.
 const HEADER_LINES: u16 = 3;
 /// Quiet status sentence under the dashboard.
@@ -62,7 +63,8 @@ pub(super) fn link_text(link: &Option<SessionLink>) -> String {
     }
 }
 
-/// Per-leg dollars. A `None` leg is unknown or unused, never a free amount.
+/// Priced legs only. A `None` leg is unknown or unused, never a free amount;
+/// the unpriced sentence names the legs that recorded tokens without a price.
 fn legs_text(b: &CostBreakdown) -> String {
     [
         ("input", b.input),
@@ -74,12 +76,7 @@ fn legs_text(b: &CostBreakdown) -> String {
         ("reasoning", b.reasoning),
     ]
     .iter()
-    .map(|(label, usd)| {
-        usd.map_or_else(
-            || format!("{label} Unknown"),
-            |v| format!("{label} {}", money_text(v)),
-        )
-    })
+    .filter_map(|(label, usd)| usd.map(|v| format!("{label} {}", money_text(v))))
     .collect::<Vec<_>>()
     .join(" · ")
 }
@@ -306,23 +303,6 @@ pub fn speed_fact(s: &SessionSummary, hydrated: bool, now: Timestamp) -> Fact {
     }
 }
 
-/// Occupancy of the recorded window. Without both figures there is no percentage.
-pub(super) fn context_use(c: &ContextUsage) -> String {
-    match (c.used, c.capacity) {
-        (Some(used), Some(window)) if window > 0 => {
-            format!("{}% of window", used.saturating_mul(100) / window)
-        }
-        (Some(_), _) => "Unknown (window not recorded)".into(),
-        _ => "Unknown".into(),
-    }
-}
-
-fn model_label(model: &Option<ModelDetail>) -> String {
-    model
-        .as_ref()
-        .map_or_else(|| "Unknown".into(), |m| one_line(&m.id))
-}
-
 /// Recorded billing/routing route, never the harness. Unknown when the provider
 /// omitted it; it is not filled in from the harness or a price table.
 fn billing_provider(model: &Option<ModelDetail>) -> String {
@@ -439,7 +419,8 @@ impl Panel {
         Self { title, rows }
     }
 
-    /// The block border adds one row above and below the content.
+    /// The block border adds one row above and below the content; the padding
+    /// adds one column on each side.
     fn height(&self) -> u16 {
         u16::try_from(self.rows.len().saturating_add(2)).unwrap_or(u16::MAX)
     }
@@ -510,15 +491,25 @@ fn note(text: impl AsRef<str>, width: usize, palette: Palette) -> Line<'static> 
     Line::styled(fit(text.as_ref(), width), palette.quiet())
 }
 
+/// A quiet lowercase label in an aligned column, then the bold value.
 fn labeled(label: &str, value: impl Into<String>, width: usize, palette: Palette) -> Line<'static> {
-    styled_row(
-        vec![
-            (format!("{label}: "), palette.quiet()),
-            (value.into(), palette.value()),
-        ],
-        width,
-        palette,
-    )
+    labeled_parts(label, vec![(value.into(), palette.value())], width, palette)
+}
+
+/// [`labeled`] with a styled value made of several parts.
+fn labeled_parts(
+    label: &str,
+    value: Vec<(String, Style)>,
+    width: usize,
+    palette: Palette,
+) -> Line<'static> {
+    let label = label.to_lowercase();
+    let pad = LABEL_W
+        .saturating_sub(UnicodeWidthStr::width(label.as_str()))
+        .max(1);
+    let mut parts = vec![(format!("{label}{}", " ".repeat(pad)), palette.quiet())];
+    parts.extend(value);
+    styled_row(parts, width, palette)
 }
 
 fn loading_line(width: usize, palette: Palette) -> Line<'static> {
@@ -677,25 +668,21 @@ fn tokens_panel(
         return Panel::new("TOKENS", rows);
     }
     let Some(usage) = usage else {
-        rows.push(note("Usage not recorded.", width, palette));
+        rows.push(note("not recorded", width, palette));
         return Panel::new("TOKENS", rows);
     };
-    let total = match (usage.total, usage.class) {
-        (Some(n), AggregationClass::Partial) => format!("{}+", grouped(n)),
-        (Some(n), _) => grouped(n),
-        (None, _) => ABSENT.into(),
-    };
+    let fact = tokens_fact(Some(usage), true);
     rows.push(styled_row(
         vec![
-            ("Total: ".into(), palette.quiet()),
             (
-                total,
+                fact.head.clone(),
                 if usage.total.is_some() {
                     palette.value()
                 } else {
                     palette.quiet()
                 },
             ),
+            (" total".into(), palette.quiet()),
             (format!(" · {}", class_name(usage.class)), palette.quiet()),
         ],
         width,
@@ -704,35 +691,53 @@ fn tokens_panel(
     if has_categories(&usage.categories) {
         rows.push(token_bar(&usage.categories, width, palette));
     }
+    // Recorded non-zero categories, largest first; absent ones are left to
+    // the closing "Not recorded" line.
     let c = &usage.categories;
-    for (label, value) in [
-        ("Input", c.input),
-        ("Cached input", c.cached_input),
-        ("Cache write", c.cache_write),
-        ("  Cache write 5m", c.cache_write_5m),
-        ("  Cache write 1h", c.cache_write_1h),
-        ("Cache read", c.cache_read),
-        ("Output", c.output),
-        ("Reasoning", c.reasoning),
-    ] {
-        let shown = value.map_or_else(|| ABSENT.to_string(), grouped);
+    let mut recorded: Vec<(&str, u64, Option<Color>)> = [
+        ("cache read", c.cache_read, Some(Color::Blue)),
+        ("input", c.input, Some(Color::Green)),
+        ("cached input", c.cached_input, None),
+        ("output", c.output, Some(Color::Yellow)),
+        ("cache write", c.cache_write, Some(Color::Magenta)),
+        ("reasoning", c.reasoning, None),
+    ]
+    .into_iter()
+    .filter_map(|(label, value, color)| value.filter(|v| *v > 0).map(|v| (label, v, color)))
+    .collect();
+    recorded.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    for (label, value, color) in recorded {
+        let swatch = match color {
+            Some(color) if !palette.is_no_color() => ("■ ".to_string(), Style::default().fg(color)),
+            _ => ("  ".to_string(), Style::default()),
+        };
         let mut parts = vec![
-            (format!("{label}: "), palette.quiet()),
-            (
-                shown,
-                if value.is_some() {
-                    palette.value()
-                } else {
-                    palette.quiet()
-                },
-            ),
+            swatch,
+            (format!("{label:<13}"), palette.quiet()),
+            (format!("{:>8}", tokens_text(Some(value))), palette.value()),
         ];
-        if let (Some(value), Some(total)) = (value, usage.total)
-            && total > 0
-        {
-            parts.push((format!("  {}", percent_text(value, total)), palette.quiet()));
+        if let Some(total) = usage.total.filter(|total| *total > 0) {
+            parts.push((
+                format!("  {:>4}", percent_text(value, total)),
+                palette.quiet(),
+            ));
         }
         rows.push(styled_row(parts, width, palette));
+        // The cache-write split stays under its parent when recorded.
+        if label == "cache write" {
+            for (split, value) in [("5m", c.cache_write_5m), ("1h", c.cache_write_1h)] {
+                if let Some(value) = value {
+                    rows.push(styled_row(
+                        vec![
+                            (format!("    {split:<11}"), palette.quiet()),
+                            (format!("{:>8}", tokens_text(Some(value))), palette.quiet()),
+                        ],
+                        width,
+                        palette,
+                    ));
+                }
+            }
+        }
     }
     Panel::new("TOKENS", rows)
 }
@@ -791,7 +796,7 @@ fn server_tool_rows(s: &SessionSummary, width: usize, palette: Palette) -> Vec<L
     };
     let mut rows = quiet_rows(
         &format!(
-            "Server tools: web_search {} · web_fetch {}",
+            "server tools: web_search {} · web_fetch {}",
             tools.web_search, tools.web_fetch
         ),
         width,
@@ -809,7 +814,7 @@ fn server_tool_rows(s: &SessionSummary, width: usize, palette: Palette) -> Vec<L
 
 fn billing_provider_row(s: &SessionSummary, width: usize, palette: Palette) -> Line<'static> {
     labeled(
-        "Billing provider",
+        "billed via",
         billing_provider(&s.meta.model),
         width,
         palette,
@@ -829,62 +834,78 @@ fn cost_panel(
         return Panel::new("COST", rows);
     }
     let Some(usage) = usage else {
-        rows.push(note(
-            "Usage not recorded; no cost estimate.",
-            width,
-            palette,
-        ));
+        rows.push(note("usage not recorded; no cost estimate", width, palette));
         rows.extend(server_tool_rows(s, width, palette));
         rows.push(billing_provider_row(s, width, palette));
         return Panel::new("COST", rows);
     };
     let fact = cost_fact(Some(usage), true);
     if fact.head == ABSENT {
-        rows.push(note("Cost: not recorded.", width, palette));
+        rows.push(note("not recorded", width, palette));
     } else {
-        let mut parts = vec![
-            ("Cost: ".into(), palette.quiet()),
-            (fact.head.clone(), palette.value()),
-        ];
-        if !fact.sub.is_empty() {
-            parts.push((" · ".into(), palette.quiet()));
-            parts.push((fact.sub.clone(), palette.quiet()));
-        }
-        rows.push(styled_row(parts, width, palette));
-    }
-    if usage.cost.usd.is_none() && usage.cost.known_subtotal > 0.0 {
-        rows.extend(quiet_rows(
-            &format!(
-                "Known subtotal: {} (incomplete, not a total)",
-                money_text(usage.cost.known_subtotal)
-            ),
+        let partial = usage.cost.usd.is_none() && usage.cost.known_subtotal > 0.0;
+        let sub = if partial {
+            "known so far, not a total".to_string()
+        } else {
+            fact.sub.clone()
+        };
+        rows.push(styled_row(
+            vec![
+                (fact.head.clone(), palette.value()),
+                (format!("  {sub}"), palette.quiet()),
+            ],
             width,
             palette,
         ));
-        let missing = missing_legs(usage);
-        if !missing.is_empty() {
-            rows.extend(quiet_rows(
-                &format!("Unpriced coverage: {}", missing.join(", ")),
-                width,
-                palette,
-            ));
-        }
     }
-    rows.extend(quiet_facts(
-        &format!("Cost by category: {}", legs_text(&usage.cost.breakdown)),
-        width,
-        palette,
-    ));
-    let as_of = usage
-        .cost
-        .as_of
-        .as_deref()
-        .map_or_else(|| "not recorded".into(), one_line);
-    rows.push(note(format!("Pricing as of: {as_of}"), width, palette));
+    let cov = &usage.coverage;
+    if cov.observed_requests > 0 {
+        let cells = width.saturating_sub(LABEL_W + 12).clamp(4, 20);
+        rows.push(labeled_parts(
+            "priced",
+            vec![
+                (
+                    priced_bar(cov.priced_requests, cov.observed_requests, cells),
+                    palette.value(),
+                ),
+                (
+                    format!("  {}/{}", cov.priced_requests, cov.observed_requests),
+                    palette.value(),
+                ),
+            ],
+            width,
+            palette,
+        ));
+    } else {
+        rows.push(labeled_parts(
+            "priced",
+            vec![("no requests observed".into(), palette.quiet())],
+            width,
+            palette,
+        ));
+    }
+    if let Some(sentence) = unpriced_sentence(usage) {
+        rows.extend(quiet_rows(&sentence, width, palette));
+    }
+    let known_legs = legs_text(&usage.cost.breakdown);
+    if !known_legs.is_empty() {
+        rows.extend(quiet_facts(
+            &format!("by category: {known_legs}"),
+            width,
+            palette,
+        ));
+    }
+    if let Some(as_of) = usage.cost.as_of.as_deref() {
+        rows.push(note(
+            format!("prices as of {}", one_line(as_of)),
+            width,
+            palette,
+        ));
+    }
     if usage.cost.class == AggregationClass::Estimated {
         rows.extend(quiet_rows(
             &format!(
-                "Estimate basis: {}",
+                "estimate basis: {}",
                 estimate_basis(&usage.cost).unwrap_or("not recorded")
             ),
             width,
@@ -893,7 +914,7 @@ fn cost_panel(
     }
     if let Some(note_text) = &usage.cost.note {
         rows.extend(quiet_rows(
-            &format!("Cost note: {}", display_safe(note_text)),
+            &format!("note: {}", display_safe(note_text)),
             width,
             palette,
         ));
@@ -903,59 +924,12 @@ fn cost_panel(
     {
         rows.extend(quiet_rows(
             &format!(
-                "Reported by source: {} (not an API-equivalent amount)",
+                "reported by source: {} (not an API-equivalent amount)",
                 money_text(reported)
             ),
             width,
             palette,
         ));
-    }
-    let cov = &usage.coverage;
-    if cov.observed_requests > 0 {
-        let incomplete = cov.priced_requests < cov.observed_requests;
-        let label = if incomplete {
-            format!(
-                "{} of {} priced",
-                cov.priced_requests, cov.observed_requests
-            )
-        } else {
-            format!("all {} priced", cov.observed_requests)
-        };
-        let extra = if incomplete { " · incomplete" } else { "" };
-        let prefix = "Priced requests: ";
-        let required = UnicodeWidthStr::width(prefix)
-            + UnicodeWidthStr::width(label.as_str())
-            + UnicodeWidthStr::width(extra)
-            + 6;
-        if required <= width {
-            let bar = priced_bar(cov.priced_requests, cov.observed_requests, 10);
-            rows.push(styled_row(
-                vec![
-                    (prefix.into(), palette.quiet()),
-                    (bar, palette.value()),
-                    (format!("  {label}{extra}"), palette.value()),
-                ],
-                width,
-                palette,
-            ));
-        } else {
-            let bar = priced_bar(cov.priced_requests, cov.observed_requests, 4);
-            rows.push(styled_row(
-                vec![(prefix.into(), palette.quiet()), (bar, palette.value())],
-                width,
-                palette,
-            ));
-            rows.extend(quiet_rows(&format!("  {label}{extra}"), width, palette));
-        }
-    } else {
-        rows.push(note(
-            "Priced requests: no requests observed",
-            width,
-            palette,
-        ));
-    }
-    if let Some(sentence) = unpriced_sentence(usage) {
-        rows.extend(quiet_rows(&sentence, width, palette));
     }
     rows.extend(server_tool_rows(s, width, palette));
     rows.push(billing_provider_row(s, width, palette));
@@ -974,74 +948,88 @@ fn time_speed_panel(
         rows.push(loading_line(width, palette));
         return Panel::new("TIME & SPEED", rows);
     }
-    rows.push(labeled("Model", model_label(&s.meta.model), width, palette));
-    let effort = s
-        .meta
-        .model
-        .as_ref()
-        .and_then(|m| m.effort.as_deref())
-        .map_or_else(|| "Unknown".into(), one_line);
-    rows.push(labeled("Effort", effort, width, palette));
+    // Model and thinking level are in the header; unrecorded figures are
+    // listed once in the closing "Not recorded" line.
     if let Some(variant) = s.meta.model.as_ref().and_then(|m| m.variant.as_deref()) {
-        rows.push(labeled("Variant", one_line(variant), width, palette));
+        rows.push(labeled("variant", one_line(variant), width, palette));
     }
     let t = &s.metrics.timing;
-    rows.push(labeled("Started", when(t.started_at), width, palette));
-    if t.ended_at.is_some() {
-        rows.push(labeled("Ended", when(t.ended_at), width, palette));
-    }
-    rows.push(labeled(
-        "Elapsed",
-        t.elapsed_ms.map_or_else(|| "Unknown".into(), span_text),
-        width,
-        palette,
-    ));
-    let active = t.active_ms.map_or_else(|| "Unknown".into(), span_text);
-    let mut active_parts = vec![
-        ("Active: ".into(), palette.quiet()),
-        (
-            active,
-            if t.active_ms.is_some() {
-                palette.value()
-            } else {
-                palette.quiet()
-            },
-        ),
-    ];
-    let active_note = coverage_note(t.active_complete);
-    if !active_note.is_empty() {
-        active_parts.push((active_note.into(), palette.quiet()));
-    }
-    rows.push(styled_row(active_parts, width, palette));
-    rows.push(labeled(
-        "Model time",
-        measured_span(t.model_ms),
-        width,
-        palette,
-    ));
-
-    let speed = speed_fact(s, hydrated, now);
-    if speed.head == ABSENT {
-        rows.push(labeled("Latest speed", "Unknown", width, palette));
-    } else {
-        rows.push(styled_row(
+    if let Some(started) = t.started_at.or(s.meta.created_at) {
+        rows.push(labeled_parts(
+            "started",
             vec![
-                ("Latest speed: ".into(), palette.quiet()),
-                (format!("{} tok/s", speed.head), palette.value()),
+                (crate::time::format_local_short(started), palette.value()),
+                (
+                    format!(" ({} ago)", relative_label(started, now)),
+                    palette.quiet(),
+                ),
             ],
             width,
             palette,
         ));
+    }
+    if let Some(ended) = t.ended_at {
+        rows.push(labeled(
+            "ended",
+            crate::time::format_local_short(ended),
+            width,
+            palette,
+        ));
+    }
+    if let Some(elapsed) = t.elapsed_ms {
+        rows.push(labeled("elapsed", span_text(elapsed), width, palette));
+    }
+    if let Some(active) = t.active_ms {
+        rows.push(labeled_parts(
+            "active",
+            vec![
+                (span_text(active), palette.value()),
+                (coverage_note(t.active_complete).into(), palette.quiet()),
+            ],
+            width,
+            palette,
+        ));
+    }
+    if let Some(model_ms) = t.model_ms.filter(|v| v.is_finite() && *v >= 0.0) {
+        rows.push(labeled(
+            "model time",
+            measured_span(Some(model_ms)),
+            width,
+            palette,
+        ));
+    }
+
+    let speed = speed_fact(s, hydrated, now);
+    if speed.head != ABSENT {
+        let mut value = vec![(
+            format!("{} tok/s", speed.head),
+            if speed.quiet {
+                palette.quiet()
+            } else {
+                palette.value()
+            },
+        )];
+        if let Some(ttft) = s.metrics.speed.latest.as_ref().and_then(|l| l.ttft_ms) {
+            value.push((
+                format!(" · TTFT {}", measured_span(Some(ttft))),
+                palette.quiet(),
+            ));
+        }
+        rows.push(labeled_parts("speed now", value, width, palette));
         if !speed.sub.is_empty() {
-            rows.push(note(format!("  {}", speed.sub), width, palette));
+            rows.push(note(
+                format!("{}{}", " ".repeat(LABEL_W), speed.sub),
+                width,
+                palette,
+            ));
         }
         if let Some(latest) = &s.metrics.speed.latest {
-            rows.extend(quiet_rows(
-                &format!(
-                    "  {} output in {} · TTFT {}",
+            rows.push(note(
+                format!(
+                    "{}{} output in {}",
+                    " ".repeat(LABEL_W),
                     grouped(latest.output_tokens),
                     measured_span(Some(latest.duration_ms)),
-                    measured_span(latest.ttft_ms)
                 ),
                 width,
                 palette,
@@ -1049,26 +1037,27 @@ fn time_speed_panel(
         }
     }
     let sp = &s.metrics.speed;
-    if sp.measured_requests == 0 {
-        rows.push(note(
-            "Weighted speed: Unknown — no measured requests",
+    if sp.measured_requests > 0 {
+        rows.push(labeled_parts(
+            "average",
+            vec![
+                (rate_text(sp.weighted_tokens_per_second), palette.value()),
+                (
+                    format!(
+                        " · {} of {} requests{}",
+                        sp.measured_requests,
+                        sp.total_requests,
+                        if sp.complete { "" } else { ", partial" }
+                    ),
+                    palette.quiet(),
+                ),
+            ],
             width,
             palette,
         ));
-    } else {
-        rows.extend(quiet_rows(
-            &format!(
-                "Weighted speed: {} — {} output over {} across {} of {} requests{}",
-                rate_text(sp.weighted_tokens_per_second),
-                grouped(sp.measured_output),
-                measured_span(Some(sp.measured_duration_ms)),
-                sp.measured_requests,
-                sp.total_requests,
-                coverage_note(sp.complete),
-            ),
-            width,
-            palette,
-        ));
+    }
+    if rows.is_empty() {
+        rows.push(note("not recorded", width, palette));
     }
     Panel::new("TIME & SPEED", rows)
 }
@@ -1083,90 +1072,95 @@ fn context_panel(
     let mut rows = Vec::new();
     let mut budget = RowBudget::new(limit);
     let c = &s.metrics.context;
-    let used = c.used.map_or_else(|| "Unknown".into(), grouped);
-    let window = c.capacity.map_or_else(
-        || "Unknown window".into(),
-        |w| format!("{} window", tokens_text(Some(w))),
-    );
+    let in_use = match (c.used, c.capacity) {
+        (Some(used), Some(window)) if window > 0 => vec![
+            (tokens_text(Some(used)), palette.value()),
+            (
+                format!(
+                    " of {} · {}% of window",
+                    tokens_text(Some(window)),
+                    used.saturating_mul(100) / window
+                ),
+                palette.quiet(),
+            ),
+        ],
+        (Some(used), _) => vec![
+            (tokens_text(Some(used)), palette.value()),
+            (" in use · window not recorded".into(), palette.quiet()),
+        ],
+        (None, Some(window)) => vec![
+            (tokens_text(Some(window)), palette.value()),
+            (" window · use not recorded".into(), palette.quiet()),
+        ],
+        (None, None) => vec![("not recorded".into(), palette.quiet())],
+    };
+    budget.push_lazy(&mut rows, || styled_row(in_use, width, palette));
     let mut suffix = Vec::new();
     if c.class != AggregationClass::Unknown {
         suffix.push(class_name(c.class).to_string());
     }
-    if c.recorded_at.is_some() {
-        suffix.push(format!("recorded {}", when(c.recorded_at)));
+    if let Some(at) = c.recorded_at {
+        suffix.push(format!("recorded {}", crate::time::format_local_short(at)));
+    }
+    if let Some(model) = c.model.as_ref() {
+        suffix.push(one_line(&model.id));
     }
     if let Some(epoch) = c.compaction_epoch.as_deref() {
         suffix.push(format!("epoch {}", one_line(epoch)));
     }
-    budget.push_lazy(&mut rows, || {
-        styled_row(
-            vec![
-                ("Context: ".into(), palette.quiet()),
-                (
-                    format!("{used} of {window}"),
-                    if c.used.is_some() || c.capacity.is_some() {
-                        palette.value()
-                    } else {
-                        palette.quiet()
-                    },
-                ),
-            ],
-            width,
-            palette,
-        )
-    });
     if !suffix.is_empty() {
-        let lines = quiet_rows_limit(
-            &format!("  {}", suffix.join(" · ")),
-            width,
-            palette,
-            budget.remaining(),
-        );
+        let lines = quiet_facts_limit(&suffix.join(" · "), width, palette, budget.remaining());
         budget.extend(&mut rows, lines);
     }
+    let cm = &s.metrics.compactions;
     budget.push_lazy(&mut rows, || {
-        labeled("Context use", context_use(c), width, palette)
+        let count = match (cm.observed, cm.history_complete) {
+            (0, true) => "none".to_string(),
+            (n, true) => format!("{n}×"),
+            (0, false) => "none seen".to_string(),
+            (n, false) => format!("{n}×+"),
+        };
+        let mut value = vec![(count, palette.value())];
+        if !cm.history_complete {
+            value.push((" · history incomplete".into(), palette.quiet()));
+        }
+        labeled_parts("compacted", value, width, palette)
     });
-    budget.push_lazy(&mut rows, || {
-        labeled("Context model", model_label(&c.model), width, palette)
-    });
-    let lines = quiet_facts_limit(
-        &compactions_line(&s.metrics.compactions),
-        width,
-        palette,
-        budget.remaining(),
-    );
-    budget.extend(&mut rows, lines);
-    if let Some(latest) = &s.metrics.compactions.latest {
+    if cm.known_cost_usd.is_some() || cm.unpriced > 0 {
+        let lines = quiet_facts_limit(&compactions_line(cm), width, palette, budget.remaining());
+        budget.extend(&mut rows, lines);
+    }
+    if let Some(latest) = &cm.latest {
         let lines = quiet_rows_limit(
-            &format!("Latest compaction: {}", when(latest.timestamp)),
+            &format!(
+                "latest {} · {}",
+                latest
+                    .timestamp
+                    .map_or_else(|| ABSENT.to_string(), crate::time::format_local_short),
+                compaction_reduction(latest)
+            ),
             width,
             palette,
             budget.remaining(),
         );
         budget.extend(&mut rows, lines);
-        budget.push_lazy(&mut rows, || {
-            let method = latest
-                .method
-                .as_deref()
-                .map_or_else(|| "Unknown".into(), one_line);
-            let trigger = latest
-                .trigger
-                .as_deref()
-                .map_or_else(|| "Unknown".into(), one_line);
-            note(
-                format!("  method {method} · trigger {trigger}"),
-                width,
-                palette,
-            )
-        });
-        let lines = quiet_rows_limit(
-            &format!("  {}", compaction_reduction(latest)),
-            width,
-            palette,
-            budget.remaining(),
-        );
-        budget.extend(&mut rows, lines);
+        if latest.method.is_some() || latest.trigger.is_some() {
+            budget.push_lazy(&mut rows, || {
+                let method = latest
+                    .method
+                    .as_deref()
+                    .map_or_else(|| ABSENT.into(), one_line);
+                let trigger = latest
+                    .trigger
+                    .as_deref()
+                    .map_or_else(|| ABSENT.into(), one_line);
+                note(
+                    format!("method {method} · trigger {trigger}"),
+                    width,
+                    palette,
+                )
+            });
+        }
     }
     if let Some(view) = page {
         let state = view.state;
@@ -1297,47 +1291,37 @@ fn family_panel(
     let mut rows = Vec::new();
     let mut budget = RowBudget::new(limit);
     budget.push_lazy(&mut rows, || {
-        labeled("Parent", link_text(parent), width, palette)
+        labeled("parent", link_text(parent), width, palette)
     });
-    budget.push_lazy(&mut rows, || {
-        labeled("Fork", link_text(fork), width, palette)
-    });
-    budget.push_lazy(&mut rows, || {
-        labeled(
-            "Agent",
-            s.meta
-                .lineage
-                .agent_type
-                .as_deref()
-                .map_or_else(|| "Unknown".into(), one_line),
-            width,
-            palette,
-        )
-    });
-    budget.push_lazy(&mut rows, || {
-        labeled(
-            "Sidechain",
-            if s.meta.lineage.sidechain {
-                "yes"
-            } else {
-                "no"
-            },
-            width,
-            palette,
-        )
-    });
+    if fork.is_some() {
+        budget.push_lazy(&mut rows, || {
+            labeled("fork", link_text(fork), width, palette)
+        });
+    }
+    if let Some(agent) = s.meta.lineage.agent_type.as_deref() {
+        budget.push_lazy(&mut rows, || {
+            labeled("agent", one_line(agent), width, palette)
+        });
+    }
+    if s.meta.lineage.sidechain {
+        budget.push_lazy(&mut rows, || labeled("sidechain", "yes", width, palette));
+    }
     if !s.meta.origins.is_empty() {
         budget.push_lazy(&mut rows, || {
-            labeled("Origin", origin_label(&s.meta), width, palette)
+            labeled("origin", origin_label(&s.meta), width, palette)
         });
     }
     match children {
-        None => budget.push_lazy(&mut rows, || note("Children: not loaded", width, palette)),
+        None => budget.push_lazy(&mut rows, || {
+            labeled("children", "not loaded", width, palette)
+        }),
         Some(list) if list.metadata.is_empty() => {
-            budget.push_lazy(&mut rows, || note("Children: none", width, palette));
+            budget.push_lazy(&mut rows, || labeled("children", "none", width, palette));
         }
         Some(list) => {
-            budget.push_lazy(&mut rows, || note("Children:", width, palette));
+            budget.push_lazy(&mut rows, || {
+                labeled("children", list.metadata.len().to_string(), width, palette)
+            });
             let count = list.metadata.len();
             for (index, child) in list.metadata.iter().enumerate() {
                 if budget.remaining() == 0 {
@@ -1345,12 +1329,15 @@ fn family_panel(
                 }
                 let branch = if index + 1 == count { "└" } else { "├" };
                 budget.push_lazy(&mut rows, || {
-                    note(
-                        format!(
-                            "  {branch} {} {}",
-                            harness_name(child.key.harness),
-                            super::widgets::display_title(child)
-                        ),
+                    styled_row(
+                        vec![
+                            (format!("{branch} "), palette.quiet()),
+                            (super::widgets::display_title(child), Style::default()),
+                            (
+                                format!("  {}", harness_name(child.key.harness)),
+                                palette.quiet(),
+                            ),
+                        ],
                         width,
                         palette,
                     )
@@ -1358,7 +1345,7 @@ fn family_panel(
             }
             if list.next.is_some() {
                 budget.push_lazy(&mut rows, || {
-                    note("  └ more children not loaded", width, palette)
+                    note("└ more children not loaded", width, palette)
                 });
             }
         }
@@ -1367,13 +1354,13 @@ fn family_panel(
 }
 
 fn process_panel(s: &SessionSummary, width: usize, palette: Palette) -> Panel {
-    let mut rows = vec![labeled("Process", process_line(&s.process), width, palette)];
+    let mut rows = vec![labeled("process", process_line(&s.process), width, palette)];
     if let ProcessAssociation::Matched {
         started_at: Some(at),
         ..
     } = s.process
     {
-        rows.push(labeled("Process start", when(Some(at)), width, palette));
+        rows.push(labeled("started", when(Some(at)), width, palette));
     }
     Panel::new("PROCESS", rows)
 }
@@ -1381,11 +1368,37 @@ fn process_panel(s: &SessionSummary, width: usize, palette: Palette) -> Panel {
 /// Fields the panels expose but the source did not record, in a fixed order.
 fn not_recorded(s: &SessionSummary) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if s.metrics.timing.ended_at.is_none() {
+    let t = &s.metrics.timing;
+    if t.started_at.or(s.meta.created_at).is_none() {
+        out.push("start time");
+    }
+    if t.ended_at.is_none() {
         out.push("end time");
+    }
+    if t.elapsed_ms.is_none() {
+        out.push("elapsed time");
+    }
+    if t.active_ms.is_none() {
+        out.push("active time");
+    }
+    if t.model_ms.is_none() {
+        out.push("model time");
+    }
+    if s.metrics.speed.latest.is_none() {
+        out.push("speed");
+    }
+    if s.metrics.speed.measured_requests == 0 {
+        out.push("average speed");
     }
     if s.meta.origins.is_empty() {
         out.push("origin");
+    }
+    if s.meta
+        .model
+        .as_ref()
+        .is_none_or(|m| m.effort.is_none() && m.configured_effort.is_none())
+    {
+        out.push("thinking level");
     }
     if s.meta
         .model
@@ -1401,12 +1414,23 @@ fn not_recorded(s: &SessionSummary) -> Vec<&'static str> {
     if s.metrics.compactions.known_cost_usd.is_none() {
         out.push("compaction cost");
     }
-    if s.usage
-        .as_ref()
-        .and_then(|u| u.categories.reasoning)
-        .is_none()
-    {
-        out.push("reasoning tokens");
+    // Token categories the panel leaves out because the source omitted them.
+    if s.usage.is_none() {
+        out.push("token usage");
+    }
+    if let Some(c) = s.usage.as_ref().map(|u| &u.categories) {
+        for (label, value) in [
+            ("input tokens", c.input),
+            ("cached input tokens", c.cached_input),
+            ("cache write tokens", c.cache_write),
+            ("cache read tokens", c.cache_read),
+            ("output tokens", c.output),
+            ("reasoning tokens", c.reasoning),
+        ] {
+            if value.is_none() {
+                out.push(label);
+            }
+        }
     }
     if s.metrics.context.capacity.is_none() {
         out.push("context window");
@@ -1489,7 +1513,11 @@ fn bottom_lines(
 fn draw_panel(buf: &mut Buffer, rect: Rect, panel: &Panel, palette: Palette) {
     let block = Block::bordered()
         .border_style(palette.dim())
-        .title(Line::styled(panel.title, palette.section()));
+        .padding(Padding::horizontal(1))
+        .title(Line::styled(
+            format!(" {} ", panel.title),
+            palette.section(),
+        ));
     let inner = block.inner(rect);
     block.render(rect, buf);
     Paragraph::new(panel.rows.clone()).render(inner, buf);
@@ -1515,8 +1543,8 @@ fn render_dashboard(
         width_u16
     };
     let right_w = width_u16.saturating_sub(left_w + COLUMN_GAP as u16);
-    let left_inner = left_w.saturating_sub(2) as usize;
-    let right_inner = right_w.saturating_sub(2) as usize;
+    let left_inner = left_w.saturating_sub(4) as usize;
+    let right_inner = right_w.saturating_sub(4) as usize;
 
     let mut placements: Vec<(Rect, Panel)> = Vec::new();
     let mut y = 0u16;
@@ -1551,12 +1579,12 @@ fn render_dashboard(
         let mut context = context_panel(s, page, right_inner, palette, limit);
         budget.consume(&mut context.rows);
         let pairs = [(tokens, cost), (time, context), (family, process)];
+        // Side-by-side panels share one height so the grid reads as rows.
         for (left, right) in pairs {
-            let left_h = left.height();
-            let right_h = right.height();
-            placements.push((Rect::new(0, y, left_w, left_h), left));
-            placements.push((Rect::new(right_x, y, right_w, right_h), right));
-            y = y.saturating_add(left_h.max(right_h));
+            let height = left.height().max(right.height());
+            placements.push((Rect::new(0, y, left_w, height), left));
+            placements.push((Rect::new(right_x, y, right_w, height), right));
+            y = y.saturating_add(height);
         }
     } else {
         let mut tokens = tokens_panel(s.usage.as_ref(), hydrated, left_inner, palette);

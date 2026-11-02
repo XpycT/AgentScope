@@ -138,19 +138,19 @@ Secondary views: filters, usage details, source/provenance information, and appl
 
 The roster must support: provider, display name, project, last activity, current/last model, state plus confidence, age, token totals (if available), and estimated cost (if configured). It is grouped by project, always: a bold group heading shows the loaded member totals (`N sessions · tokens · cost`), and sessions without a project go into a "No project" group. Lineage wins: a child renders under its parent, in the parent's group. The top line shows the loaded session count, non-zero counts by state, live state, the sort mode, and any active filters; per-provider counts live in the filter overlay.
 
-Each session is two lines. The primary line has the status glyph, fold marker and bold display title, with right-aligned `STATUS`, `SPEED`, `TOKENS` and `COST` columns under one header row. The quiet second line has the agent tag (`CDX`, `CLD`, `OC`, `OMP`, `HRM`, `PI`; bracketed like `[OMP]` when color is unavailable), model, thinking level, and billing provider. Children are folded by default (`▸ +N`) and expand into tree-prefixed rows under their parent. Narrow terminals drop columns from the right in the fixed order `COST`, `SPEED`, `TOKENS`; `STATUS` always stays, and there is no horizontal column scrolling.
+Each session is two lines. The primary line has the status glyph, fold marker and bold display title, with right-aligned `STATUS`, `SPEED`, `TOKENS` and `COST` columns under one header row. The quiet second line has the agent tag (`CDX`, `CLD`, `OC`, `OMP`, `HRM`, `PI`; bracketed like `[OMP]` when color is unavailable), model, thinking level, and billing provider. Children are folded by default (`▸ Title +N`) and expand into tree-prefixed rows under their parent. Narrow terminals drop columns from the right in the fixed order `COST`, `SPEED`, `TOKENS`; `STATUS` always stays, and there is no horizontal column scrolling.
 
 ```text
 AgentScope · 24 sessions · Live: on · ● 2 active · ○ 5 recent · ! 12 quiet · ✓ 5 complete · sort: last activity
 ─────────────────────────────────────────────────────────────────────────────────────────────
                                                             STATUS    SPEED     TOKENS       COST
 RipperGame  8 sessions · 1.2M+ · ~$3.40
-●  ▾ Inventory API                                        active 12s     84.2     91.2k      ~$0.42
-   CDX  gpt-6.1-sol  high  openai
-   └ ✓ Subagent: tests                                   complete 2m        —       8.1k      ~$0.03
-      CDX  gpt-6.1-sol  medium  openai
-!  ▸ +2 Scanner refactor                                      quiet 9m        —      73.0k      ~$0.23
-   CLD  claude-sonnet-5-5  medium  anthropic
+▌ ● ▾ Inventory API                                      active 12s     84.2     91.2k      ~$0.42
+▌      CDX  gpt-6.1-sol · high · openai
+    └ ✓   Subagent: tests                                complete 2m        —       8.1k      ~$0.03
+           CDX  gpt-6.1-sol · medium · openai
+  !   ▸ Scanner refactor +2                                  quiet 9m        —      73.0k      ~$0.23
+       CLD  claude-sonnet-5-5 · medium · anthropic
 ─────────────────────────────────────────────────────────────────────────────────────────────
 Enter open   ←/→ fold   Tab inspector   / search   f filter   s sort   r refresh   m more   p procs   ? help   q quit
 ```
