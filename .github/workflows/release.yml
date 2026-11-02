@@ -1,0 +1,241 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Hex-encoded 32-byte zipsign verifying key that future builds will use to
+  # check update archives.
+  AGENTSCOPE_UPDATE_PUBLIC_KEY: ${{ vars.AGENTSCOPE_UPDATE_PUBLIC_KEY }}
+
+jobs:
+  update-key:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate release tag and verification key
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PYKEY'
+          import os, re
+          from pathlib import Path
+          version = re.search(r'(?m)^version\s*=\s*"([^"]+)"', Path('Cargo.toml').read_text()).group(1)
+          if os.environ['RELEASE_TAG'] != 'v' + version:
+              raise SystemExit('Release tag must match Cargo.toml package version')
+          key = os.environ.get('AGENTSCOPE_UPDATE_PUBLIC_KEY', '').strip()
+          if len(key) != 64 or any(c not in '0123456789abcdefABCDEF' for c in key):
+              raise SystemExit('Set AGENTSCOPE_UPDATE_PUBLIC_KEY to the 64-character public key before releasing')
+          PYKEY
+
+  macos:
+    needs: update-key
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          components: rustfmt
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ env.TARGET }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            release-${{ env.TARGET }}-${{ hashFiles('Cargo.lock') }}-
+            release-${{ env.TARGET }}-
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          test -x target/release/agentscope
+          ./target/release/agentscope --version
+          mkdir -p dist/stage
+          cp target/release/agentscope README.md LICENSE dist/stage/
+          tar -C dist/stage -czf "dist/agentscope-$TARGET.tar.gz" agentscope README.md LICENSE
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agentscope-aarch64-apple-darwin
+          path: dist/agentscope-aarch64-apple-darwin.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    needs: update-key
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      # Static CRT so the binary runs without the VC++ redistributable.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ env.TARGET }}-static-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            release-${{ env.TARGET }}-static-${{ hashFiles('Cargo.lock') }}-
+            release-${{ env.TARGET }}-static-
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          if (!(Test-Path target/release/agentscope.exe)) { throw 'Executable not found' }
+          ./target/release/agentscope.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'Executable failed to run' }
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Compress-Archive -Path target/release/agentscope.exe, README.md, LICENSE -DestinationPath "dist/agentscope-$env:TARGET.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agentscope-x86_64-pc-windows-msvc
+          path: dist/agentscope-x86_64-pc-windows-msvc.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    needs: update-key
+    # Oldest supported runner, so the binary links against an older glibc.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ env.TARGET }}-ubuntu22-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            release-${{ env.TARGET }}-ubuntu22-${{ hashFiles('Cargo.lock') }}-
+            release-${{ env.TARGET }}-ubuntu22-
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          test -x target/release/agentscope
+          ./target/release/agentscope --version
+          if ldd target/release/agentscope | grep -q 'not found'; then
+            ldd target/release/agentscope
+            exit 1
+          fi
+          mkdir -p dist/stage
+          cp target/release/agentscope README.md LICENSE dist/stage/
+          tar -C dist/stage -czf "dist/agentscope-$TARGET.tar.gz" agentscope README.md LICENSE
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agentscope-x86_64-unknown-linux-gnu
+          path: dist/agentscope-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [macos, windows, linux]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: agentscope-*
+          merge-multiple: true
+          path: artifacts
+      - name: Install archive signing tool
+        run: cargo install zipsign --version 0.2.2 --locked
+      - name: Sign and verify update archives
+        env:
+          # Base64 of the private key file written by `zipsign gen-key`.
+          UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_SIGNING_PRIVATE_KEY }}
+        run: |
+          keys="$RUNNER_TEMP/keys"
+          mkdir -p "$keys"
+          trap 'rm -rf "$keys"' EXIT
+          test -n "$UPDATE_SIGNING_PRIVATE_KEY" || { echo 'UPDATE_SIGNING_PRIVATE_KEY is not set'; exit 1; }
+          printf '%s' "$UPDATE_SIGNING_PRIVATE_KEY" | base64 --decode > "$keys/private.key"
+          printf '%s' "$AGENTSCOPE_UPDATE_PUBLIC_KEY" | xxd -r -p > "$keys/public.key"
+          # The derived key must match the published one, or clients reject updates.
+          zipsign gen-key --extract "$keys/private.key" "$keys/derived.key"
+          cmp "$keys/derived.key" "$keys/public.key" || { echo 'Signing key does not match AGENTSCOPE_UPDATE_PUBLIC_KEY'; exit 1; }
+          cd artifacts
+          for archive in *.tar.gz; do
+            zipsign sign tar "$archive" "$keys/private.key"
+            zipsign verify tar "$archive" "$keys/public.key"
+          done
+          for archive in *.zip; do
+            zipsign sign zip "$archive" "$keys/private.key"
+            zipsign verify zip "$archive" "$keys/public.key"
+          done
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          assets=(
+            artifacts/agentscope-aarch64-apple-darwin.tar.gz
+            artifacts/agentscope-x86_64-pc-windows-msvc.zip
+            artifacts/agentscope-x86_64-unknown-linux-gnu.tar.gz
+            artifacts/SHA256SUMS.txt
+          )
+          for asset in "${assets[@]}"; do test -s "$asset"; done
+          printf 'AgentScope %s\n\nDownload the archive for your platform below. See the repository README for usage.\n' "$TAG" > notes.md
+          gh release create "$TAG" "${assets[@]}" \
+            --title "AgentScope $TAG" \
+            --notes-file notes.md \
+            --generate-notes \
+            --draft
+          gh release edit "$TAG" --draft=false
