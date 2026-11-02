@@ -958,6 +958,9 @@ fn replaced_source_is_not_served_through_old_offsets() {
 
     // Same length, different content, no refresh in between.
     std::fs::write(&f.path, original.replace("aaaa", "bbbb")).unwrap();
+    // A coarse filesystem clock can leave the mtime unchanged, which is the documented
+    // same-length/same-mtime false negative; this case is about a visible rewrite.
+    set_modified(&f.path, 1_000_000_000);
     // Longer replacement.
     let check = |f: &mut Fixture| {
         assert!(
