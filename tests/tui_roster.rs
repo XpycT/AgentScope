@@ -1034,13 +1034,25 @@ fn selected_row_has_background_in_color_mode() {
     let buf = draw(&app, &ctx(false), 150, 40);
     let (_, y) = locate_left(&buf, "Inventory API", layout.rows.width);
     let width = buf.area.width as usize;
+    let (tag_x, tag_y) = locate_left(&buf, "CDX", layout.rows.width);
+    assert_eq!(tag_y, y + 1, "the tag owns the selected row's second line");
+    // " CDX " is one span; the padded spaces carry the tag background too.
+    let tag_start = tag_x as usize - 1;
+    let tag_end = tag_x as usize + 3;
     for line in [y as usize, y as usize + 1] {
         for x in 0..layout.rows.width as usize {
-            assert_eq!(
-                buf.content()[line * width + x].bg,
-                Color::Black,
-                "({x},{line}) outside the selected background"
-            );
+            let cell = &buf.content()[line * width + x];
+            if line == y as usize + 1 && (tag_start..=tag_end).contains(&x) {
+                assert_eq!(cell.bg, Color::Blue, "the tag keeps its own background");
+                assert_eq!(cell.fg, Color::Black, "and its chosen foreground");
+                assert_ne!(cell.fg, cell.bg, "selected tag text stays readable");
+            } else {
+                assert_eq!(
+                    cell.bg,
+                    Color::Black,
+                    "({x},{line}) outside the selected background"
+                );
+            }
         }
     }
     let (_, other) = locate_left(&buf, "Scanner refactor", layout.rows.width);
@@ -1051,6 +1063,37 @@ fn selected_row_has_background_in_color_mode() {
             "an unselected row has no selection background (x={x})"
         );
     }
+}
+
+#[test]
+fn a_large_roster_keeps_the_selected_row_in_the_viewport() {
+    let mut app = app();
+    let total = 40_000usize;
+    let rows: Vec<SessionSummary> = (0..total)
+        .map(|i| {
+            session(
+                Harness::Codex,
+                &format!("s{i}"),
+                &format!("Session {i}"),
+                12,
+                None,
+                ProcessAssociation::Unmatched,
+            )
+        })
+        .collect();
+    let last = rows[total - 1].meta.key.clone();
+    app.apply_roster(rows, vec![]);
+    assert!(app.select_row(&last));
+
+    let layout = RosterLayout::for_area(Rect::new(0, 0, 120, 40));
+    let selected = app.visual_selected_index().expect("a selected row");
+    assert!(
+        layout
+            .slots(&app)
+            .iter()
+            .any(|(_, index)| *index == selected),
+        "a prefix longer than 65,535 lines still scrolls the selected row into view"
+    );
 }
 
 #[test]
@@ -1306,6 +1349,52 @@ fn preview_shows_last_activity_states() {
     app.load_failed(id);
     let out = text(&preview_buffer(&app, true));
     assert!(out.contains("couldn't read latest activity"), "{out}");
+}
+
+#[test]
+fn preview_hydration_failure_is_distinct_from_activity_failure() {
+    let mut app = app();
+    let summary = rich(Harness::Codex, "h", "Failed facts");
+    let key = summary.meta.key.clone();
+    let mut snap = support::snapshot(
+        1,
+        vec![SessionSummary::unhydrated(summary.meta.clone())],
+        ScanProgress {
+            harness: Harness::Codex,
+            scanned: 1,
+            total: Some(1),
+            done: true,
+        },
+    );
+    snap.summaries = Vec::new();
+    assert!(app.apply_roster_snapshot(snap, vec![]));
+    let hydration = app
+        .take_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            WorkerRequest::HydratePreview { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .expect("the selection requests preview facts");
+    app.load_failed(hydration);
+    assert!(app.preview_hydration_failed(&key));
+
+    // A successful activity read is independent: it cannot fill failed facts.
+    let activity = begin_activity(&mut app);
+    assert!(app.apply_activity(
+        activity,
+        key.clone(),
+        activity_page(
+            vec![tool_event(&key, NOW - 1_000, r#"{"command":"cargo test"}"#)],
+            false,
+        )
+    ));
+    let out = text(&preview_buffer(&app, true));
+    assert!(out.contains("couldn't read session facts"), "{out}");
+    assert!(
+        out.contains("✓ exec cargo test"),
+        "the activity read still succeeds:\n{out}"
+    );
 }
 
 #[test]

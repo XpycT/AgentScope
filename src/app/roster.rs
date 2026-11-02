@@ -6,6 +6,7 @@
 //! totals are computed once per rebuild and only borrowed here.
 
 use std::cell::Cell;
+use std::fmt;
 
 use crate::domain::{SessionKey, SessionSummary, Status};
 
@@ -81,20 +82,41 @@ pub struct GroupTotals {
 }
 
 /// The one-line heading emitted before a project group's members.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct GroupHeader<'a> {
     pub project: Option<&'a str>,
     pub totals: GroupTotals,
 }
 
+/// The project name is provider-supplied text: report its presence and length
+/// only, like [`crate::domain::SessionMetadata`].
+impl fmt::Debug for GroupHeader<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupHeader")
+            .field("project_len", &self.project.map(str::len))
+            .field("totals", &self.totals)
+            .finish()
+    }
+}
+
 /// One project group over the visible roots. Rebuilt with the view and totals,
 /// so the row iterator only borrows it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct GroupInfo {
     pub project: Option<String>,
     /// Indices into `App::view`, in view order.
     pub roots: Vec<usize>,
     pub totals: GroupTotals,
+}
+
+impl fmt::Debug for GroupInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupInfo")
+            .field("project_len", &self.project.as_deref().map(str::len))
+            .field("roots", &self.roots.len())
+            .field("totals", &self.totals)
+            .finish()
+    }
 }
 
 /// One session row in the loaded tree.

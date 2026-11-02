@@ -221,21 +221,25 @@ impl RosterLayout {
         let Some(at) = app.focus_visual_index() else {
             return 0;
         };
-        let mut total = 0u16;
+        // Cumulative heights are unbounded; only screen coordinates stay `u16`.
+        // Saturating at 65,535 lines would undercount a large roster and stop
+        // scrolling rows out before the selected one reaches the viewport.
+        let mut total = 0usize;
         let mut count = 0usize;
         for item in app.roster_rows().take(at + 1) {
-            total = total.saturating_add(item.height());
+            total = total.saturating_add(usize::from(item.height()));
             count += 1;
         }
         if count <= at {
             return 0;
         }
+        let viewport = usize::from(self.rows.height);
         let mut first = 0;
         for item in app.roster_rows() {
-            if first >= at || total <= self.rows.height {
+            if first >= at || total <= viewport {
                 break;
             }
-            total = total.saturating_sub(item.height());
+            total = total.saturating_sub(usize::from(item.height()));
             first += 1;
         }
         first
@@ -783,13 +787,21 @@ fn row_lines(
     if !highlighted {
         return lines;
     }
-    // Patch every span of the selected row: a span's own style (the agent tag
-    // background) would otherwise win over the line style and break the band.
+    // Patch every span of the selected row for one continuous band. The agent
+    // tag keeps its own background: painting the selection background over it
+    // would erase the tag (black text on black), so its foreground/background
+    // pair stays the contrast cue.
     let select = |line: Line<'static>| {
         Line::from(
             line.spans
                 .into_iter()
-                .map(|span| span.patch_style(selection))
+                .map(|span| {
+                    if span.style.bg.is_some() {
+                        span
+                    } else {
+                        span.patch_style(selection)
+                    }
+                })
                 .collect::<Vec<_>>(),
         )
     };

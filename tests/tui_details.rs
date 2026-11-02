@@ -444,16 +444,23 @@ fn details_never_say_full() {
         ),
     );
     assert!(app.open_details());
-    for step in [0, -1] {
-        let out = screen_at(&app, 100, 40);
-        assert!(
-            !out.to_lowercase().contains("full"),
-            "details never claim a bounded preview is full:\n{out}"
-        );
-        if step != 0 {
-            assert!(app.details_step(step));
-        }
-    }
+    let out = screen_at(&app, 100, 40);
+    assert!(out.contains("REASONING"), "{out}");
+    assert!(
+        !out.to_lowercase().contains("full"),
+        "details never claim a bounded preview is full:\n{out}"
+    );
+
+    assert!(app.details_step(-1));
+    let out = screen_at(&app, 100, 40);
+    assert!(
+        out.contains("SHELL"),
+        "the tool event is now selected:\n{out}"
+    );
+    assert!(
+        !out.to_lowercase().contains("full"),
+        "details never claim a bounded preview is full:\n{out}"
+    );
 }
 
 #[test]

@@ -23,8 +23,8 @@ use super::RosterContext;
 use super::details::wrap_into;
 use super::session::{Fact, cost_fact, speed_fact, tokens_fact};
 use super::widgets::{
-    ABSENT, LOADING, Palette, agent_tag, display_title, fit, one_line, status_chip, tokens_text,
-    tool_glyph,
+    ABSENT, LOADING, Palette, READ_FAILED, agent_tag, display_title, fit, one_line, status_chip,
+    tokens_text, tool_glyph,
 };
 
 /// Draw the preview into `area`. Beside the list a left rule separates it.
@@ -53,8 +53,25 @@ pub fn render_preview(frame: &mut Frame, app: &App, ctx: &RosterContext, area: R
         return;
     };
 
-    let pinned = pinned_lines(app, row.session, &row.status, row.hydrated, width, palette);
-    let scrolling = scrolling_rows(app, row.session, row.hydrated, &key, width, palette);
+    let facts_failed = app.preview_hydration_failed(&key);
+    let pinned = pinned_lines(
+        app,
+        row.session,
+        &row.status,
+        row.hydrated,
+        facts_failed,
+        width,
+        palette,
+    );
+    let scrolling = scrolling_rows(
+        app,
+        row.session,
+        row.hydrated,
+        facts_failed,
+        &key,
+        width,
+        palette,
+    );
 
     let pinned_height = pinned.len().min(inner.height as usize);
     if pinned_height > 0 {
@@ -95,6 +112,7 @@ fn pinned_lines(
     session: &SessionSummary,
     status: &Status,
     hydrated: bool,
+    facts_failed: bool,
     width: usize,
     palette: Palette,
 ) -> Vec<Line<'static>> {
@@ -165,10 +183,24 @@ fn pinned_lines(
         width,
     ));
 
-    // Tokens with provenance, cost, and speed.
-    let tokens = tokens_fact(session.usage.as_ref(), hydrated);
-    let cost = cost_fact(session.usage.as_ref(), hydrated);
-    let speed = speed_fact(session, hydrated, app.now());
+    // Tokens with provenance, cost, and speed. A failed hydration is not
+    // "still loading": cached values stay, and otherwise the facts say so.
+    let failed = facts_failed && !hydrated;
+    let tokens = if failed {
+        Fact::failed()
+    } else {
+        tokens_fact(session.usage.as_ref(), hydrated)
+    };
+    let cost = if failed {
+        Fact::failed()
+    } else {
+        cost_fact(session.usage.as_ref(), hydrated)
+    };
+    let speed = if failed {
+        Fact::failed()
+    } else {
+        speed_fact(session, hydrated, app.now())
+    };
     let mut numbers = vec![(tokens.head.clone(), fact_style(&tokens, palette))];
     if matches!(tokens.sub.as_str(), "derived" | "reported") {
         numbers.push((" ".into(), Style::default()));
@@ -192,6 +224,20 @@ fn pinned_lines(
             width,
         ));
     }
+    if facts_failed {
+        lines.push(styled_row(
+            vec![(
+                if hydrated {
+                    "couldn't refresh session facts"
+                } else {
+                    "couldn't read session facts"
+                }
+                .into(),
+                palette.quiet(),
+            )],
+            width,
+        ));
+    }
 
     // One-line bar and the top-three legend beside it.
     if hydrated && let Some(usage) = session.usage.as_ref() {
@@ -209,6 +255,7 @@ fn scrolling_rows(
     app: &App,
     session: &SessionSummary,
     hydrated: bool,
+    facts_failed: bool,
     key: &SessionKey,
     width: usize,
     palette: Palette,
@@ -217,7 +264,11 @@ fn scrolling_rows(
 
     rows.push(ScrollRow::Section("CONTEXT"));
     let mut context = Vec::new();
-    wrap_into(&mut context, &context_text(session, hydrated), width);
+    wrap_into(
+        &mut context,
+        &context_text(session, hydrated, facts_failed),
+        width,
+    );
     rows.extend(context.into_iter().map(ScrollRow::Text));
 
     rows.push(ScrollRow::Section("STARTED"));
@@ -289,8 +340,12 @@ fn ready_rows(rows: &mut Vec<ScrollRow>, last: &LastActivity, width: usize) {
 }
 
 /// Recorded window occupancy. A missing window has no percentage, and the
-/// preview never falls back to the word `Unknown`.
-fn context_text(session: &SessionSummary, hydrated: bool) -> String {
+/// preview never falls back to the word `Unknown`. A failed hydration is a
+/// read failure, not an unfinished load.
+fn context_text(session: &SessionSummary, hydrated: bool, facts_failed: bool) -> String {
+    if facts_failed && !hydrated {
+        return READ_FAILED.into();
+    }
     if !hydrated {
         return LOADING.into();
     }

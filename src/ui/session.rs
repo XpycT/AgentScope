@@ -23,7 +23,9 @@ use crate::time::relative_label;
 use super::RosterContext;
 use super::inspector::{class_name, grouped, money_text, process_line};
 use super::preview::token_bar;
-use super::widgets::{ABSENT, LOADING, Palette, fit, harness_name, one_line, tokens_text};
+use super::widgets::{
+    ABSENT, LOADING, Palette, READ_FAILED, fit, harness_name, one_line, tokens_text,
+};
 
 /// Panels stack in one column below this width.
 const TWO_COLUMN_MIN: usize = 90;
@@ -145,6 +147,13 @@ impl Fact {
     /// Hydrated, but the source recorded no value: absent, which is not zero.
     fn absent() -> Self {
         Self::new(ABSENT, "")
+    }
+
+    /// The source could not be read. Quiet, because failure is not a value.
+    pub fn failed() -> Self {
+        let mut fact = Self::new(READ_FAILED, "read failed");
+        fact.quiet = true;
+        fact
     }
 }
 

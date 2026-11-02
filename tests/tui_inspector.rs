@@ -763,6 +763,37 @@ fn moving_up_stops_following() {
 }
 
 #[test]
+fn moving_after_the_count_discards_the_automatic_catch_up() {
+    let mut app = app_with(summary(3));
+    open(&mut app, backward_page(0..3, false));
+    app.apply_roster(vec![summary(5)], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert!(app.apply_events_after(*request_id, 4));
+    let (tail_id, from, direction) = load_page(&app.take_requests());
+    assert_eq!((from, direction), (None, PageDirection::Backward));
+    assert_eq!(app.new_event_count(), 2);
+
+    // Navigation wins before the automatic tail page arrives.
+    app.inspector_move(-1);
+    let t = app.transcript().unwrap();
+    assert_eq!(t.selected_event().unwrap().id, "e1");
+    assert!(!t.following());
+
+    assert!(app.apply_transcript(tail_id, backward_page(2..5, false)));
+    let t = app.transcript().unwrap();
+    assert_eq!(
+        t.selected_event().unwrap().id,
+        "e1",
+        "an automatic catch-up never overrides newer navigation"
+    );
+    assert!(!t.following());
+    assert_eq!(app.new_event_count(), 2, "the arrivals stay counted");
+}
+
+#[test]
 fn manual_collapse_of_latest_sticks_until_next_append() {
     let mut app = app_with(summary(3));
     open(&mut app, backward_page(0..3, false));
@@ -858,6 +889,32 @@ fn manual_collapse_of_latest_survives_an_unchanged_reload() {
     assert!(
         !t.is_expanded(&t.events()[2]),
         "an ordinary reload preserves the manual collapse"
+    );
+}
+
+#[test]
+fn manual_collapse_of_latest_survives_an_unchanged_restart() {
+    let mut app = app_with(summary(3));
+    open(&mut app, backward_page(0..3, false));
+    app.inspector_toggle();
+    assert!(
+        !app.transcript()
+            .unwrap()
+            .is_expanded(&app.transcript().unwrap().events()[2])
+    );
+
+    app.restart_transcript();
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+        panic!("expected Select after restart, got {requests:?}");
+    };
+    assert!(app.apply_transcript(*request_id, backward_page(0..3, false)));
+    let t = app.transcript().unwrap();
+    assert!(t.following(), "the restart keeps following");
+    assert_eq!(t.selected_event().unwrap().id, "e2");
+    assert!(
+        !t.is_expanded(&t.events()[2]),
+        "an unchanged latest row keeps the reader's manual collapse"
     );
 }
 
@@ -2411,6 +2468,82 @@ fn nested_children_pop_in_order() {
 fn esc_at_stack_bottom_returns_to_roster() {
     let mut app = app_with(summary(1));
     open(&mut app, page(vec![msg(0)], None, false));
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.screen, Screen::Roster);
+    assert!(app.transcript().is_none());
+}
+
+#[test]
+fn shift_tab_from_inspector_clears_the_child_stack_but_keeps_the_transcript() {
+    let (mut app, parent, child) = child_pair();
+    let parent_page = page(
+        vec![
+            event_in(&parent, 0, EventKind::UserPrompt, "parent prompt"),
+            tool_in(&parent, 1, Some(SessionLink::Resolved(child.clone()))),
+        ],
+        None,
+        false,
+    );
+    open(&mut app, parent_page);
+    press(&mut app, KeyCode::Char('o'));
+    take_select(&mut app, &child);
+
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(app.screen, Screen::Roster);
+    assert_eq!(
+        app.transcript().unwrap().key(),
+        &child,
+        "the transcript is retained across the roster visit"
+    );
+
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.screen, Screen::Inspector);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        app.screen,
+        Screen::Roster,
+        "the roster visit reset the stack bottom"
+    );
+    assert!(
+        app.transcript().is_none(),
+        "Esc closes the inspector instead of reopening the parent"
+    );
+}
+
+#[test]
+fn tab_from_details_to_roster_clears_the_child_stack() {
+    let (mut app, parent, child) = child_pair();
+    let parent_page = page(
+        vec![
+            event_in(&parent, 0, EventKind::UserPrompt, "parent prompt"),
+            tool_in(&parent, 1, Some(SessionLink::Resolved(child.clone()))),
+        ],
+        None,
+        false,
+    );
+    open(&mut app, parent_page);
+    press(&mut app, KeyCode::Char('o'));
+    let request = take_select(&mut app, &child);
+    let child_page = page(
+        vec![event_in(
+            &child,
+            0,
+            EventKind::AssistantMessage,
+            "child reply",
+        )],
+        None,
+        false,
+    );
+    assert!(app.apply_transcript(request, child_page));
+
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.screen, Screen::Details);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.screen, Screen::Roster);
+    assert_eq!(app.transcript().unwrap().key(), &child);
+
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.screen, Screen::Inspector);
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.screen, Screen::Roster);
     assert!(app.transcript().is_none());

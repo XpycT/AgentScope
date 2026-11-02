@@ -55,9 +55,10 @@ Options:
   --help                    Print this help
 
 Keys: j/k move, g/G first/last, Enter open (or load more), m next 50 roots, Space expand,
-      Tab swap list/preview, Left/Right scroll columns, J/K scroll preview, / search loaded,
+      Tab inspector (narrow: swap list/preview), J/K scroll preview, / search loaded,
       n/N next/previous match, f filter, s sort (S reverse), r refresh, p process candidates,
       D diagnostics, v source, x redaction, ? help, q or Ctrl+c quit.
+Inspector: d details, i session info, o child session, Esc back, Shift+Tab roster.
 Mouse: click selects, the marker expands, Load more rows load, the wheel scrolls; hold Shift to
        select text with the terminal. Mouse input never changes agent sessions.";
 
@@ -325,5 +326,18 @@ fn inspect(path: PathBuf) -> Result<(), SourceError> {
         if batch.done {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HELP;
+
+    #[test]
+    fn help_matches_the_shipped_dispatcher() {
+        assert!(HELP.contains("Tab inspector (narrow: swap list/preview)"));
+        assert!(!HELP.contains("scroll columns"));
+        assert!(HELP.contains("o child session"));
+        assert!(HELP.contains("Shift+Tab roster"));
     }
 }

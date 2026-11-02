@@ -590,6 +590,12 @@ impl App {
         &self.preview
     }
 
+    /// Hydration of `key` failed for good; its detailed facts will not arrive
+    /// without an explicit retry.
+    pub fn preview_hydration_failed(&self, key: &SessionKey) -> bool {
+        matches!(&self.preview, PreviewState::Failed { key: failed } if failed == key)
+    }
+
     /// Progress of cached preview facts while hydration continues.
     pub fn preview_progress(&self) -> WorkProgress {
         match &self.preview {
@@ -1138,7 +1144,7 @@ impl App {
             if t.loading().is_none() {
                 let id = self.request_seq + 1;
                 self.request_seq = id;
-                let request = t.tail_request(id);
+                let request = t.auto_tail_request(id);
                 self.outbox.push(request);
             } else {
                 // The load in flight settles first; `pump_transcript` then reads
@@ -1255,7 +1261,7 @@ impl App {
         let id = self.request_seq + 1;
         if let Some(t) = &mut self.transcript {
             if t.tail_refresh_owed() && t.loading().is_none() {
-                let request = t.tail_request(id);
+                let request = t.auto_tail_request(id);
                 self.request_seq = id;
                 self.outbox.push(request);
                 return;

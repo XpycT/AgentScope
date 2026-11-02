@@ -150,6 +150,19 @@ fn sentinel_secret_never_appears_in_debug_warnings_or_errors() {
 }
 
 #[test]
+fn roster_group_rows_never_debug_the_project_name() {
+    let header = agentscope::app::GroupHeader {
+        project: Some(SENTINEL),
+        totals: agentscope::app::GroupTotals::default(),
+    };
+    assert_clean_debug("GroupHeader", &header);
+    assert_clean_debug(
+        "RosterItem::GroupHeader",
+        &agentscope::app::RosterItem::GroupHeader(header),
+    );
+}
+
+#[test]
 fn provider_errors_never_echo_file_content() {
     let world = World::new();
     let bad = world.dir.path().join("opencode").join("junk.db");

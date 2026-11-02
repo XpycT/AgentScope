@@ -45,6 +45,9 @@ pub enum PageKind {
 struct Pending {
     request_id: u64,
     kind: PageKind,
+    /// A tail page pulled in by a count while following, not by the reader.
+    /// Navigation that stops following invalidates it when it arrives.
+    automatic: bool,
 }
 
 /// The anchor a chunk's page reported, and which end of the chunk it names.
@@ -138,6 +141,10 @@ pub struct Transcript {
     resume: Option<String>,
     /// Events scanned while chasing `resume`; recovery is bounded by the window cap.
     resume_scanned: usize,
+    /// The last row's first event id at the moment a replacement transcript
+    /// carried state over. An unchanged latest row keeps its carried automatic
+    /// expansion (or the reader's manual collapse) on the first tail page.
+    carried_latest: Option<String>,
     /// True once any page has been applied.
     loaded: bool,
     search: TranscriptSearch,
@@ -169,6 +176,7 @@ impl Transcript {
             probed,
             resume: None,
             resume_scanned: 0,
+            carried_latest: None,
             loaded: false,
             search: TranscriptSearch::default(),
         }
@@ -274,6 +282,10 @@ impl Transcript {
     pub(super) fn carry_over(&mut self, previous: &Transcript) {
         self.expanded = previous.expanded.clone();
         self.auto_expanded = previous.auto_expanded.clone();
+        self.carried_latest = previous
+            .last_row_first()
+            .and_then(|at| previous.events.get(at))
+            .map(|event| event.id.clone());
         self.follow = previous.follow;
         self.search.set_query(previous.search.query());
         // A follower wants the new newest row, not the old anchor: only a reader
@@ -350,8 +362,12 @@ impl Transcript {
         }
     }
 
-    fn begin(&mut self, request_id: u64, kind: PageKind) {
-        self.pending = Some(Pending { request_id, kind });
+    fn begin(&mut self, request_id: u64, kind: PageKind, automatic: bool) {
+        self.pending = Some(Pending {
+            request_id,
+            kind,
+            automatic,
+        });
         self.failed = None;
         self.reload_capped = false;
         if kind == PageKind::Tail {
@@ -366,7 +382,7 @@ impl Transcript {
     pub(super) fn select_request(&mut self, request_id: u64) -> WorkerRequest {
         // Opening a transcript starts at its newest entry; `Select` loads the
         // newest page backward from the tail.
-        self.begin(request_id, PageKind::Tail);
+        self.begin(request_id, PageKind::Tail, false);
         WorkerRequest::Select {
             request_id,
             key: self.key.clone(),
@@ -383,8 +399,18 @@ impl Transcript {
     }
 
     /// Request the newest page. A new request supersedes any load in flight.
+    /// This is the reader's own jump, so it always lands on the newest row.
     pub(super) fn tail_request(&mut self, request_id: u64) -> WorkerRequest {
-        self.begin(request_id, PageKind::Tail);
+        self.carried_latest = None;
+        self.begin(request_id, PageKind::Tail, false);
+        self.backward_request(request_id, None)
+    }
+
+    /// Request the newest page because an arrival was counted while following.
+    /// If navigation stops following before it arrives, its response must not
+    /// pull the reader back to the tail.
+    pub(super) fn auto_tail_request(&mut self, request_id: u64) -> WorkerRequest {
+        self.begin(request_id, PageKind::Tail, true);
         self.backward_request(request_id, None)
     }
 
@@ -418,7 +444,7 @@ impl Transcript {
             end_anchor: self.newer.clone(),
             boundary: self.events.first().map(|e| e.id.clone()),
         });
-        self.begin(request_id, PageKind::Reload);
+        self.begin(request_id, PageKind::Reload, false);
         if probing_end {
             Some(WorkerRequest::LoadPage {
                 request_id,
@@ -442,7 +468,7 @@ impl Transcript {
             PageKind::Initial | PageKind::Tail => {
                 // Selecting again re-establishes both the worker selection and
                 // the newest page load.
-                self.begin(request_id, PageKind::Tail);
+                self.begin(request_id, PageKind::Tail, false);
                 Some(WorkerRequest::Select {
                     request_id,
                     key: self.key.clone(),
@@ -455,13 +481,13 @@ impl Transcript {
             PageKind::Older => {
                 self.failed = None;
                 let anchor = self.older.clone()?;
-                self.begin(request_id, kind);
+                self.begin(request_id, kind, false);
                 Some(self.backward_request(request_id, Some(anchor)))
             }
             PageKind::Newer => {
                 self.failed = None;
                 let anchor = self.newer.clone()?;
-                self.begin(request_id, kind);
+                self.begin(request_id, kind, false);
                 Some(WorkerRequest::LoadPage {
                     request_id,
                     key: self.key.clone(),
@@ -539,7 +565,7 @@ impl Transcript {
             return None;
         }
         if let Some(anchor) = self.reload.as_ref().map(|r| r.anchor.clone()) {
-            self.begin(request_id, PageKind::Reload);
+            self.begin(request_id, PageKind::Reload, false);
             return Some(self.backward_request(request_id, anchor));
         }
         // A restarted transcript returns to its reading anchor, one page at a time.
@@ -549,7 +575,7 @@ impl Transcript {
                 return None;
             }
             if let Some(anchor) = self.older.clone() {
-                self.begin(request_id, PageKind::Older);
+                self.begin(request_id, PageKind::Older, false);
                 return Some(self.backward_request(request_id, Some(anchor)));
             }
             self.resume = None;
@@ -561,7 +587,7 @@ impl Transcript {
         } else {
             return None;
         };
-        self.begin(request_id, kind);
+        self.begin(request_id, kind, false);
         Some(WorkerRequest::LoadPage {
             request_id,
             key: self.key.clone(),
@@ -771,6 +797,14 @@ impl Transcript {
         match pending.kind {
             PageKind::Initial => self.apply_initial(page, continuation),
             PageKind::Tail => {
+                if pending.automatic && !self.follow {
+                    // The reader moved off the newest row after the arrival
+                    // started this catch-up. Applying it would undo that
+                    // navigation, so the page is discarded and the count stays.
+                    self.search.invalidate();
+                    return true;
+                }
+                let carried = self.carried_latest.take();
                 // `Select` asks the worker for `Backward/None`, so this page is
                 // always the newest window, even when it holds a single event.
                 self.replace(page, PageDirection::Backward);
@@ -786,7 +820,15 @@ impl Transcript {
                     // reading position it carried over.
                     self.follow = false;
                 } else {
-                    self.expand_latest(self.selected);
+                    // An unchanged latest row keeps the expansion state the
+                    // restart carried over; a manual collapse stays a collapse.
+                    let unchanged = self
+                        .events
+                        .get(self.selected)
+                        .is_some_and(|event| carried.as_deref() == Some(event.id.as_str()));
+                    if !unchanged {
+                        self.expand_latest(self.selected);
+                    }
                 }
             }
             PageKind::Newer => {

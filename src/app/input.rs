@@ -491,7 +491,10 @@ impl App {
                 self.open_details();
             }
             Screen::Details => {
-                // Focus moves; the transcript, overlays, and search stay.
+                // Focus moves; the transcript, overlays, and search stay. This
+                // is a return to the roster, so the child stack is at its
+                // bottom; tabbing back must not resurrect an old parent.
+                self.session_stack.clear();
                 self.screen = Screen::Roster;
             }
             Screen::Source | Screen::Diagnostics | Screen::Session => {}
@@ -501,7 +504,12 @@ impl App {
     /// `Shift+Tab`: the previous pane.
     pub fn focus_prev(&mut self) {
         match self.screen {
-            Screen::Inspector => self.screen = Screen::Roster,
+            Screen::Inspector => {
+                // Same retained transcript as Details → Tab, and the same rule:
+                // reaching the roster is the stack bottom.
+                self.session_stack.clear();
+                self.screen = Screen::Roster;
+            }
             Screen::Details => {
                 self.close_overlay();
             }

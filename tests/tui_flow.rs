@@ -532,9 +532,26 @@ fn help_is_contextual_and_closes_without_quitting() {
     ch(&mut app, '?');
     let screen = draw(&app, 100, 30);
     assert!(screen.contains("Next / previous match"), "{screen}");
+    for want in ["Open the tool's child session", "Back: parent session"] {
+        assert!(screen.contains(want), "missing {want:?} in:\n{screen}");
+    }
     ch(&mut app, '?');
     assert_eq!(app.panel(), Panel::None);
     assert_eq!(app.screen, Screen::Inspector);
+
+    // Details help names its event stepping and child-opening keys.
+    assert_eq!(ch(&mut app, 'd'), KeyAction::None);
+    assert_eq!(app.screen, Screen::Details);
+    ch(&mut app, '?');
+    let screen = draw(&app, 100, 30);
+    for want in [
+        "Previous / next loaded event",
+        "Open the tool's child session",
+    ] {
+        assert!(screen.contains(want), "missing {want:?} in:\n{screen}");
+    }
+    ch(&mut app, '?');
+    assert_eq!(app.screen, Screen::Details);
 
     // Fits the smallest supported terminal.
     ch(&mut app, '?');
