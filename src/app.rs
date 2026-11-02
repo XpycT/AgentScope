@@ -1140,7 +1140,9 @@ impl App {
         if !t.apply_count(request_id, count) {
             return false;
         }
-        if count > 0 && t.following() {
+        // `count` includes events already known after the anchor; only events
+        // that arrived since are worth a reload.
+        if t.new_events() > 0 && t.following() {
             if t.loading().is_none() {
                 let id = self.request_seq + 1;
                 self.request_seq = id;

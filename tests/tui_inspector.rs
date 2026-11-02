@@ -737,6 +737,39 @@ fn new_events_while_following_reload_tail_and_move_expansion() {
     assert_eq!(app.new_event_count(), 0);
 }
 
+/// The count is relative to the newest-observed boundary: a summary change without
+/// new rows (the count equals the events already known after the anchor) must not
+/// pull a tail page in. Such a needless reload would absorb an append that lands
+/// while it is in flight, so the arrival would never be counted.
+#[test]
+fn a_count_without_arrivals_does_not_reload_the_tail() {
+    let mut app = app_with(summary(3));
+    open(&mut app, backward_page(0..3, false));
+
+    let mut changed = summary(3);
+    changed.last_event_at = Some(NOW + 1);
+    app.apply_roster(vec![changed], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    // Two events were already known after the anchor: nothing arrived.
+    assert!(app.apply_events_after(*request_id, 2));
+    assert!(page_requests(&app.take_requests()).is_empty());
+    assert_eq!(app.new_event_count(), 0);
+
+    // A later arrival is still counted, then pulled in.
+    app.apply_roster(vec![summary(4)], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert!(app.apply_events_after(*request_id, 3));
+    assert_eq!(app.new_event_count(), 1);
+    let (_, from, direction) = load_page(&app.take_requests());
+    assert_eq!((from, direction), (None, PageDirection::Backward));
+}
+
 #[test]
 fn moving_up_stops_following() {
     let mut app = app_with(summary(3));
