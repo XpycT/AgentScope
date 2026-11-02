@@ -136,39 +136,48 @@ Secondary views: filters, usage details, source/provenance information, and appl
 
 ### 5.2 Session roster
 
-The roster must support: provider, display name, project, last activity, current/last model, state plus confidence, age, token totals (if available), and estimated cost (if configured). A compact summary shows the total number of discovered sessions and counts by state, with time range and filter visibility clearly indicated.
+The roster must support: provider, display name, project, last activity, current/last model, state plus confidence, age, token totals (if available), and estimated cost (if configured). It is grouped by project, always: a bold group heading shows the loaded member totals (`N sessions · tokens · cost`), and sessions without a project go into a "No project" group. Lineage wins: a child renders under its parent, in the parent's group. The top line shows the loaded session count, non-zero counts by state, live state, the sort mode, and any active filters; per-provider counts live in the filter overlay.
+
+Each session is two lines. The primary line has the status glyph, fold marker and bold display title, with right-aligned `STATUS`, `SPEED`, `TOKENS` and `COST` columns under one header row. The quiet second line has the agent tag (`CDX`, `CLD`, `OC`, `OMP`, `HRM`, `PI`; bracketed like `[OMP]` when color is unavailable), model, thinking level, and billing provider. Children are folded by default (`▸ +N`) and expand into tree-prefixed rows under their parent. Narrow terminals drop columns from the right in the fixed order `COST`, `SPEED`, `TOKENS`; `STATUS` always stays, and there is no horizontal column scrolling.
 
 ```text
-AgentScope | LOCAL | Codex 7  Claude 4  OpenCode 3 | Live: on
-─────────────────────────────────────────────────────────────────
-STATUS       PROVIDER   SESSION / PROJECT             LAST    TOKENS
-● Active     Codex      Inventory API · RipperGame     12s     91k
-! Quiet      Claude     Scanner refactor · RipperGame   9m     73k
-? Unknown    OpenCode   PR review · CortexSandbox       2h     41k
-✓ Complete   Codex      Localization · RipperGame       1d     28k
-─────────────────────────────────────────────────────────────────
-Enter inspect   / filter   s sort   r refresh   ? help   q quit
+AgentScope · 24 sessions · Live: on · ● 2 active · ○ 5 recent · ! 12 quiet · ✓ 5 complete · sort: last activity
+─────────────────────────────────────────────────────────────────────────────────────────────
+                                                            STATUS    SPEED     TOKENS       COST
+RipperGame  8 sessions · 1.2M+ · ~$3.40
+●  ▾ Inventory API                                        active 12s     84.2     91.2k      ~$0.42
+   CDX  gpt-6.1-sol  high  openai
+   └ ✓ Subagent: tests                                   complete 2m        —       8.1k      ~$0.03
+      CDX  gpt-6.1-sol  medium  openai
+!  ▸ +2 Scanner refactor                                      quiet 9m        —      73.0k      ~$0.23
+   CLD  claude-sonnet-5-5  medium  anthropic
+─────────────────────────────────────────────────────────────────────────────────────────────
+Enter open   ←/→ fold   Tab inspector   / search   f filter   s sort   r refresh   m more   p procs   ? help   q quit
 ```
 
 The source of “Active” must be clear. **A recently modified transcript does not by itself prove that an associated process remains alive.**
 
+Beside the list (or swapped in with `Tab` on a narrow terminal), the preview pins the agent tag and title, project/model/thinking level/provider and lineage, status with its evidence, tokens with provenance, cost, speed, and a stacked token bar with a legend. `J`/`K` or the wheel scrolls `CONTEXT`, `STARTED`, and `LAST ACTIVITY`. The last-activity block reads the newest transcript page in the background and shows the latest tool interaction and assistant reply; its states are `…` (not read yet), `no activity recorded`, `no reply in recent events`, or `couldn't read latest activity`.
+
 ### 5.3 Session inspector
 
-The inspector displays a header (session/provider/model/project, first/last timestamps), process correlation (if supported), state and supporting evidence, measured/estimated usage, and an event timeline. Selecting a timeline row opens readable tool arguments and results, with truncation indicators and an explicit “show full content” action. Long paths and huge outputs should be scrollable and searchable.
+The inspector displays a three-line header: agent tag, title and status with evidence; a quiet project/model/thinking level/provider/started/loaded-events line; and tokens, cost, context, speed, tool calls and children. Its conversation rows start a turn with a `▌ You` prompt bar and put agent work beneath it: tool rows carry a `✓`/`✗`/`…`/`?` status, the tool name, a one-line summary and an exit code or duration; reasoning rows show persisted reasoning text (or `reasoning (no text recorded)`); consecutive auxiliary model calls and allowlisted system noise fold into one quiet line. Enter expands a row in place with the recorded argument, output and reasoning previews, ending `recorded preview · v opens the source`. Opening the transcript at its tail enables follow mode, auto-expanding the latest row; moving off it stops following, and `G`/`End` returns. `o` opens a resolved child's transcript, with `Esc` popping the navigation stack back to the parent.
+
+Below the inspector, `d` opens event details: a badge header with the event kind, time, relative age, `event N of M loaded`, and exit status, then the content with a `USAGE`/`COST`/`SOURCE` side column at 110 columns and wider (stacked below). Tool details show `input (recorded preview)` and `output (recorded preview)`. `[`/`]` move to the previous/next loaded event and stop at the loaded window edges; they never load a page implicitly.
+
+`i` opens session info with the same three-line header and boxed `TOKENS`, `COST`, `TIME & SPEED`, `CONTEXT`, `FAMILY` and `PROCESS` panels in two columns at 90 columns and wider (stacked below), followed by quiet `Not recorded:` and `Priced models:` lines. `m` loads older compactions into the `CONTEXT` panel and `Space` expands or collapses their summaries.
 
 ```text
-< Back   CODEX / Inventory API
-Project: RipperGame  Model: ...  Session: ...
-Status: ? Possibly stalled   Evidence: no recorded events in 9m
-Tokens: 73,214 reported | Cost: $0.23 estimated | Process: unmatched
+[CDX] Inventory API                      ● active 12s · new events in the last minute
+project RipperGame · model gpt-6.1-sol · thinking high · provider openai · started 09:58 · 182 loaded
+91.2k+ reported · ~$0.42 · 42% of window · 84.2 tok/s · 14 tools · 2 children
 
-12:14  user       Implement inventory checks and run tests
-12:15  assistant  I will inspect the current implementation
-12:15  tool       Read InventoryComponent.cpp                [expand]
-12:17  tool       Edit InventoryService.cpp                [expand]
-12:18  tool       cargo test / build                        [expand]
-12:18  tool       Exit 1; 2 failed assertions               [expand]
-12:20  assistant  Investigating the validation path...
+▌ You   12:14  Implement inventory checks and run tests
+  ✓ Read   InventoryComponent.cpp                       12:15
+  ✓ Edit   InventoryService.cpp                         12:17
+  ✓ bash   cargo test                                   12:18   exit 1
+  reasoning: the validation path looks suspicious
+▌ Agent 12:20  Investigating the validation path...
 ```
 
 ### 5.4 Transcript reading rules
@@ -182,19 +191,36 @@ Tokens: 73,214 reported | Cost: $0.23 estimated | Process: unmatched
 
 ### 5.5 Keyboard behavior
 
-| Key | Action |
-|---|---|
-| `j`/`k`, arrows | Navigate rows |
-| `Enter` | Inspect session or expand selected event |
-| `Esc`/`Backspace` | Back / close panel |
-| `/` | Search or filter |
-| `Tab` | Switch focus between panes |
-| `s` | Cycle sort order |
-| `r` | Refresh immediately |
-| `?` | Contextual help |
-| `q` | Quit when not in text input |
+| Screen | Key | Action |
+|---|---|---|
+| Roster | `j`/`k`, arrows | Move; a Load more row takes focus |
+| Roster | `g`/`G`, `Home`/`End` | First / last row |
+| Roster | `PgUp`/`PgDn`, `Ctrl+u`/`Ctrl+d` | Page |
+| Roster | `←`/`→`, `h`/`l` | Collapse / expand; `←` on a child selects its parent |
+| Roster | `Space` | Show or hide a family's children |
+| Roster | `Enter` | Open the inspector, or load more on a focused Load more row |
+| Roster | `m` | Load the next 50 roots |
+| Roster | `/`, `f`, `s`/`S` | Search loaded roots; filter; cycle sort / reverse |
+| Roster | `Tab` | Wide: open the inspector. Narrow: swap list and preview |
+| Roster | `J`/`K` | Scroll the preview |
+| Roster | `r`, `p` | Refresh (retries a paused worker); process candidates |
+| Inspector | `j`/`k`, `g`/`G`, `PgUp`/`PgDn` | Move; `G`/`End` jumps to the latest row |
+| Inspector | `Enter`, `/`, `n`/`N` | Expand/collapse; search loaded events; next/previous match |
+| Inspector | `d`, `i`, `o` | Event details; session info; open a resolved child |
+| Inspector | `v`, `D`, `x`, `r` | Source record; diagnostics; reveal/re-mask the selected source; retry |
+| Inspector | `Esc`/`Backspace` | Back; pops child navigation, then returns to the roster |
+| Details | `[`/`]` | Previous / next loaded event |
+| Details | `v`, `D`, `o`, `Esc` | Source; diagnostics; open child; back |
+| Session info | `m`, `Space`/`Enter` | Load older compactions; expand summaries |
+| Overlays | `j`/`k`, `PgUp`/`PgDn`, `Home`/`End` | Scroll or move |
+| Overlays | `Esc`/`Backspace` | Close |
+| Anywhere | `?` | Contextual help when no panel is open and no search is being edited; closes an open help panel. Filter and process panels ignore it |
+| Anywhere | `q` | Quit when not in text input; the filter panel does not quit |
+| Anywhere | `Ctrl+c` | Quit, always |
 
-Accessibility considerations: good contrast on dark/light terminals, icons never as the only state indicator, keyboard-only operation, graceful narrow terminals, and safe truncation of long strings.
+Compact views use `—` for unavailable values and `…` for values not read yet, `+` for a partial total (a lower bound), `~` for an estimate or an mtime-derived age, and `couldn't read` for a failed read; detail views state Unknown/not recorded in words. Status is always a glyph plus word and age (`● active`, `○ recent`, `! quiet`, `▲ stalled?`, `✓ complete`, `✗ failed`, `× cancelled`, `- unavailable`, `? unknown`), never a glyph alone.
+
+Accessibility considerations: good contrast on dark/light terminals, icons never as the only state indicator, keyboard-only operation, graceful narrow terminals without horizontal column scrolling, and safe truncation of long strings.
 
 ## 6. Functional requirements
 
@@ -208,7 +234,7 @@ Accessibility considerations: good contrast on dark/light terminals, icons never
 | FR-06 | Show searchable, sortable roster and session inspector | Must | Keyboard-only navigation passes acceptance script |
 | FR-07 | Expand tool inputs, tool outputs, errors, and truncated content | Must | Long content remains readable, no output lost silently |
 | FR-08 | Incrementally update observed sessions while app runs | Must | Newly appended complete records appear without restart |
-| FR-09 | Display measured token categories and flag derived or unavailable values | Must | Usage fixtures avoid double-counting |
+| FR-09 | Display measured token categories; flag partial totals with `+` in compact views and derived/reported/unavailable provenance in the preview, session info and details. | Must | Usage fixtures avoid double-counting |
 | FR-10 | Display model-aware *estimated* costs only when price configuration is available | Should | Missing pricing produces Unknown, not $0 |
 | FR-11 | Discover relevant agent processes and show evidence/correlation confidence | Should | No false hard failure on ambiguous process match |
 | FR-12 | Show time since last observed activity and possible-stall alerts | Should | Silent active processes remain labeled uncertain |
@@ -366,7 +392,7 @@ These are engineering targets, not claims of measured performance. Define a benc
 
 **AC-06 — Accurate usage:** Golden fixtures for duplicate and cumulative token observations produce the expected totals, with no double-counting.
 
-**AC-07 — Missing data:** Unavailable cost, missing completion event, or ambiguous process matching display Unknown/Unmatched instead of misleading zeros or hard failures.
+**AC-07 — Missing data:** Compact views (roster, preview, headers) show `—` for unavailable values and `…` for values not read yet; detail views state Unknown/not recorded in words. Missing data never displays as zero or a hard failure.
 
 **AC-08 — Read-only regression:** Running all acceptance tests never changes provider session files, the main provider databases, configuration, permissions, credentials, or running processes. The only permitted filesystem change is SQLite's transient `-shm`/`-wal` sidecars for read-only SQLite readers (OpenCode and Hermes, ADR-0002).
 
