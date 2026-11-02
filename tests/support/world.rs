@@ -880,8 +880,8 @@ pub struct Grown {
     pub secret_opencode: SessionKey,
     pub omp: OmpPlant,
     pub pi: PiPlant,
-    /// An OpenCode database whose WAL cannot be opened without a sidecar SQLite may not
-    /// create (a directory occupies the `-shm` name).
+    /// An OpenCode WAL database held under an exclusive SQLite lock: every reader gets
+    /// `database is locked`, on every platform, until the lock is released.
     pub locked_db: PathBuf,
     _locked_writer: Connection,
 }
@@ -1595,22 +1595,21 @@ fn grow(world: &World) -> Grown {
     }
     assert_eq!(roots.len(), ROOT_COUNT);
 
-    // ---- The locked WAL database: committed rows live in a WAL, and the shared-memory
-    // name is occupied by a directory, so SQLite cannot open it without a sidecar it may
-    // not create. Nothing may be repaired, deleted or copied by the reader.
-    let source = world.dir.path().join("locked-src").join("opencode.db");
-    fs::create_dir_all(source.parent().unwrap()).unwrap();
-    let locked_writer = oc::create_v2(&source);
-    oc::insert_session(&locked_writer, &oc::Session::new("ses_locked", 1, 2));
+    // ---- The locked WAL database: committed rows live in a WAL, and one writer holds an
+    // exclusive SQLite lock on it. SQLite refuses every other connection with "database is
+    // locked" on Windows, Linux and macOS alike; a filesystem trick such as occupying the
+    // `-shm` name is not portable because SQLite can fall back to read-only WAL access on
+    // Unix. Nothing may be repaired, deleted or copied by the reader.
     let locked_db = world.dir.path().join("locked").join("opencode.db");
     fs::create_dir_all(locked_db.parent().unwrap()).unwrap();
-    fs::copy(&source, &locked_db).unwrap();
-    fs::copy(
-        oc::sidecar(&source, "-wal"),
-        oc::sidecar(&locked_db, "-wal"),
-    )
-    .unwrap();
-    fs::create_dir(oc::sidecar(&locked_db, "-shm")).unwrap();
+    let locked_writer = oc::create_v2(&locked_db);
+    oc::insert_session(&locked_writer, &oc::Session::new("ses_locked", 1, 2));
+    locked_writer
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .expect("exclusive locking mode");
+    locked_writer
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("exclusive lock");
 
     let mut child_activity = vec![
         (cdx_kid.clone(), CHILD_MS + 3),

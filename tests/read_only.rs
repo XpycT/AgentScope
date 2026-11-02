@@ -518,7 +518,7 @@ fn native_world_full_session_leaves_provider_content_unchanged_and_sidecars_clas
     assert_eq!(metadata(&world), before_meta);
     assert_only_adr0002_sidecars_added(&world, &before_paths);
     // Sidecars are reported separately (ADR-0002): only the live OpenCode database's
-    // own may differ. The locked database's copy is exactly as it was built.
+    // own may differ. The locked database's sidecars are exactly as they were built.
     for (path, bytes) in &before.sidecars {
         let live = path.starts_with("opencode");
         if !live {
@@ -539,8 +539,6 @@ fn native_world_locked_wal_is_unavailable_never_repaired_and_hides_nothing_else(
     let g = world.grown();
     let before = snapshot(world.dir.path());
     let before_paths = all_paths(world.dir.path());
-    let shm = support::opencode::sidecar(&g.locked_db, "-shm");
-    assert!(shm.is_dir());
 
     let mut config = world.locked_config();
     config.refresh_ms = 3_600_000;
@@ -579,7 +577,10 @@ fn native_world_locked_wal_is_unavailable_never_repaired_and_hides_nothing_else(
     assert!(worker.shutdown());
 
     // Nothing is repaired, deleted, copied or created beside the locked database.
-    assert!(shm.is_dir(), "the occupied -shm name is left alone");
+    assert!(
+        g.locked_db.is_file(),
+        "the locked database is left in place"
+    );
     let after = snapshot(world.dir.path());
     assert_eq!(after.files, before.files);
     assert_eq!(after.sidecars, before.sidecars);

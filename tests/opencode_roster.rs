@@ -514,19 +514,20 @@ fn no_active_wal_opens_read_only() {
 }
 
 #[test]
-fn non_writable_directory_with_required_sidecar_shows_unavailable() {
+fn unusable_sidecars_show_unavailable_and_are_left_alone() {
     let live = tmp();
     let live_db = live.path().join("opencode.db");
     let writer = create_v2(&live_db);
     insert_session(&writer, &Session::new("hidden", 1, 2));
 
-    // A WAL with committed rows exists, but the shm sidecar cannot be created or opened:
-    // a directory occupies its name. No chmod, no repair, no copy of provider files.
+    // The database is WAL-mode, but both sidecar names are occupied by directories. SQLite
+    // cannot open the WAL read-only on Unix (where an absent `-shm` alone is tolerated) or
+    // on Windows. No chmod, no repair, no copy of provider files.
     let blocked = tmp();
     let db = blocked.path().join("opencode.db");
     fs::copy(&live_db, &db).unwrap();
-    fs::copy(sidecar(&live_db, "-wal"), sidecar(&db, "-wal")).unwrap();
     fs::create_dir(sidecar(&db, "-shm")).unwrap();
+    fs::create_dir(sidecar(&db, "-wal")).unwrap();
     let main_before = file_bytes(&db);
 
     let result = OpenCodeScanner::new(&config_for_db(&db));
@@ -537,7 +538,7 @@ fn non_writable_directory_with_required_sidecar_shows_unavailable() {
     );
     assert_eq!(file_bytes(&db), main_before);
     assert!(
-        sidecar(&db, "-shm").is_dir(),
+        sidecar(&db, "-shm").is_dir() && sidecar(&db, "-wal").is_dir(),
         "nothing is deleted or repaired"
     );
     drop(writer);
