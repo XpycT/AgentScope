@@ -183,6 +183,7 @@ impl App {
             && self.view.iter().any(|&i| self.sessions[i].meta.key == key)
         {
             self.selected = Some(key);
+            self.selection_chosen = true;
             self.recompute_visual_selection();
         }
         self.input.editing = None;

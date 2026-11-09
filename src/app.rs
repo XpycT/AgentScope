@@ -164,6 +164,10 @@ pub struct App {
     /// the view so the row iterator only borrows it.
     groups: Vec<roster::GroupInfo>,
     selected: Option<SessionKey>,
+    /// The user picked `selected` (keys, click, search). Until then, discovery
+    /// publications keep the top row selected rather than carrying the first
+    /// auto-selected session down as newer sessions sort above it.
+    selection_chosen: bool,
     /// Cached visual position of `selected`, including Load more rows.
     visual_selected: Option<usize>,
     sort: SortMode,
@@ -230,6 +234,7 @@ impl App {
             view: Vec::new(),
             groups: Vec::new(),
             selected: None,
+            selection_chosen: false,
             visual_selected: None,
             sort: SortMode::LastActivity,
             ascending: SortMode::LastActivity.default_ascending(),
@@ -343,6 +348,11 @@ impl App {
             }
         }
         self.placeholders = placeholders;
+        // While discovery is still publishing (and for the first frozen result),
+        // an automatic selection stays on the top row.
+        if !self.selection_chosen && (self.roster.provisional || snapshot.provisional) {
+            self.selected = None;
+        }
         self.frozen_order = snapshot
             .roots
             .iter()
@@ -1042,6 +1052,7 @@ impl App {
         let Some(key) = self.selected.clone() else {
             return false;
         };
+        self.selection_chosen = true;
         self.session_stack.clear();
         self.start_transcript(key, None);
         self.screen = Screen::Inspector;
@@ -1085,6 +1096,7 @@ impl App {
             return false;
         };
         self.selected = Some(key.clone());
+        self.selection_chosen = true;
         self.recompute_visual_selection();
         self.start_transcript_at(key, event_id);
         self.screen = Screen::Inspector;
@@ -1357,6 +1369,7 @@ impl App {
         let next = current.saturating_add(delta).clamp(0, last) as usize;
         let key = keys[next].clone();
         self.selected = Some(key.clone());
+        self.selection_chosen = true;
         self.recompute_visual_selection();
         self.select_session(&key);
     }
@@ -1416,6 +1429,7 @@ impl App {
         self.session_stack.push((parent, event_id));
         self.overlays = overlay::Overlays::default();
         self.selected = Some(key.clone());
+        self.selection_chosen = true;
         self.recompute_visual_selection();
         self.start_transcript_at(key, None);
         self.screen = Screen::Inspector;

@@ -1690,3 +1690,53 @@ fn mtime_derived_activity_is_marked_approximate() {
     let out = text(&draw(&app, &ctx(false), 120, 40));
     assert!(out.contains("~3m"), "approximate marker missing:\n{out}");
 }
+
+/// Discovery publishes provisional pages while it scans. Newer sessions found
+/// later sort above the one auto-selected first; an untouched selection must
+/// follow the top row instead of being carried (and scrolled) down the list.
+#[test]
+fn startup_selection_follows_top_until_user_moves() {
+    let mk = |id: &str, age: i64| {
+        session(
+            Harness::Claude,
+            id,
+            id,
+            age,
+            None,
+            ProcessAssociation::Unmatched,
+        )
+    };
+    let provisional = |generation, sessions| {
+        let mut snap = support::snapshot(generation, sessions, scan());
+        snap.provisional = true;
+        snap
+    };
+    let mut app = app();
+    assert!(app.apply_roster_snapshot(provisional(0, vec![mk("old", 900)]), vec![]));
+    assert_eq!(app.selected_key().map(|k| k.native_id), Some("old".into()));
+
+    let newer: Vec<_> = (0..40).map(|i| mk(&format!("new{i:02}"), 10 + i)).collect();
+    let mut all = newer.clone();
+    all.push(mk("old", 900));
+    assert!(app.apply_roster_snapshot(provisional(0, all.clone()), vec![]));
+    assert_eq!(
+        app.selected_key().map(|k| k.native_id),
+        Some("new00".into())
+    );
+
+    // The first frozen generation still follows the top.
+    assert!(app.apply_roster_snapshot(support::snapshot(1, all.clone(), scan()), vec![]));
+    assert_eq!(
+        app.selected_key().map(|k| k.native_id),
+        Some("new00".into())
+    );
+    assert_eq!(app.visual_selected_index(), Some(1));
+
+    // Once the user moves, later publications keep their choice.
+    app.move_selection(2);
+    let chosen = app.selected_key();
+    let mut reordered = vec![mk("fresh", 1)];
+    reordered.extend(all);
+    assert!(app.apply_roster_snapshot(support::snapshot(2, reordered, scan()), vec![]));
+    assert_eq!(app.selected_key(), chosen);
+}

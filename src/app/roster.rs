@@ -420,6 +420,7 @@ impl App {
             Slot::Session(key) => {
                 self.roster_view.load_focus = None;
                 self.selected = Some(key.clone());
+                self.selection_chosen = true;
                 self.recompute_visual_selection();
                 self.select_session(&key.clone());
             }
@@ -463,6 +464,7 @@ impl App {
         }
         self.roster_view.load_focus = None;
         self.selected = Some(key.clone());
+        self.selection_chosen = true;
         self.recompute_visual_selection();
         self.select_session(key);
         true
